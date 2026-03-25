@@ -119,19 +119,19 @@ Build the full database layer (ORM → migrations → repositories) before wirin
 
 Build the `MockBroker` first so all subsequent layers can be developed and tested without a live IBKR connection.
 
-- [ ] **4.1** Define `BaseBroker` abstract interface (`app/brokers/base.py`): `connect()`, `disconnect()`, `get_account_summary()`, `get_positions()`, `subscribe_price_feed(tickers)`, `place_order()`, `cancel_order()` *(S)*
-- [ ] **4.2** Implement `MockBroker` (`app/brokers/mock/client.py`): simulates connection, returns synthetic account/position data, echoes orders as filled *(M)*
+- [x] **4.1** Define `BaseBroker` abstract interface (`app/brokers/base.py`): `connect()`, `disconnect()`, `get_account_summary()`, `get_positions()`, `subscribe_price_feed(tickers)`, `place_order()`, `cancel_order()` *(S)*
+- [x] **4.2** Implement `MockBroker` (`app/brokers/mock/client.py`): simulates connection, returns synthetic account/position data, echoes orders as filled *(M)*
   - *Depends on: 4.1*
-- [ ] **4.3** Implement `IBKRClient` (`app/brokers/ibkr/client.py`) wrapping `ib_async` *(L)*
+- [x] **4.3** Implement `IBKRClient` (`app/brokers/ibkr/client.py`) wrapping `ib_async` *(L)*
   - `connect()` / `disconnect()` with connection status tracking
   - `get_account_summary()` → maps to internal `AccountSummary` model
   - `get_positions()` → maps to internal `Position` model
   - `subscribe_price_feed(tickers)` → attaches tick event handlers
   - `place_order()` / `cancel_order()`
   - *Depends on: 4.1*
-- [ ] **4.4** Implement `app/brokers/ibkr/mapper.py` — maps raw `ib_async` objects to internal Pydantic models *(S)*
+- [x] **4.4** Implement `app/brokers/ibkr/mapper.py` — maps raw `ib_async` objects to internal Pydantic models *(S)*
   - *Depends on: 4.3*
-- [ ] **4.5** Wire broker selection via dependency injection: `get_broker()` in `app/dependencies.py` returns `IBKRClient` or `MockBroker` based on `ENVIRONMENT` env var *(S)*
+- [x] **4.5** Wire broker selection via dependency injection: `get_broker()` in `app/dependencies.py` returns `IBKRClient` or `MockBroker` based on `ENVIRONMENT` env var *(S)*
   - *Depends on: 4.2, 4.3*
 
 **Checkpoint A (no Gateway needed)**: Write a pytest using `MockBroker` that calls `connect()`, `get_account_summary()`, and `place_order()`. All pass without a live connection.
@@ -142,13 +142,15 @@ Build the `MockBroker` first so all subsequent layers can be developed and teste
 
 ### Layer 5 — Market Data
 
-- [ ] **5.1** Implement `RedisCache` wrapper (`app/data/cache.py`): `get`, `set`, `delete`, `publish`, `subscribe` helpers over `redis.asyncio` *(S)*
+- [x] **5.1** Implement `RedisCache` wrapper (`app/data/cache.py`): `get`, `set`, `delete`, `publish`, `subscribe` helpers over `redis.asyncio` *(S)*
   - *Depends on: 1.2*
-- [ ] **5.2** Implement `MarketDataFeed` (`app/data/feed.py`): subscribes to live price ticks for all active `watched_symbols`, writes `price:{ticker}` to Redis, publishes to `watchlist_prices` pub/sub channel *(M)*
+- [x] **5.2** Implement `MarketDataFeed` (`app/data/feed.py`): subscribes to live price ticks for all active `watched_symbols`, writes `price:{ticker}` to Redis, publishes to `watchlist_prices` pub/sub channel *(M)*
   - On symbol add/remove, update subscriptions dynamically without restart
   - *Depends on: 4.1, 5.1, 3.6*
-- [ ] **5.3** Implement `HistoricalDataFetcher` (`app/data/historical.py`): fetches 1-year OHLCV per symbol via broker, stores in TimescaleDB with overwrite-on-refresh policy *(L)*
+- [x] **5.3** Implement `HistoricalDataFetcher` (`app/data/historical.py`): fetches 1-year OHLCV per symbol via broker, stores in TimescaleDB with overwrite-on-refresh policy *(L)*
   - *Depends on: 4.1, 3.4*
+
+**Checkpoint** ✅: `docker-compose up` + `alembic upgrade head` (both migrations applied). 24 unit tests pass. 3 integration tests confirm: MockBroker + MarketDataFeed writes `price:{ticker}` to real Redis and publishes to `watchlist_prices`; HistoricalDataFetcher writes >200 OHLCV rows to the `ohlcv_bars` hypertable.
 
 **Checkpoint**: Start the app with `MockBroker`. Confirm Redis receives `price:{ticker}` updates. Confirm historical fetch writes rows to TimescaleDB.
 
