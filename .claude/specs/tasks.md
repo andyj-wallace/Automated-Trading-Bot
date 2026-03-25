@@ -48,15 +48,15 @@ The build order is:
 
 These tasks create a runnable shell with nothing inside it yet. After this layer you can run `docker-compose up` and see an empty FastAPI app respond on localhost.
 
-- [ ] **1.1** Initialize monorepo: create `backend/` and `frontend/` directories, root `.gitignore`, `README.md` *(S)*
-- [ ] **1.2** Set up `docker-compose.yml` with PostgreSQL 15 + TimescaleDB extension, Redis 7, and a `backend` service placeholder *(S)*
-- [ ] **1.3** Scaffold FastAPI app: `app/main.py` (app factory), `app/config.py` (pydantic-settings), `app/dependencies.py` (empty Depends stubs) *(S)*
-- [ ] **1.4** Configure `pydantic-settings` for environment-based config; create `.env.example` with all required variables *(S)*
+- [x] **1.1** Initialize monorepo: create `backend/` and `frontend/` directories, root `.gitignore`, `README.md` *(S)*
+- [x] **1.2** Set up `docker-compose.yml` with PostgreSQL 15 + TimescaleDB extension, Redis 7, and a `backend` service placeholder *(S)*
+- [x] **1.3** Scaffold FastAPI app: `app/main.py` (app factory), `app/config.py` (pydantic-settings), `app/dependencies.py` (empty Depends stubs) *(S)*
+- [x] **1.4** Configure `pydantic-settings` for environment-based config; create `.env.example` with all required variables *(S)*
   - Use `environment-setup.md` as the canonical variable reference and copy the template from there
   - Confirm `.env` is in `.gitignore` before adding any real values to `.env`
   - *Depends on: 1.3*
-- [ ] **1.5** Initialize React 18 + TypeScript frontend with Tailwind CSS; verify dev server starts *(S)*
-- [ ] **1.6** Set up GitHub Actions CI: lint + test on push (Python: ruff + pytest; TS: tsc + eslint) *(M)*
+- [x] **1.5** Initialize React 18 + TypeScript frontend with Tailwind CSS; verify dev server starts *(S)*
+- [x] **1.6** Set up GitHub Actions CI: lint + test on push (Python: ruff + pytest; TS: tsc + eslint) *(M)*
   - *Depends on: 1.1*
 
 **Checkpoint**: `docker-compose up` starts Postgres, Redis, and an empty FastAPI app. `GET /` returns 200.

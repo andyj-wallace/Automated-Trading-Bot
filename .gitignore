@@ -1,4 +1,70 @@
-.DS_Store
+# =============================================================================
+# .gitignore — Automated Trading Bot
+# =============================================================================
 
-./claude
-env
+# --- Environment / Secrets ---------------------------------------------------
+.env
+.env.local
+.env.*.local
+credentials.txt
+secrets/
+
+# Keep the example template committed
+!.env.example
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# --- Node / Frontend ---------------------------------------------------------
+node_modules/
+frontend/dist/
+frontend/build/
+frontend/.vite/
+*.tsbuildinfo
+
+# --- Docker ------------------------------------------------------------------
+.docker/
+
+# --- Logs --------------------------------------------------------------------
+logs/
+*.log
+
+# --- IDE / OS ----------------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+
+# --- Alembic -----------------------------------------------------------------
+# Keep versions/ committed; exclude compiled pyc inside it
+alembic/versions/*.pyc
