@@ -84,26 +84,26 @@ Set up structured logging before writing any business logic, so every layer that
 
 Build the full database layer (ORM → migrations → repositories) before wiring any API or business logic to it.
 
-- [ ] **3.1** Configure Alembic: `alembic/env.py` pointing at async SQLAlchemy engine, linked to `DATABASE_URL` env var *(S)*
+- [x] **3.1** Configure Alembic: `alembic/env.py` pointing at async SQLAlchemy engine, linked to `DATABASE_URL` env var *(S)*
   - *Depends on: 1.2, 1.3*
-- [ ] **3.2** Define SQLAlchemy ORM models (`app/db/models/`): `Trade`, `TradingStrategy`, `WatchedSymbol`, `SystemLog`, `PortfolioSnapshot` *(M)*
+- [x] **3.2** Define SQLAlchemy ORM models (`app/db/models/`): `Trade`, `TradingStrategy`, `WatchedSymbol`, `SystemLog`, `PortfolioSnapshot` *(M)*
   - `WatchedSymbol`: `id` (UUID PK), `ticker` (VARCHAR 10, unique), `display_name`, `is_active`, `added_at`, `updated_at`
   - `Trade`: all columns from `design.md § trades` including `stop_loss_price` (required), `risk_amount`, `account_balance_at_entry`
   - `TradingStrategy`: `config` as JSONB (includes `symbols` array)
   - *Depends on: 3.1*
-- [ ] **3.3** Create Alembic initial migration from ORM models; verify `alembic upgrade head` creates all tables cleanly *(S)*
+- [x] **3.3** Create Alembic initial migration from ORM models; verify `alembic upgrade head` creates all tables cleanly *(S)*
   - *Depends on: 3.2*
-- [ ] **3.4** Configure TimescaleDB hypertable for `portfolio_snapshots` (partition on `time` column) *(S)*
+- [x] **3.4** Configure TimescaleDB hypertable for `portfolio_snapshots` (partition on `time` column) *(S)*
   - *Depends on: 3.3*
-- [ ] **3.5** Create async SQLAlchemy session factory (`app/db/session.py`) with connection pool (min 5, max 20) *(S)*
+- [x] **3.5** Create async SQLAlchemy session factory (`app/db/session.py`) with connection pool (min 5, max 20) *(S)*
   - *Depends on: 3.2*
-- [ ] **3.6** Implement `SymbolRepo` (`app/db/repositories/symbol_repo.py`) — CRUD for `watched_symbols` *(S)*
+- [x] **3.6** Implement `SymbolRepo` (`app/db/repositories/symbol_repo.py`) — CRUD for `watched_symbols` *(S)*
   - *Depends on: 3.2, 3.5*
-- [ ] **3.7** Implement `TradeRepo` (`app/db/repositories/trade_repo.py`) — CRUD for `trades`; no update/delete on audit-sensitive fields *(M)*
+- [x] **3.7** Implement `TradeRepo` (`app/db/repositories/trade_repo.py`) — CRUD for `trades`; no update/delete on audit-sensitive fields *(M)*
   - *Depends on: 3.2, 3.5*
-- [ ] **3.8** Implement `StrategyRepo` (`app/db/repositories/strategy_repo.py`) — CRUD for `trading_strategies` *(M)*
+- [x] **3.8** Implement `StrategyRepo` (`app/db/repositories/strategy_repo.py`) — CRUD for `trading_strategies` *(M)*
   - *Depends on: 3.2, 3.5*
-- [ ] **3.9** Implement `PortfolioRepo` (`app/db/repositories/portfolio_repo.py`) — insert snapshots, query by time range *(S)*
+- [x] **3.9** Implement `PortfolioRepo` (`app/db/repositories/portfolio_repo.py`) — insert snapshots, query by time range *(S)*
   - *Depends on: 3.4, 3.5*
 
 **Checkpoint**: Run migrations against the Docker Postgres instance. Use a DB client to confirm all tables and the hypertable exist. Write a quick pytest that inserts and retrieves a `WatchedSymbol` via the repo.
