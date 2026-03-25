@@ -60,8 +60,24 @@ Approved Signal → OrderManager.execute() → Broker
 
 ### 4. Broker Abstraction Layer (`backend/app/brokers/`)
 - Abstract `BaseBroker` interface; all strategy and execution code depends on this, never on IBKR directly
-- IBKR client (`ib_insync`) wrapped in `IBKRClient`
-- `MockBroker` for paper trading and testing without live market connection
+- `IBKRClient` wraps `ib_async` (the actively maintained successor to `ib_insync` — see `tasks.md § Library Change`)
+- `MockBroker` decouples all development and testing from any live broker dependency — the default for `ENVIRONMENT=development`
+
+**How IBKR connectivity works at runtime:**
+
+`IBKRClient` does not connect directly to IBKR's servers. It connects via TCP socket to a locally running **IB Gateway** process, which holds the authenticated IBKR session. The application never handles IBKR credentials.
+
+```
+IBKRClient (ib_async)
+    │ TCP socket localhost:4001
+    ▼
+IB Gateway process (running locally or in Docker)
+    │ authenticated session
+    ▼
+IBKR servers
+```
+
+IB Gateway must be running and authenticated before `IBKRClient.connect()` is called. Gateway authentication requires manual login (username + password + IBKR Mobile 2FA) once per session. See `ibkr-gateway.md` for setup and daily startup procedure.
 
 ### 5. Data Management (`backend/app/data/`)
 - `MarketDataFeed`: subscribes to live price data from broker
@@ -321,8 +337,11 @@ Must include:
 - Sensitive fields (account numbers, API keys) masked in all log output
 - No user authentication required (personal-use system), but API should bind to localhost or VPN only in production
 - HTTPS enforced for any external notification webhook delivery
+- **Live trading guard**: `IBKRClient.connect()` must raise an error if `ENVIRONMENT=development` and `IBKR_TRADING_MODE=live` are set simultaneously — prevents accidental live order submission during development. This is enforced in code, not just convention.
+- **Trading mode**: `IBKR_TRADING_MODE` env var controls paper vs live at the Gateway login level; the application code is identical in both modes. Default must be `paper`. See `ibkr-gateway.md § Paper vs Live Mode`.
 
 ---
 
 > See `requirements.md` for feature user stories.
 > See `tasks.md` for implementation task breakdown.
+> See `ibkr-gateway.md` for IB Gateway setup, authentication, and daily startup procedure.
