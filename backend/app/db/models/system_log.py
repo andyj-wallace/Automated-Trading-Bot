@@ -1,8 +1,8 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Enum as SAEnum, Text, String, func
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import BigInteger, Text, String, func
+from sqlalchemy.dialects.postgresql import ENUM as PGENUM, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -28,7 +28,7 @@ class SystemLog(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     level: Mapped[str] = mapped_column(String(20), nullable=False)
     category: Mapped[LogCategory] = mapped_column(
-        SAEnum(LogCategory, name="logcategory"), nullable=False, index=True
+        PGENUM(LogCategory, name="logcategory", create_type=False), nullable=False, index=True
     )
     message: Mapped[str] = mapped_column(Text, nullable=False)
     context: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

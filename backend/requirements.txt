@@ -19,7 +19,7 @@ numpy==2.2.1
 scipy==1.15.0
 
 # Broker
-ib_async==0.9.86
+ib_async==2.1.0
 
 # HTTP client
 httpx==0.28.1

@@ -90,7 +90,7 @@ def upgrade() -> None:
         sa.Column("symbol", sa.String(10), nullable=False),
         sa.Column(
             "direction",
-            sa.Enum("BUY", "SELL", name="tradedirection", create_type=False),
+            postgresql.ENUM("BUY", "SELL", name="tradedirection", create_type=False),
             nullable=False,
         ),
         sa.Column("quantity", sa.Numeric(precision=18, scale=8), nullable=False),
@@ -99,7 +99,7 @@ def upgrade() -> None:
         sa.Column("exit_price", sa.Numeric(precision=18, scale=8), nullable=True),
         sa.Column(
             "status",
-            sa.Enum("OPEN", "CLOSED", "CANCELLED", name="tradestatus", create_type=False),
+            postgresql.ENUM("OPEN", "CLOSED", "CANCELLED", name="tradestatus", create_type=False),
             nullable=False,
             server_default="OPEN",
         ),
@@ -134,7 +134,7 @@ def upgrade() -> None:
         sa.Column("level", sa.String(20), nullable=False),
         sa.Column(
             "category",
-            sa.Enum("TRADING", "RISK", "SYSTEM", "ERROR", name="logcategory", create_type=False),
+            postgresql.ENUM("TRADING", "RISK", "SYSTEM", "ERROR", name="logcategory", create_type=False),
             nullable=False,
         ),
         sa.Column("message", sa.Text(), nullable=False),

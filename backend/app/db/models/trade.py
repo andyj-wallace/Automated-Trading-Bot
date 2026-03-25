@@ -3,8 +3,8 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import TIMESTAMP, Enum as SAEnum, ForeignKey, Numeric, String, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import TIMESTAMP, ForeignKey, Numeric, String, func
+from sqlalchemy.dialects.postgresql import ENUM as PGENUM, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -45,7 +45,7 @@ class Trade(Base):
     )
     symbol: Mapped[str] = mapped_column(String(10), nullable=False, index=True)
     direction: Mapped[TradeDirection] = mapped_column(
-        SAEnum(TradeDirection, name="tradedirection"), nullable=False
+        PGENUM(TradeDirection, name="tradedirection", create_type=False), nullable=False
     )
     quantity: Mapped[Decimal] = mapped_column(Numeric(precision=18, scale=8), nullable=False)
     entry_price: Mapped[Decimal] = mapped_column(Numeric(precision=18, scale=8), nullable=False)
@@ -56,7 +56,7 @@ class Trade(Base):
         Numeric(precision=18, scale=8), nullable=True
     )
     status: Mapped[TradeStatus] = mapped_column(
-        SAEnum(TradeStatus, name="tradestatus"),
+        PGENUM(TradeStatus, name="tradestatus", create_type=False),
         nullable=False,
         default=TradeStatus.OPEN,
     )
