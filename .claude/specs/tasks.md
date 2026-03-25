@@ -67,13 +67,13 @@ These tasks create a runnable shell with nothing inside it yet. After this layer
 
 Set up structured logging before writing any business logic, so every layer that follows can log correctly from day one.
 
-- [ ] **2.1** Set up structured JSON logging (`app/monitoring/logger.py`): four named loggers (`trading`, `risk`, `system`, `error`), JSON format, configurable level via env *(M)*
+- [x] **2.1** Set up structured JSON logging (`app/monitoring/logger.py`): four named loggers (`trading`, `risk`, `system`, `error`), JSON format, configurable level via env *(M)*
   - Sensitive fields (account numbers, API keys) must be masked at the formatter level
-- [ ] **2.2** Configure `audit.log` as a **separate, append-only file handler** — not subject to rotation policy *(S)*
+- [x] **2.2** Configure `audit.log` as a **separate, append-only file handler** — not subject to rotation policy *(S)*
   - *Depends on: 2.1*
-- [ ] **2.3** Configure rotation for `trading.log`, `risk.log`, `system.log`, `error.log`: 10MB max, 5 backups *(S)*
+- [x] **2.3** Configure rotation for `trading.log`, `risk.log`, `system.log`, `error.log`: 10MB max, 5 backups *(S)*
   - *Depends on: 2.1*
-- [ ] **2.4** Add basic FastAPI error handling middleware (`app/api/middleware.py`) — catches unhandled exceptions, logs to `error.log`, returns standard error envelope *(S)*
+- [x] **2.4** Add basic FastAPI error handling middleware (`app/api/middleware.py`) — catches unhandled exceptions, logs to `error.log`, returns standard error envelope *(S)*
   - *Depends on: 2.1, 1.3*
 
 **Checkpoint**: Start the app, trigger an intentional error — see JSON log entries appear in the correct log file.

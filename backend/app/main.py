@@ -1,9 +1,25 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.middleware import ErrorHandlerMiddleware
 from app.config import get_settings
+from app.monitoring.logger import setup_logging, system_logger
 
 settings = get_settings()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    setup_logging(log_level=settings.log_level)
+    system_logger.info(
+        "Application starting",
+        extra={"environment": settings.environment, "log_level": settings.log_level},
+    )
+    yield
+    system_logger.info("Application shutting down")
+
 
 app = FastAPI(
     title="Automated Trading Bot",
@@ -11,8 +27,12 @@ app = FastAPI(
     version="0.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
+# Middleware — ErrorHandlerMiddleware must be added BEFORE CORSMiddleware
+# so that error responses also get CORS headers.
+app.add_middleware(ErrorHandlerMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],  # Vite dev server
