@@ -8,7 +8,7 @@
 .env.*.local
 credentials.txt
 secrets/
-IB Gateway/
+IB Gateway*/
 
 # Keep the example template committed
 !.env.example

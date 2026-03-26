@@ -144,6 +144,14 @@ class MockBroker(BaseBroker):
         # No-op in the mock — subscriptions are callback lists, not per-ticker
 
     # ------------------------------------------------------------------
+    # Ticker validation
+    # ------------------------------------------------------------------
+
+    async def validate_ticker(self, symbol: str) -> bool:
+        """Accept any non-empty ticker in mock mode — no live lookup needed."""
+        return bool(symbol and symbol.strip())
+
+    # ------------------------------------------------------------------
     # Historical data
     # ------------------------------------------------------------------
 
