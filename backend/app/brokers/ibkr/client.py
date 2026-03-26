@@ -216,6 +216,23 @@ class IBKRClient(BaseBroker):
         )
         return [mapper.map_price_bar(bar, bar_size) for bar in bars]
 
+    async def validate_ticker(self, symbol: str) -> bool:
+        """
+        Check whether the symbol resolves to a valid IBKR-tradeable stock.
+
+        Qualifies the contract against IBKR's contract database. Returns True
+        if at least one matching contract is found, False otherwise. Falls back
+        to True if not connected so callers are never blocked by connectivity.
+        """
+        if not self._ib.isConnected():
+            return True  # cannot validate without connection — allow the add
+        contract = Stock(symbol.upper(), "SMART", "USD")
+        try:
+            details = await self._ib.reqContractDetailsAsync(contract)
+            return len(details) > 0
+        except Exception:
+            return False
+
     async def cancel_order(self, broker_order_id: str) -> bool:
         """
         Cancel a pending order by its IBKR order ID.

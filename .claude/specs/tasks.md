@@ -160,23 +160,23 @@ Build the `MockBroker` first so all subsequent layers can be developed and teste
 
 The risk layer is a pure calculation and validation layer — no I/O, no DB calls. Build and fully test it before hooking up to execution.
 
-- [ ] **6.1** Define `BaseStrategy` abstract class (`app/core/strategy_engine/base.py`): `generate_signal()`, `calculate_position_size()`, `get_config_schema()` *(S)*
+- [x] **6.1** Define `BaseStrategy` abstract class (`app/core/strategy_engine/base.py`): `generate_signal()`, `calculate_position_size()`, `get_config_schema()` *(S)*
   - This is needed here only for the `RiskParams` type that `RiskCalculator` depends on
-- [ ] **6.2** Implement `RiskCalculator` (`app/core/risk/calculator.py`) *(M)*
+- [x] **6.2** Implement `RiskCalculator` (`app/core/risk/calculator.py`) *(M)*
   - Formula: `max_quantity = floor((account_balance × 0.01) / (entry_price − stop_loss_price))`
   - Raises `ValidationError` if `stop_loss_price >= entry_price`
   - Write unit tests: normal case, tiny stop distance, large account, fractional result, invalid stop (≥5 test cases)
   - *Depends on: 6.1*
-- [ ] **6.3** Implement `RiskManager.validate()` (`app/core/risk/manager.py`) — hard gate before order submission *(M)*
+- [x] **6.3** Implement `RiskManager.validate()` (`app/core/risk/manager.py`) — hard gate before order submission *(M)*
   - Reject immediately if no `stop_loss_price` provided
   - Reject if `risk_amount > 0.01 × account_balance_at_entry`
   - Snapshot `account_balance_at_entry` at time of validation
   - Log all rejections to `risk.log` with full context (symbol, qty, entry, stop-loss, risk amount, balance)
   - *Depends on: 6.2, 2.1*
-- [ ] **6.4** Implement `RiskMonitor` (`app/core/risk/monitor.py`): polls open trades, computes aggregate exposure, emits alerts at 75% and 90% of configurable thresholds *(M)*
+- [x] **6.4** Implement `RiskMonitor` (`app/core/risk/monitor.py`): polls open trades, computes aggregate exposure, emits alerts at 75% and 90% of configurable thresholds *(M)*
   - *Depends on: 6.3, 3.7*
 
-**Checkpoint**: Run all `RiskCalculator` unit tests green. Manually invoke `RiskManager.validate()` with a missing stop-loss — confirm rejection is logged.
+**Checkpoint** ✅: 14 `RiskCalculator` unit tests green (normal, tiny stop, large account, fractional floor, invalid stop × 4, risk_amount helpers). `RiskManager.validate()` with missing stop-loss raises `RiskRejectionError` and writes WARNING to `risk.log` — verified in `test_missing_stop_loss_is_logged`. All 5 `RiskMonitor` alert-level tests pass.
 
 ---
 
@@ -184,17 +184,17 @@ The risk layer is a pure calculation and validation layer — no I/O, no DB call
 
 This is the highest-criticality layer. The audit trail is non-optional (see `INF-04`).
 
-- [ ] **7.1** Implement `OrderManager.submit_order()` (`app/core/execution/order_manager.py`) *(L)*
+- [x] **7.1** Implement `OrderManager.submit_order()` (`app/core/execution/order_manager.py`) *(L)*
   - **This is the only permitted code path for order submission** — enforced by architecture
   - **Pre-submission**: write audit entry to `audit.log` before broker call: trade ID, symbol, direction, qty, entry, stop-loss, risk amount, balance, strategy ID
   - **Post-confirmation**: write audit entry after broker responds: broker order ID, status, actual fill price/qty, error codes if any
   - If post-confirmation log write fails → escalate to `error.log` + fire system alert
   - Audit entries are append-only; no update/delete path permitted anywhere in the codebase
   - *Depends on: 6.3, 4.1, 2.2*
-- [ ] **7.2** Implement `TradeHandler` (`app/core/execution/trade_handler.py`): post-fill callback that persists trade to DB and publishes trade event to Redis *(M)*
+- [x] **7.2** Implement `TradeHandler` (`app/core/execution/trade_handler.py`): post-fill callback that persists trade to DB and publishes trade event to Redis *(M)*
   - *Depends on: 7.1, 3.7, 5.1*
 
-**Checkpoint**: Using `MockBroker`, call `submit_order()` with a valid signal. Verify: (1) pre-submission entry appears in `audit.log`, (2) mock order is placed, (3) post-confirmation entry appears, (4) trade row is written to DB. Then force a failed audit write and confirm escalation to `error.log`.
+**Checkpoint** ✅: Using MockBroker — (1) PRE_SUBMISSION audit entry written before broker call, (2) mock order placed and FILLED, (3) POST_CONFIRMATION entry written after fill, (4) trade row readable from DB via integration test, trade event published to `trade_events` Redis channel. Forced audit-write failure → `error_logger.critical` fired with trade_id and error detail. All 12 unit tests + 3 integration tests pass.
 
 ---
 
@@ -202,23 +202,23 @@ This is the highest-criticality layer. The audit trail is non-optional (see `INF
 
 With all backend logic complete, expose it via thin FastAPI routes.
 
-- [ ] **8.1** Implement standard JSON response envelope and error format (`app/api/v1/schemas.py`) *(S)*
+- [x] **8.1** Implement standard JSON response envelope and error format (`app/api/v1/schemas.py`) *(S)*
   - *Depends on: 1.3*
-- [ ] **8.2** Implement symbols endpoints (`app/api/v1/symbols.py`): `GET/POST /api/v1/symbols`, `DELETE /api/v1/symbols/{ticker}` *(M)*
+- [x] **8.2** Implement symbols endpoints (`app/api/v1/symbols.py`): `GET/POST /api/v1/symbols`, `DELETE /api/v1/symbols/{ticker}` *(M)*
   - `POST` validates ticker against broker before saving
   - `DELETE` with open position requires confirmation flag in request body
   - *Depends on: 3.6, 4.1, 8.1*
-- [ ] **8.3** Implement trades endpoints (`app/api/v1/trades.py`): `GET /api/v1/trades`, `GET /api/v1/trades/{id}` *(S)*
+- [x] **8.3** Implement trades endpoints (`app/api/v1/trades.py`): `GET /api/v1/trades`, `GET /api/v1/trades/{id}` *(S)*
   - *Depends on: 3.7, 8.1*
-- [ ] **8.4** Implement strategies endpoints (`app/api/v1/strategies.py`): `GET /api/v1/strategies`, `PATCH /api/v1/strategies/{id}` *(M)*
+- [x] **8.4** Implement strategies endpoints (`app/api/v1/strategies.py`): `GET /api/v1/strategies`, `PATCH /api/v1/strategies/{id}` *(M)*
   - `PATCH` handles both `is_enabled` toggle and JSONB config updates (including `config.symbols` assignment)
   - *Depends on: 3.8, 8.1*
-- [ ] **8.5** Implement portfolio/risk endpoint (`app/api/v1/portfolio.py`): `GET /api/v1/portfolio/risk` *(S)*
+- [x] **8.5** Implement portfolio/risk endpoint (`app/api/v1/portfolio.py`): `GET /api/v1/portfolio/risk` *(S)*
   - *Depends on: 3.9, 8.1*
-- [ ] **8.6** Implement system health endpoint (`app/api/v1/system.py`): `GET /api/v1/system/health` *(S)*
+- [x] **8.6** Implement system health endpoint (`app/api/v1/system.py`): `GET /api/v1/system/health` *(S)*
   - Returns broker, DB, and Redis status; HTTP 503 if any critical component down; response < 500ms
   - *Depends on: 4.1, 3.5, 5.1, 8.1*
-- [ ] **8.7** Implement WebSocket endpoint `/ws/dashboard` (`app/api/websocket.py`) *(L)*
+- [x] **8.7** Implement WebSocket endpoint `/ws/dashboard` (`app/api/websocket.py`) *(L)*
   - Multiplexes three channels over a single connection: trade events, risk updates, `watchlist_prices`
   - Uses Redis pub/sub as the source of truth — WebSocket handler is a thin forwarder
   - *Depends on: 5.1, 5.2, 7.2*

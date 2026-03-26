@@ -4,10 +4,18 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.middleware import ErrorHandlerMiddleware
+from app.api.v1.portfolio import router as portfolio_router
+from app.api.v1.strategies import router as strategies_router
+from app.api.v1.symbols import router as symbols_router
+from app.api.v1.system import router as system_router
+from app.api.v1.trades import router as trades_router
+from app.api.websocket import router as ws_router
 from app.config import get_settings
 from app.monitoring.logger import setup_logging, system_logger
 
 settings = get_settings()
+
+_API_PREFIX = "/api/v1"
 
 
 @asynccontextmanager
@@ -40,6 +48,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# REST API v1 routers
+app.include_router(symbols_router, prefix=_API_PREFIX)
+app.include_router(trades_router, prefix=_API_PREFIX)
+app.include_router(strategies_router, prefix=_API_PREFIX)
+app.include_router(portfolio_router, prefix=_API_PREFIX)
+app.include_router(system_router, prefix=_API_PREFIX)
+
+# WebSocket — no version prefix, path is /ws/dashboard
+app.include_router(ws_router)
 
 
 @app.get("/", tags=["root"])

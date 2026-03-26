@@ -149,6 +149,16 @@ class BaseBroker(ABC):
         """Remove a single ticker from the active price subscription."""
 
     @abstractmethod
+    async def validate_ticker(self, symbol: str) -> bool:
+        """
+        Return True if the symbol is a valid tradeable security.
+
+        Used by the POST /api/v1/symbols endpoint before persisting a new
+        watchlist entry. Implementations that cannot validate (e.g. mock)
+        should return True.
+        """
+
+    @abstractmethod
     async def get_historical_data(
         self,
         symbol: str,
