@@ -47,7 +47,7 @@ class OrderRequest(BaseModel):
     quantity: Decimal
     order_type: Literal["MKT", "LMT"] = "MKT"
     limit_price: Decimal | None = None
-    stop_loss_price: Decimal  # required — enforced upstream by risk layer
+    stop_loss_price: Decimal | None = None  # set when submit_stop_to_broker=True; None for close orders
     strategy_id: UUID | None = None
 
 

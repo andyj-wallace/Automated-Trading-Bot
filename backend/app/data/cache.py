@@ -67,6 +67,44 @@ class RedisCache:
         """Publish a message to a Redis pub/sub channel."""
         await self._client.publish(channel, message)
 
+    async def subscribe_many(
+        self,
+        channels: list[str],
+        patterns: list[str],
+    ) -> AsyncGenerator[dict, None]:
+        """
+        Async generator that yields raw message dicts from one or more channels
+        and/or glob patterns.
+
+        Yielded dicts contain at minimum:
+            type     — "message" (channel) or "pmessage" (pattern)
+            channel  — the matched channel name (bytes decoded to str)
+            data     — the message payload (str)
+            pattern  — the matched pattern, only present for "pmessage"
+
+        Usage:
+            async for msg in cache.subscribe_many(
+                channels=["trade_events"],
+                patterns=["price:*"],
+            ):
+                ...
+        """
+        pubsub = self._client.pubsub()
+        if channels:
+            await pubsub.subscribe(*channels)
+        if patterns:
+            await pubsub.psubscribe(*patterns)
+        try:
+            async for raw in pubsub.listen():
+                if raw["type"] in ("message", "pmessage"):
+                    yield raw
+        finally:
+            if channels:
+                await pubsub.unsubscribe(*channels)
+            if patterns:
+                await pubsub.punsubscribe(*patterns)
+            await pubsub.aclose()
+
     async def subscribe(self, channel: str) -> AsyncGenerator[str, None]:
         """
         Async generator that yields messages from a Redis pub/sub channel.

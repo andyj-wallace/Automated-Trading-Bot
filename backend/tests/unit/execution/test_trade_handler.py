@@ -1,5 +1,9 @@
 """
-Unit tests for TradeHandler (Layer 7.2).
+Unit tests for TradeHandler (Layer 7.2 / 6B.8).
+
+After 6B.8, TradeHandler.on_fill() no longer creates the trade row.
+Instead it looks up the existing trade (created at PENDING by OrderManager)
+and publishes the trade_executed event to Redis.
 
 Uses an in-memory fake cache and a mock DB session — no Redis or PostgreSQL needed.
 """
@@ -15,7 +19,7 @@ import pytest
 from app.brokers.base import OrderResult
 from app.core.execution.trade_handler import TRADE_EVENTS_CHANNEL, TradeHandler
 from app.core.risk.manager import TradeRequest, ValidationResult
-from app.db.models.trade import TradeDirection, TradeStatus
+from app.db.models.trade import ExitReason, TradeDirection, TradeStatus
 
 
 # ---------------------------------------------------------------------------
@@ -32,14 +36,14 @@ class FakeCache:
 
 
 class FakeTrade:
-    """Simulates what TradeRepo.create() returns."""
+    """Simulates what TradeRepo.get_by_id() returns after 6B.8."""
 
     def __init__(self, request: TradeRequest, order_result: OrderResult) -> None:
         self.id = request.trade_id
         self.symbol = request.symbol
         self.direction = TradeDirection(request.direction)
         self.quantity = order_result.filled_quantity
-        self.entry_price = order_result.avg_fill_price
+        self.entry_price = request.entry_price  # requested price (set at PENDING)
         self.stop_loss_price = request.stop_loss_price
         self.risk_amount = Decimal("50")
         self.account_balance_at_entry = Decimal("100000")
@@ -80,6 +84,8 @@ def _make_validation(request: TradeRequest) -> ValidationResult:
         risk_amount=Decimal("50.05"),
         max_quantity=200,
         account_balance_at_entry=Decimal("100000"),
+        take_profit_price=Decimal("210"),
+        reward_to_risk_ratio=Decimal("2.0"),
     )
 
 
@@ -94,29 +100,27 @@ def handler(cache: FakeCache) -> TradeHandler:
 
 
 def _make_mock_session(request: TradeRequest, order_result: OrderResult):
-    """Returns an AsyncMock session whose TradeRepo.create returns a FakeTrade."""
+    """Returns a patched TradeRepo whose get_by_id returns a FakeTrade."""
     session = MagicMock()
     fake_trade = FakeTrade(request, order_result)
-
-    import app.core.execution.trade_handler as th_module
 
     class PatchedRepo:
         def __init__(self, _session):
             pass
 
-        async def create(self, **kwargs):
+        async def get_by_id(self, trade_id):
             return fake_trade
 
     return session, PatchedRepo, fake_trade
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint (4): trade row persisted
+# on_fill looks up existing trade (not creates)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_on_fill_calls_trade_repo_create(handler: TradeHandler, monkeypatch) -> None:
+async def test_on_fill_looks_up_existing_trade(handler: TradeHandler, monkeypatch) -> None:
     req = _request()
     result = _make_order_result(req)
     validation = _make_validation(req)
@@ -131,24 +135,31 @@ async def test_on_fill_calls_trade_repo_create(handler: TradeHandler, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_on_fill_uses_actual_fill_price_not_requested(
+async def test_on_fill_raises_when_trade_not_found(
     handler: TradeHandler, monkeypatch
 ) -> None:
-    """Entry price stored must be the broker's avg_fill_price, not entry_price from request."""
-    req = _request(entry_price=Decimal("200.00"))
-    result = _make_order_result(req, avg_fill_price=Decimal("200.05"))
+    """on_fill must raise if OrderManager didn't create the trade row."""
+    req = _request()
+    result = _make_order_result(req)
     validation = _make_validation(req)
-    session, PatchedRepo, fake_trade = _make_mock_session(req, result)
+    session = MagicMock()
+
+    class RepoReturningNone:
+        def __init__(self, _session):
+            pass
+
+        async def get_by_id(self, trade_id):
+            return None
 
     import app.core.execution.trade_handler as th_module
-    monkeypatch.setattr(th_module, "TradeRepo", PatchedRepo)
+    monkeypatch.setattr(th_module, "TradeRepo", RepoReturningNone)
 
-    trade = await handler.on_fill(req, validation, result, session)
-    assert trade.entry_price == Decimal("200.05")
+    with pytest.raises(RuntimeError, match="not found"):
+        await handler.on_fill(req, validation, result, session)
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint (4): trade event published to Redis
+# Trade event published to Redis
 # ---------------------------------------------------------------------------
 
 
@@ -195,6 +206,27 @@ async def test_on_fill_published_event_format(
     assert payload["symbol"] == "AAPL"
     assert payload["direction"] == "BUY"
     assert payload["status"] == "OPEN"
+
+
+@pytest.mark.asyncio
+async def test_on_fill_event_includes_take_profit_and_rr(
+    handler: TradeHandler, cache: FakeCache, monkeypatch
+) -> None:
+    """6B: published event must include take_profit_price and reward_to_risk_ratio."""
+    req = _request()
+    result = _make_order_result(req)
+    validation = _make_validation(req)  # take_profit=210, rr=2.0
+    session, PatchedRepo, _ = _make_mock_session(req, result)
+
+    import app.core.execution.trade_handler as th_module
+    monkeypatch.setattr(th_module, "TradeRepo", PatchedRepo)
+
+    await handler.on_fill(req, validation, result, session)
+
+    _, raw = cache.published[0]
+    payload = json.loads(raw)["payload"]
+    assert payload["take_profit_price"] == "210"
+    assert payload["reward_to_risk_ratio"] == "2.0"
 
 
 # ---------------------------------------------------------------------------

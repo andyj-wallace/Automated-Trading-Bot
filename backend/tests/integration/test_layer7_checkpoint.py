@@ -2,11 +2,11 @@
 Layer 7 integration checkpoint — requires live Docker services.
 
 Verifies (against real DB and Redis):
-  (4) trade row is written to DB after on_fill()
-  Integration of submit_order() → on_fill() end-to-end with MockBroker
-
-Points (1)–(3) and (5) are fully covered by unit tests in
-tests/unit/execution/test_order_manager.py.
+  (1) trade row created at PENDING before broker call (6B.8)
+  (2) status transitions SUBMITTED → OPEN on fill (6B.8)
+  (3) PRE_SUBMISSION and POST_CONFIRMATION audit entries written (7.1)
+  (4) trade row readable from DB with correct final status (7.1)
+  (5) trade event published to trade_events Redis channel (7.2)
 
 Run after:
     docker-compose up -d
@@ -19,7 +19,9 @@ Then:
 import json
 import os
 import uuid
+from contextlib import asynccontextmanager
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
@@ -31,6 +33,7 @@ from app.core.execution.order_manager import OrderManager
 from app.core.execution.trade_handler import TRADE_EVENTS_CHANNEL, TradeHandler
 from app.core.risk.manager import RiskManager, RiskRejectionError, TradeRequest
 from app.data.cache import RedisCache
+from app.db.models.trade import TradeStatus
 from app.db.repositories.trade_repo import TradeRepo
 
 _DB_URL = os.environ.get(
@@ -61,13 +64,31 @@ async def cache() -> RedisCache:
 
 
 @pytest_asyncio.fixture
-async def session() -> AsyncSession:
-    engine = create_async_engine(_DB_URL, echo=False)
+async def engine():
+    eng = create_async_engine(_DB_URL, echo=False)
+    yield eng
+    await eng.dispose()
+
+
+@pytest_asyncio.fixture
+async def session_factory(engine):
+    """Returns an async session factory compatible with OrderManager."""
+    factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    @asynccontextmanager
+    async def _factory():
+        async with factory() as sess:
+            yield sess
+
+    return _factory
+
+
+@pytest_asyncio.fixture
+async def session(engine) -> AsyncSession:
     factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with factory() as sess:
         yield sess
         await sess.rollback()
-    await engine.dispose()
 
 
 def _valid_request(**kwargs) -> TradeRequest:
@@ -85,18 +106,104 @@ def _valid_request(**kwargs) -> TradeRequest:
 
 
 # ---------------------------------------------------------------------------
-# Checkpoint (4): trade row written to DB
+# Checkpoint (1): trade row created at PENDING before broker call
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_trade_created_at_pending_before_broker_call(
+    broker: MockBroker,
+    session_factory,
+    session: AsyncSession,
+) -> None:
+    """
+    6B.8: OrderManager creates a PENDING row before place_order() is called.
+    Verified by intercepting place_order and reading the DB inside it.
+    """
+    order_manager = OrderManager(broker, RiskManager(), session_factory)
+    req = _valid_request()
+
+    pending_status_observed = []
+
+    original = broker.place_order
+
+    async def spy_place_order(order_request):
+        # Inside broker call — the trade should already be at SUBMITTED
+        repo = TradeRepo(session)
+        trade = await repo.get_by_id(req.trade_id)
+        if trade:
+            pending_status_observed.append(trade.status)
+        return await original(order_request)
+
+    broker.place_order = spy_place_order
+    await order_manager.submit_order(req)
+    broker.place_order = original
+
+    # Should have been at SUBMITTED (PENDING → SUBMITTED before broker call)
+    assert pending_status_observed, "Broker spy was not called"
+    assert pending_status_observed[0] in (TradeStatus.PENDING, TradeStatus.SUBMITTED)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint (2): status transitions to OPEN on fill
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_trade_status_open_after_fill(
+    broker: MockBroker,
+    session_factory,
+    session: AsyncSession,
+) -> None:
+    order_manager = OrderManager(broker, RiskManager(), session_factory)
+    req = _valid_request()
+
+    validation, order_result = await order_manager.submit_order(req)
+    assert order_result.status == "FILLED"
+
+    repo = TradeRepo(session)
+    trade = await repo.get_by_id(req.trade_id)
+    assert trade is not None
+    assert trade.status == TradeStatus.OPEN
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint (3): audit entries written
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_audit_entries_written(
+    broker: MockBroker,
+    session_factory,
+) -> None:
+    order_manager = OrderManager(broker, RiskManager(), session_factory)
+    req = _valid_request()
+
+    with patch("app.core.execution.order_manager.audit_logger") as mock_audit:
+        await order_manager.submit_order(req)
+
+    messages = [c.args[0] for c in mock_audit.info.call_args_list]
+    assert "PRE_SUBMISSION" in messages
+    assert "POST_CONFIRMATION" in messages
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint (4): trade row readable with take_profit and R:R fields
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_on_fill_persists_trade_to_db(
-    broker: MockBroker, cache: RedisCache, session: AsyncSession
+    broker: MockBroker,
+    cache: RedisCache,
+    session_factory,
+    session: AsyncSession,
 ) -> None:
     """
     Full flow: submit_order() → on_fill() → trade row readable from DB.
     """
-    order_manager = OrderManager(broker, RiskManager())
+    order_manager = OrderManager(broker, RiskManager(), session_factory)
     trade_handler = TradeHandler(cache)
     req = _valid_request()
 
@@ -105,28 +212,32 @@ async def test_on_fill_persists_trade_to_db(
 
     trade = await trade_handler.on_fill(req, validation, order_result, session)
 
-    # Verify the row is readable in the same session (flushed but not committed).
-    # trade.id is auto-generated by the DB — not req.trade_id.
     repo = TradeRepo(session)
     fetched = await repo.get_by_id(trade.id)
 
     assert fetched is not None
     assert fetched.symbol == "AAPL"
-    assert fetched.entry_price == order_result.avg_fill_price
     assert fetched.stop_loss_price == req.stop_loss_price
     assert str(fetched.direction.value) == "BUY"
-    # Session is rolled back after the test — row does not persist.
+    assert fetched.status == TradeStatus.OPEN
+    # 6B fields
+    assert fetched.take_profit_price is not None
+    assert fetched.reward_to_risk_ratio is not None
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint (5): trade event published to Redis
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_on_fill_publishes_trade_event_to_redis(
-    broker: MockBroker, cache: RedisCache, session: AsyncSession
+    broker: MockBroker,
+    cache: RedisCache,
+    session_factory,
+    session: AsyncSession,
 ) -> None:
-    """
-    on_fill() publishes a trade_executed event to the trade_events Redis channel.
-    Intercepted by wrapping the cache.publish method.
-    """
-    order_manager = OrderManager(broker, RiskManager())
+    order_manager = OrderManager(broker, RiskManager(), session_factory)
     trade_handler = TradeHandler(cache)
     req = _valid_request(symbol="MSFT")
 
@@ -150,21 +261,24 @@ async def test_on_fill_publishes_trade_event_to_redis(
     assert event["event"] == "trade_executed"
     assert event["payload"]["symbol"] == "MSFT"
     assert event["payload"]["direction"] == "BUY"
+    # 6B fields in event
+    assert "take_profit_price" in event["payload"]
+    assert "reward_to_risk_ratio" in event["payload"]
 
 
 # ---------------------------------------------------------------------------
-# Rejection before any DB write
+# Rejection: no DB row written
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_risk_rejection_writes_no_db_row(
-    broker: MockBroker, session: AsyncSession
+    broker: MockBroker,
+    session_factory,
+    session: AsyncSession,
 ) -> None:
-    """
-    A rejected trade must leave zero rows in the DB for that trade_id.
-    """
-    order_manager = OrderManager(broker, RiskManager())
+    """A rejected trade must leave zero rows in the DB for that trade_id."""
+    order_manager = OrderManager(broker, RiskManager(), session_factory)
     req = _valid_request(stop_loss_price=None)
 
     with pytest.raises(RiskRejectionError):

@@ -129,6 +129,62 @@ async def test_broker_place_order_called(broker: MockBroker, manager: OrderManag
     assert calls[0].trade_id == req.trade_id
 
 
+@pytest.mark.asyncio
+async def test_stop_not_forwarded_to_broker_by_default(
+    broker: MockBroker, manager: OrderManager
+) -> None:
+    """6B.8: stop_loss_price is NOT sent to broker unless submit_stop_to_broker=True."""
+    req = _request()  # submit_stop_to_broker defaults to False
+    calls = []
+    original = broker.place_order
+
+    async def spy(order_request):
+        calls.append(order_request)
+        return await original(order_request)
+
+    broker.place_order = spy
+    await manager.submit_order(req)
+
+    assert calls[0].stop_loss_price is None
+
+
+@pytest.mark.asyncio
+async def test_stop_forwarded_to_broker_when_opted_in(
+    broker: MockBroker, manager: OrderManager
+) -> None:
+    """6B.8: stop_loss_price IS sent to broker when submit_stop_to_broker=True."""
+    req = _request(submit_stop_to_broker=True)
+    calls = []
+    original = broker.place_order
+
+    async def spy(order_request):
+        calls.append(order_request)
+        return await original(order_request)
+
+    broker.place_order = spy
+    await manager.submit_order(req)
+
+    assert calls[0].stop_loss_price == req.stop_loss_price
+
+
+@pytest.mark.asyncio
+async def test_pre_submission_includes_take_profit_and_rr(
+    manager: OrderManager,
+) -> None:
+    """6B.8: pre-submission audit entry includes take_profit_price and R:R."""
+    req = _request()
+    with patch("app.core.execution.order_manager.audit_logger") as mock_audit:
+        await manager.submit_order(req)
+
+    pre_call = next(
+        c for c in mock_audit.info.call_args_list if c.args[0] == "PRE_SUBMISSION"
+    )
+    extra = pre_call.kwargs["extra"]
+    assert "take_profit_price" in extra
+    assert "reward_to_risk_ratio" in extra
+    assert "submit_stop_to_broker" in extra
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint (3): post-confirmation entry written to audit.log
 # ---------------------------------------------------------------------------

@@ -25,6 +25,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.repositories.trade_repo import TradeRepo
 from app.monitoring.logger import risk_logger
 
+# Hard ceiling: aggregate portfolio risk must never exceed 10% of account balance.
+# This constant is shared with RiskManager (which has its own copy) and enforced
+# here so RiskMonitorConfig cannot be configured beyond this value.
+MAX_PORTFOLIO_RISK_HARD_LIMIT = Decimal("0.10")
+
 # Default maximum aggregate risk: 5% = up to 5 concurrent trades × 1% each.
 DEFAULT_MAX_AGGREGATE_RISK_PCT = Decimal("0.05")
 
@@ -44,6 +49,14 @@ class RiskMonitorConfig:
     warning_fraction: Decimal = field(default=_WARNING_FRACTION)
     critical_fraction: Decimal = field(default=_CRITICAL_FRACTION)
     poll_interval_seconds: int = field(default=DEFAULT_POLL_INTERVAL_SECONDS)
+
+    def __post_init__(self) -> None:
+        if self.max_aggregate_risk_pct > MAX_PORTFOLIO_RISK_HARD_LIMIT:
+            raise ValueError(
+                f"max_aggregate_risk_pct {self.max_aggregate_risk_pct} exceeds "
+                f"hard limit {MAX_PORTFOLIO_RISK_HARD_LIMIT}. "
+                "The portfolio risk ceiling is non-negotiable."
+            )
 
     @property
     def warning_threshold(self) -> Decimal:
