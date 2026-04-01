@@ -231,12 +231,12 @@ With all backend logic complete, expose it via thin FastAPI routes.
 
 ### Layer 9 — Frontend Shell
 
-- [ ] **9.1** Build React app shell: page router, persistent nav/sidebar layout, placeholder routes for all pages *(M)*
+- [x] **9.1** Build React app shell: page router, persistent nav/sidebar layout, placeholder routes for all pages *(M)*
   - Pages: Dashboard, Watchlist, Strategies, Portfolio, Symbol Detail, Backtesting, System Health
   - *Depends on: 1.5*
-- [ ] **9.2** Set up React Query client and base API client (`src/api/client.ts`) with request/response type wrappers *(S)*
+- [x] **9.2** Set up React Query client and base API client (`src/api/client.ts`) with request/response type wrappers *(S)*
   - *Depends on: 9.1*
-- [ ] **9.3** Set up WebSocket client hook (`src/hooks/useWebSocket.ts`) — connects to `/ws/dashboard`, reconnects on drop, exposes parsed event stream *(M)*
+- [x] **9.3** Set up WebSocket client hook (`src/hooks/useWebSocket.ts`) — connects to `/ws/dashboard`, reconnects on drop, exposes parsed event stream *(M)*
   - *Depends on: 9.1*
 
 **Checkpoint**: App loads in browser, nav works, all pages show "coming soon" placeholders. No 404s or console errors.
