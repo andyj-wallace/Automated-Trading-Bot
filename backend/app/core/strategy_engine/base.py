@@ -65,6 +65,13 @@ class Signal(BaseModel):
     A HOLD signal carries no financial fields. BUY/SELL signals must include
     entry_price, stop_loss_price, and quantity (sized by calculate_position_size).
     The RiskManager validates these before any order is submitted.
+
+    Optional take_profit_price: strategy suggestion; RiskManager accepts it if it
+    meets the minimum R:R ratio, otherwise calculates mechanically.
+
+    submit_stop_to_broker: when True, the stop-loss is sent to the broker as a
+    native stop order (provides protection if the system goes offline). Take-profit
+    is always managed internally by PositionMonitor.
     """
 
     symbol: str
@@ -74,6 +81,8 @@ class Signal(BaseModel):
     quantity: int | None = None
     strategy_id: UUID | None = None
     timestamp: datetime
+    take_profit_price: Decimal | None = None
+    submit_stop_to_broker: bool = False
 
 
 # ---------------------------------------------------------------------------

@@ -184,46 +184,46 @@ The risk layer is a pure calculation and validation layer — no I/O, no DB call
 
 Extends Layer 6 with R:R enforcement, portfolio-level cap, and internal position monitoring. These changes touch existing Layer 6 files plus add a new `PositionMonitor` component.
 
-- [ ] **6B.1** Update `Signal` model (`app/core/strategy_engine/base.py`) *(S)*
+- [x] **6B.1** Update `Signal` model (`app/core/strategy_engine/base.py`) *(S)*
   - Add `take_profit_price: Decimal | None = None` — strategy suggestion, optional
   - Add `submit_stop_to_broker: bool = False` — opt-in flag per strategy
   - *Depends on: 6.1*
-- [ ] **6B.2** Update `TradeRequest` and `ValidationResult` (`app/core/risk/manager.py`) *(S)*
+- [x] **6B.2** Update `TradeRequest` and `ValidationResult` (`app/core/risk/manager.py`) *(S)*
   - `TradeRequest`: add `take_profit_price: Decimal | None`, `submit_stop_to_broker: bool = False`
   - `ValidationResult`: add `take_profit_price: Decimal`, `reward_to_risk_ratio: Decimal`
   - *Depends on: 6.3*
-- [ ] **6B.3** Add R:R gate to `RiskManager.validate()` (`app/core/risk/manager.py`) *(M)*
+- [x] **6B.3** Add R:R gate to `RiskManager.validate()` (`app/core/risk/manager.py`) *(M)*
   - Add `min_reward_to_risk: Decimal = Decimal("2.0")` to `RiskManager.__init__`
   - Gate 3: if strategy suggested `take_profit_price` and it's below `required_take_profit` → reject with `INSUFFICIENT_REWARD`
   - Gate 3: if no suggestion → set `take_profit_price = entry + (stop_distance × min_rr_ratio)`
   - Include `take_profit_price` and `reward_to_risk_ratio` in `ValidationResult`
   - Log R:R rejections to `risk.log` with: entry, stop, required target, suggested target
   - *Depends on: 6B.2*
-- [ ] **6B.4** Add portfolio max risk gate to `RiskManager.validate()` *(M)*
+- [x] **6B.4** Add portfolio max risk gate to `RiskManager.validate()` *(M)*
   - Add `MAX_PORTFOLIO_RISK_HARD_LIMIT = Decimal("0.10")` constant (never overridable)
   - `validate()` gains `current_aggregate_risk: Decimal` parameter
   - Gate 4: reject with `PORTFOLIO_RISK_LIMIT_EXCEEDED` if `aggregate + new > max × balance`
   - Log rejection with: current aggregate, new trade risk, configured limit
   - *Depends on: 6B.3*
-- [ ] **6B.5** Enforce hard limit in `RiskMonitorConfig` (`app/core/risk/monitor.py`) *(S)*
+- [x] **6B.5** Enforce hard limit in `RiskMonitorConfig` (`app/core/risk/monitor.py`) *(S)*
   - Add `MAX_PORTFOLIO_RISK_HARD_LIMIT = Decimal("0.10")` 
   - Validate `max_aggregate_risk_pct ≤ MAX_PORTFOLIO_RISK_HARD_LIMIT` in `__post_init__`; raise `ValueError` if exceeded
   - *Depends on: 6.4*
-- [ ] **6B.6** Alembic migration: add new columns and update `status` ENUM on `trades` table *(S)*
+- [x] **6B.6** Alembic migration: add new columns and update `status` ENUM on `trades` table *(S)*
   - Add `take_profit_price DECIMAL NOT NULL`
   - Add `reward_to_risk_ratio DECIMAL NOT NULL`
   - Add `exit_reason VARCHAR` nullable, ENUM values: `STOP_LOSS`, `TAKE_PROFIT`, `MANUAL`
   - Expand `status` ENUM from `OPEN, CLOSED, CANCELLED` to `PENDING, SUBMITTED, OPEN, CLOSING, CLOSED, CANCELLED`
   - Update `Trade` ORM model (`app/db/models/trade.py`) to match
   - *Depends on: 3.3*
-- [ ] **6B.7** Implement `PositionMonitor` (`app/core/execution/position_monitor.py`) *(M)*
+- [x] **6B.7** Implement `PositionMonitor` (`app/core/execution/position_monitor.py`) *(M)*
   - Subscribes to `price:{ticker}` Redis channel for all open trades (loaded from `TradeRepo` on start)
   - On price update: compare against `stop_loss_price` and `take_profit_price` for each matching open trade
   - Triggers `OrderManager.close_position(trade_id, reason)` when a level is hit
   - Updates subscription list when new trades open or close (via Redis trade events channel)
   - Runs as a background asyncio task
   - *Depends on: 6B.6, 5.1, 7.1*
-- [ ] **6B.8** Update `OrderManager` (`app/core/execution/order_manager.py`) *(M)*
+- [x] **6B.8** Update `OrderManager` (`app/core/execution/order_manager.py`) *(M)*
   - Create trade row at `PENDING` (via `TradeRepo`) before any broker call; write pre-submission audit entry
   - Transition to `SUBMITTED` immediately before `place_order()` is called
   - Transition to `OPEN` on `FILLED`/`PARTIAL` broker response; to `CANCELLED` on `REJECTED`/`ERROR`
@@ -232,7 +232,7 @@ Extends Layer 6 with R:R enforcement, portfolio-level cap, and internal position
   - Include `take_profit_price`, `reward_to_risk_ratio`, `submit_stop_to_broker` in pre-submission audit entry
   - Log any unexpected status transition as `CRITICAL` to `error.log`
   - *Depends on: 6B.4, 6B.6, 6B.7*
-- [ ] **6B.9** Wire `PositionMonitor` startup into app lifecycle (`app/main.py`) *(S)*
+- [x] **6B.9** Wire `PositionMonitor` startup into app lifecycle (`app/main.py`) *(S)*
   - Start as background task on app startup; stop cleanly on shutdown
   - *Depends on: 6B.7*
 

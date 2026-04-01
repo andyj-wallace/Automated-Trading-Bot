@@ -16,9 +16,18 @@ class TradeDirection(str, enum.Enum):
 
 
 class TradeStatus(str, enum.Enum):
-    OPEN = "OPEN"
-    CLOSED = "CLOSED"
-    CANCELLED = "CANCELLED"
+    PENDING = "PENDING"      # row created; risk validated; order not yet sent
+    SUBMITTED = "SUBMITTED"  # entry order sent to broker; awaiting fill
+    OPEN = "OPEN"            # broker confirmed fill; PositionMonitor active
+    CLOSING = "CLOSING"      # stop/target hit; close order submitted
+    CLOSED = "CLOSED"        # close confirmed; exit fields written
+    CANCELLED = "CANCELLED"  # rejected or cancelled before reaching OPEN
+
+
+class ExitReason(str, enum.Enum):
+    STOP_LOSS = "STOP_LOSS"
+    TAKE_PROFIT = "TAKE_PROFIT"
+    MANUAL = "MANUAL"
 
 
 class Trade(Base):
@@ -30,6 +39,9 @@ class Trade(Base):
     Audit-sensitive fields (entry_price, stop_loss_price, risk_amount,
     account_balance_at_entry) must never be updated after creation.
     TradeRepo enforces this by providing no update path for these columns.
+
+    Status lifecycle: PENDING → SUBMITTED → OPEN → CLOSING → CLOSED
+                                                  ↘ CANCELLED (from PENDING or SUBMITTED)
     """
 
     __tablename__ = "trades"
@@ -52,13 +64,22 @@ class Trade(Base):
     stop_loss_price: Mapped[Decimal] = mapped_column(
         Numeric(precision=18, scale=8), nullable=False
     )
+    take_profit_price: Mapped[Decimal] = mapped_column(
+        Numeric(precision=18, scale=8), nullable=False
+    )
+    reward_to_risk_ratio: Mapped[Decimal] = mapped_column(
+        Numeric(precision=18, scale=8), nullable=False
+    )
     exit_price: Mapped[Decimal | None] = mapped_column(
         Numeric(precision=18, scale=8), nullable=True
+    )
+    exit_reason: Mapped[ExitReason | None] = mapped_column(
+        PGENUM(ExitReason, name="exitreason", create_type=False), nullable=True
     )
     status: Mapped[TradeStatus] = mapped_column(
         PGENUM(TradeStatus, name="tradestatus", create_type=False),
         nullable=False,
-        default=TradeStatus.OPEN,
+        default=TradeStatus.PENDING,
     )
     # Calculated at validation time: quantity × (entry_price − stop_loss_price)
     risk_amount: Mapped[Decimal] = mapped_column(Numeric(precision=18, scale=8), nullable=False)

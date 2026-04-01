@@ -17,15 +17,52 @@ settings = get_settings()
 
 _API_PREFIX = "/api/v1"
 
+_position_monitor = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _position_monitor
+
     setup_logging(log_level=settings.log_level)
     system_logger.info(
         "Application starting",
         extra={"environment": settings.environment, "log_level": settings.log_level},
     )
+
+    # ------------------------------------------------------------------
+    # Start PositionMonitor as a background task
+    # ------------------------------------------------------------------
+    from app.core.execution.order_manager import OrderManager
+    from app.core.execution.position_monitor import PositionMonitor
+    from app.core.risk.manager import RiskManager
+    from app.data.cache import RedisCache
+    from app.db.session import AsyncSessionFactory
+    from app.dependencies import _build_broker
+
+    broker = _build_broker()
+    cache = RedisCache(settings.redis_url)
+    order_manager = OrderManager(
+        broker=broker,
+        risk_manager=RiskManager(),
+        session_factory=AsyncSessionFactory,
+        cache=cache,
+    )
+    _position_monitor = PositionMonitor(
+        cache=cache,
+        session_factory=AsyncSessionFactory,
+        order_manager=order_manager,
+    )
+    await _position_monitor.start()
+
     yield
+
+    # ------------------------------------------------------------------
+    # Graceful shutdown
+    # ------------------------------------------------------------------
+    if _position_monitor:
+        await _position_monitor.stop()
+    await cache.close()
     system_logger.info("Application shutting down")
 
 
