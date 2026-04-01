@@ -15,8 +15,11 @@ graph TD
     API --> RM[Risk Manager]
     API --> DM[Data Manager]
     API --> NS[Notification Service]
-    SE --> BK[Broker Abstraction Layer]
-    RM --> BK
+    SE -->|Signal| RM
+    RM -->|ValidationResult| OM[Order Manager]
+    OM --> BK[Broker Abstraction Layer]
+    PM[Position Monitor] -->|price hit → close| OM
+    RD -->|price feed| PM
     BK --> IBKR[Interactive Brokers API]
     DM --> PG[(PostgreSQL + TimescaleDB)]
     DM --> RD[(Redis Cache)]
@@ -44,18 +47,59 @@ graph TD
 **Signal flow:**
 ```
 Market Data → Strategy.generate_signal() → Signal
-Signal + Portfolio State → RiskManager.validate() → Approved/Rejected
-Approved Signal → OrderManager.execute() → Broker
+             (optional: stop suggestion, take-profit suggestion, submit_stop_to_broker flag)
+                          ↓
+             Signal + Portfolio State → RiskManager.validate()
+             ├── Check 1: stop-loss present / valid
+             ├── Check 2: position size within 1% rule
+             ├── Check 3: R:R ratio ≥ minimum (calculate take-profit if not suggested)
+             ├── Check 4: aggregate portfolio exposure ≤ max
+             └── REJECT → log to risk.log → End
+                 APPROVE → ValidationResult (stop, take_profit, quantity, risk_amount)
+                          ↓
+             OrderManager.submit_order() → Broker (entry order only)
+                          ↓
+             PositionMonitor watches price:{ticker} in Redis
+             ├── price ≤ stop_loss_price  → OrderManager.close_position()
+             └── price ≥ take_profit_price → OrderManager.close_position()
 ```
 
 ### 3. Risk Management (`backend/app/core/risk/`)
-- Enforces the **1% rule** as a hard gate on every individual trade (not configurable):
-  - Maximum loss per trade = 1% of current account balance
-  - Loss is defined as: `quantity × (entry_price − stop_loss_price)`
-  - A stop-loss price is **required** for every trade — orders without one are rejected outright
-  - Multiple trades can be open simultaneously; each independently capped at 1% (e.g. 5 trades = up to 5% total exposure)
-- `RiskCalculator`: derives maximum safe position size from account balance, entry price, and stop-loss distance
-- `RiskMonitor`: tracks aggregate open exposure across all active trades and emits alerts as total risk grows
+
+The risk engine is the sole authority on whether a trade may be entered and on what terms. Strategies feed signals in; the risk engine determines stop-loss, take-profit, position size, and portfolio-level fit.
+
+**Per-trade rules (hard gates — not configurable):**
+- Maximum loss per trade = 1% of current account balance
+- Loss is defined as: `quantity × (entry_price − stop_loss_price)`
+- A stop-loss price is **required** — orders without one are rejected outright
+- Multiple trades can be open simultaneously; each independently capped at 1%
+
+**Stop-loss ownership:**
+- The risk engine owns stop-loss determination — it validates a strategy-suggested value or falls back to a calculated default
+- Strategies may include a `stop_loss_price` suggestion in their signal; the risk engine accepts it only if valid (i.e. below entry, produces a sensible risk distance)
+
+**Reward-to-risk ratio (configurable, default 2:1):**
+- Every trade must achieve a minimum R:R ratio before entry is permitted
+- `required_take_profit = entry_price + (stop_distance × min_rr_ratio)`
+- Strategy may suggest a `take_profit_price`; accepted if ≥ `required_take_profit`, rejected otherwise
+- If no suggestion is provided, the risk engine calculates `take_profit_price` mechanically
+- Trades that cannot achieve the minimum R:R (e.g. mechanically calculated target is unrealistic given market conditions) are rejected — strategies are expected to skip such setups
+
+**Portfolio-level constraint (configurable):**
+- Maximum aggregate open exposure: default 5%, hard ceiling 10% (never configurable beyond 10%)
+- `RiskManager.validate()` checks `current_aggregate_risk + new_risk_amount ≤ max_portfolio_risk` before approving
+- New trades are rejected if they would push total exposure over the active limit
+
+**Internal position monitoring (`PositionMonitor`):**
+- Stop-loss and take-profit levels are stored in the `trades` table and monitored internally
+- `PositionMonitor` subscribes to the Redis `price:{ticker}` feed and triggers `OrderManager.close_position()` when either level is hit
+- Neither stop-loss nor take-profit needs to be sent to the broker — execution is managed by the system
+- **Optional broker stop-loss**: a strategy may set `submit_stop_to_broker: true` on its signal to send the stop as a native broker stop order (provides protection if the system goes offline); take-profit is always managed internally
+
+**Components:**
+- `RiskCalculator`: derives max position size and validates/calculates stop & target prices
+- `RiskManager`: orchestrates all gates — calls calculator, checks R:R, checks portfolio limit; returns `ValidationResult` with approved stop, take-profit, and position size
+- `RiskMonitor`: polls open trades, computes aggregate exposure, emits WARNING (≥75% of max) and CRITICAL (≥90% of max) log alerts; wired to Redis pub/sub in Layer 14
 - All trade executions must pass `RiskManager.validate()` before order submission
 
 ### 4. Broker Abstraction Layer (`backend/app/brokers/`)
@@ -124,26 +168,47 @@ IB Gateway must be running and authenticated before `IBKRClient.connect()` is ca
         │
         ▼
 [Strategy Engine: generate_signal()]
-        │ Signal (BUY/SELL/HOLD + size hint)
+        │ Signal (BUY/SELL/HOLD)
+        │ optional: stop_loss_price, take_profit_price, submit_stop_to_broker
         ▼
 [Risk Manager: validate()]
-    ├── REJECT → Log risk rejection → End
-    └── APPROVE
-            │
+    ├── Gate 1: stop-loss present and valid
+    ├── Gate 2: position size within 1% rule
+    ├── Gate 3: R:R ≥ minimum (calculate take-profit if not provided)
+    ├── Gate 4: aggregate exposure ≤ portfolio max
+    ├── REJECT → Log to risk.log → End
+    └── APPROVE → ValidationResult
+            │  (stop_loss_price, take_profit_price, quantity, risk_amount)
             ▼
     [Order Manager: submit_order()]
-            │
+            │ status → PENDING; trade row created; pre-submission audit written
             ▼
     [Broker Layer: place_order()]
-            │
+            │ status → SUBMITTED
             ▼
     [IBKR API]
             │ Execution confirmation
-            ▼
-    [Trade Repo: record_trade()]
-            │
-            ▼
-    [Redis Pub/Sub: broadcast to dashboard]
+            ├── REJECTED / ERROR → status → CANCELLED; logged
+            └── FILLED / PARTIAL → status → OPEN
+                    │ persists stop_loss_price, take_profit_price, reward_to_risk_ratio
+                    ▼
+            [Trade Repo: update_trade()]
+                    │
+                    ▼
+            [Redis Pub/Sub: broadcast to dashboard]
+                    │
+                    ▼
+            [Position Monitor: watches price:{ticker}]
+            ├── price ≤ stop_loss_price  → close_position(reason=STOP_LOSS)
+            │                               status → CLOSING
+            └── price ≥ take_profit_price → close_position(reason=TAKE_PROFIT)
+                                             status → CLOSING
+                    │
+                    ▼
+            [Broker Layer: place_order() — close]
+                    │ confirmation
+                    ▼
+            status → CLOSED; exit_price, exit_reason, pnl written
 ```
 
 ### Dashboard Real-time Update Flow
@@ -220,15 +285,37 @@ IB Gateway must be running and authenticated before `IBKRClient.connect()` is ca
 | `direction` | ENUM | `BUY`, `SELL` |
 | `quantity` | DECIMAL | Sized to satisfy 1% rule |
 | `entry_price` | DECIMAL | |
-| `stop_loss_price` | DECIMAL | **Required** — used to calculate risk amount |
+| `stop_loss_price` | DECIMAL | **Required** — set by risk engine (strategy suggestion validated or overridden) |
+| `take_profit_price` | DECIMAL | **Required** — set by risk engine (strategy suggestion validated or calculated from R:R) |
+| `reward_to_risk_ratio` | DECIMAL | Actual R:R of the trade at entry: `(take_profit − entry) / (entry − stop_loss)` |
 | `exit_price` | DECIMAL | Nullable until closed |
-| `status` | ENUM | `OPEN`, `CLOSED`, `CANCELLED` |
+| `exit_reason` | ENUM | Nullable until closed: `STOP_LOSS`, `TAKE_PROFIT`, `MANUAL` |
+| `status` | ENUM | `PENDING` → `SUBMITTED` → `OPEN` → `CLOSING` → `CLOSED` (or `CANCELLED`) — see lifecycle below |
 | `risk_amount` | DECIMAL | `quantity × (entry_price − stop_loss_price)` — must be ≤ 1% of account balance at entry |
 | `account_balance_at_entry` | DECIMAL | Snapshot of balance used for 1% calculation |
 | `pnl` | DECIMAL | Nullable until closed |
 | `executed_at` | TIMESTAMPTZ | |
 | `closed_at` | TIMESTAMPTZ | Nullable |
 | `created_at` | TIMESTAMPTZ | |
+
+**Trade status lifecycle:**
+```
+PENDING   — trade row created; risk validation passed; pre-submission audit written;
+            order not yet sent to broker
+    ↓
+SUBMITTED — entry order sent to broker; awaiting fill confirmation
+    ↓
+OPEN      — broker confirmed fill (FILLED or PARTIAL); PositionMonitor now active for this trade
+    ↓
+CLOSING   — stop or target hit; close order submitted to broker; awaiting confirmation
+    ↓
+CLOSED    — close order confirmed by broker; exit_price, exit_reason, pnl written
+
+CANCELLED — order was rejected or cancelled before reaching OPEN
+            (broker REJECTED response, or manual cancel while PENDING/SUBMITTED)
+```
+
+Transitions are only ever forward. No state may go backward. `CANCELLED` is only reachable from `PENDING` or `SUBMITTED`. Any unexpected transition is logged as an error.
 
 ### `trading_strategies`
 | Column | Type | Notes |
