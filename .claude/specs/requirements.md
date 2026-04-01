@@ -83,6 +83,36 @@
 - [ ] Audit log entries are append-only; no update or delete path exists in the codebase
 - [ ] Audit logs are retained separately from rotating application logs and are **not subject to the 10MB rotation/overwrite policy**
 - [ ] Both entries are produced inside `OrderManager.submit_order()` — this is the single enforced choke point; no other code path may submit orders
+- [ ] Pre-submission entry includes: `take_profit_price`, `reward_to_risk_ratio`, `submit_stop_to_broker` flag
+- [ ] Close entries (from `PositionMonitor` triggers) are also written to `trading.log` with `exit_reason`
+
+---
+
+### INF-05 — Trade Lifecycle State Tracking
+**Priority**: P0
+
+> As a trader, I want every trade to have a visible status reflecting exactly where it is in its lifecycle, so that I can see at a glance whether an order is pending, live, being closed, or done.
+
+**Status definitions:**
+| Status | Meaning |
+|--------|---------|
+| `PENDING` | Risk approved; trade row created; pre-submission audit written; order not yet sent to broker |
+| `SUBMITTED` | Entry order sent to broker; awaiting fill confirmation |
+| `OPEN` | Broker confirmed fill (`FILLED` or `PARTIAL`); `PositionMonitor` active |
+| `CLOSING` | Stop or target hit; close order submitted; awaiting broker confirmation |
+| `CLOSED` | Close confirmed; `exit_price`, `exit_reason`, `pnl` written |
+| `CANCELLED` | Order rejected or cancelled before reaching `OPEN` (only reachable from `PENDING` or `SUBMITTED`) |
+
+**Acceptance Criteria:**
+- [ ] `trades.status` column is an ENUM with values: `PENDING`, `SUBMITTED`, `OPEN`, `CLOSING`, `CLOSED`, `CANCELLED`
+- [ ] `OrderManager.submit_order()` creates the trade row at `PENDING` before any broker call
+- [ ] Status transitions to `SUBMITTED` immediately before `place_order()` is called
+- [ ] Status transitions to `OPEN` on broker `FILLED` or `PARTIAL` response
+- [ ] Status transitions to `CANCELLED` on broker `REJECTED` or `ERROR` response (from `PENDING` or `SUBMITTED` only)
+- [ ] `PositionMonitor` sets status to `CLOSING` when it submits a close order
+- [ ] Status transitions to `CLOSED` on close order broker confirmation; `exit_price`, `exit_reason`, `pnl` written atomically
+- [ ] No backward transitions permitted — any unexpected transition is logged as `CRITICAL` to `error.log`
+- [ ] All status transitions are reflected in the dashboard via Redis pub/sub within 5 seconds
 
 ---
 
@@ -218,7 +248,7 @@ max_quantity = floor( (account_balance × 0.01) / (entry_price − stop_loss_pri
 ```
 
 **Acceptance Criteria:**
-- [ ] `RiskCalculator.calculate_position_size(account_balance, entry_price, stop_loss_price)` returns max safe quantity
+- [ ] `RiskCalculator.max_quantity(account_balance, entry_price, stop_loss_price)` returns max safe quantity
 - [ ] Result always rounds **down** to whole shares (never up)
 - [ ] Function raises a validation error if `stop_loss_price >= entry_price` (invalid stop placement)
 - [ ] Result respects any additional per-strategy position size caps (whichever is smaller wins)
@@ -226,7 +256,107 @@ max_quantity = floor( (account_balance × 0.01) / (entry_price − stop_loss_pri
 
 ---
 
-### RSK-03 — Real-time Risk Monitoring
+### RSK-03 — Stop-Loss Ownership & Strategy Suggestions
+**Priority**: P0
+
+> As a trader, I want the risk engine to own stop-loss determination so that strategies cannot bypass risk rules by setting their own stop prices.
+
+**Rule:**
+- The risk engine is the sole authority on the stop-loss price used for position sizing and trade validation
+- A strategy may include a `stop_loss_price` suggestion in its signal; the risk engine validates it (must be < entry, must produce a sensible stop distance) and accepts or rejects it
+- If no suggestion is provided, the risk engine calculates the stop-loss via a configured default method
+
+**Acceptance Criteria:**
+- [ ] `Signal.stop_loss_price` is optional — strategies may suggest but never mandate a stop
+- [ ] `RiskManager.validate()` validates any suggested stop; rejects if invalid (e.g. stop ≥ entry)
+- [ ] Approved stop-loss is included in `ValidationResult` and persisted on the `trades` record
+- [ ] Stop-loss is always stored internally regardless of whether it is sent to the broker
+
+---
+
+### RSK-04 — Reward-to-Risk Ratio Enforcement
+**Priority**: P0
+
+> As a trader, I want every trade to meet a minimum reward-to-risk ratio so that winners are structurally larger than losers, making the system profitable even with a sub-50% win rate.
+
+**Rule:**
+- Minimum R:R ratio is configurable (default 2:1); no trade may be entered below the minimum
+- `required_take_profit = entry_price + (stop_distance × min_rr_ratio)`
+- A strategy may suggest a `take_profit_price`; it is accepted only if ≥ `required_take_profit`
+- If no suggestion is provided, the risk engine sets `take_profit_price = required_take_profit`
+- Trades where the minimum R:R is unachievable are rejected
+
+**Acceptance Criteria:**
+- [ ] `RiskManager` has a configurable `min_reward_to_risk: Decimal` (default `2.0`)
+- [ ] Every approved trade has a `take_profit_price` set in `ValidationResult`
+- [ ] `Signal.take_profit_price` is optional — strategy suggestion accepted if it meets minimum R:R
+- [ ] Trade rejected with reason `INSUFFICIENT_REWARD` if suggested take-profit is below required target
+- [ ] Actual `reward_to_risk_ratio` stored on the `trades` record at entry
+- [ ] Rejection logged to `risk.log` with: symbol, entry, stop, required target, suggested target (if any)
+
+---
+
+### RSK-05 — Portfolio Max Risk Enforcement
+**Priority**: P0
+
+> As a trader, I want a hard cap on total portfolio exposure so that even when multiple trades are open simultaneously, my total capital at risk stays within a defined limit.
+
+**Rule:**
+- Maximum aggregate open exposure: configurable, default 5%, hard system ceiling 10%
+- The ceiling of 10% is enforced in code and cannot be overridden via configuration
+- A new trade is rejected if `current_aggregate_risk + new_risk_amount > max_portfolio_risk_pct × account_balance`
+
+**Acceptance Criteria:**
+- [ ] `RiskManager.validate()` receives `current_aggregate_risk: Decimal` as a parameter
+- [ ] Trade rejected with reason `PORTFOLIO_RISK_LIMIT_EXCEEDED` if aggregate would exceed configured max
+- [ ] `MAX_PORTFOLIO_RISK_HARD_LIMIT = Decimal("0.10")` defined as a non-overridable constant
+- [ ] Default `max_aggregate_risk_pct = Decimal("0.05")` — configurable up to but not exceeding 0.10
+- [ ] `RiskMonitorConfig` validates that `max_aggregate_risk_pct ≤ MAX_PORTFOLIO_RISK_HARD_LIMIT` on instantiation
+- [ ] Rejection logged to `risk.log` with: current aggregate exposure, new trade risk, configured limit
+
+---
+
+### RSK-06 — Internal Position Monitoring (Stop & Target)
+**Priority**: P0
+
+> As a trader, I want the system to automatically close positions when the stop-loss or take-profit price is hit, without relying on broker-side stop orders.
+
+**Rule:**
+- `PositionMonitor` subscribes to `price:{ticker}` in Redis for all open positions
+- When `price ≤ stop_loss_price`: trigger `OrderManager.close_position(reason=STOP_LOSS)`
+- When `price ≥ take_profit_price`: trigger `OrderManager.close_position(reason=TAKE_PROFIT)`
+- `exit_reason` is recorded on the `trades` record on close
+
+**Acceptance Criteria:**
+- [ ] `PositionMonitor` (`app/core/execution/position_monitor.py`) subscribes to Redis price feed for all open trades
+- [ ] Stop-loss trigger closes position and records `exit_reason=STOP_LOSS`
+- [ ] Take-profit trigger closes position and records `exit_reason=TAKE_PROFIT`
+- [ ] Manual close records `exit_reason=MANUAL`
+- [ ] `PositionMonitor` runs as a background task alongside the main app
+- [ ] Position close events are published to Redis pub/sub for dashboard update
+
+---
+
+### RSK-07 — Optional Broker Stop-Loss Submission
+**Priority**: P1
+
+> As a trader, I want to optionally send a stop-loss order to the broker so that my position has downside protection even if the system goes offline.
+
+**Rule:**
+- Each strategy can set `submit_stop_to_broker: bool` on its signal (default `false`)
+- When `true`, `OrderManager` includes the stop-loss as a native stop order in the broker request
+- Take-profit is always managed internally — never sent to the broker
+
+**Acceptance Criteria:**
+- [ ] `Signal.submit_stop_to_broker: bool = False` field on base signal model
+- [ ] `TradeRequest.submit_stop_to_broker: bool = False` forwarded to `OrderManager`
+- [ ] `OrderManager` conditionally sets `stop_loss_price` on `OrderRequest` based on the flag
+- [ ] Stop-loss is always stored in the `trades` record regardless of the flag
+- [ ] Broker stop submission is noted in the pre-submission audit entry
+
+---
+
+### RSK-08 — Real-time Risk Monitoring
 **Priority**: P1
 
 > As a trader, I want to see both per-trade risk and total aggregate exposure across all open trades on the dashboard, so that I understand both individual trade risk and my overall capital at risk.
@@ -234,23 +364,22 @@ max_quantity = floor( (account_balance × 0.01) / (entry_price − stop_loss_pri
 **Acceptance Criteria:**
 - [ ] Dashboard displays per-trade risk: each open trade shows its locked-in risk amount and % of account balance
 - [ ] Dashboard displays aggregate exposure: sum of all open trade risk amounts as % of account balance (e.g. "3 trades open = 3.0% total at risk")
-- [ ] Aggregate exposure is informational — it does not block new trades (each trade is independently validated at 1%)
+- [ ] Dashboard shows take-profit target and R:R ratio per open trade
 - [ ] All metrics update within 5 seconds of any position change
 - [ ] Historical aggregate risk visible as a chart for the current trading day
 
 ---
 
-### RSK-04 — Risk Threshold Alerts
+### RSK-09 — Risk Threshold Alerts
 **Priority**: P1
 
-> As a trader, I want alerts when a proposed trade is approaching or breaching its 1% cap, and when total open exposure reaches notable levels, so that I maintain awareness of my capital at risk.
+> As a trader, I want alerts when total open exposure reaches notable levels, so that I maintain awareness of my capital at risk.
 
 **Acceptance Criteria:**
-- [ ] Alert fires if a new trade's calculated risk is between 90–100% of the 1% cap (warning before hard rejection)
-- [ ] Alert fires when total aggregate open exposure exceeds configurable thresholds (default: 3% and 5% of account balance)
-- [ ] Aggregate exposure alerts are **informational only** — they do not block new trades
+- [ ] Alert fires when total aggregate open exposure exceeds configurable thresholds (default: WARNING at 75% of max, CRITICAL at 90% of max)
+- [ ] Aggregate exposure alerts are **informational only** — they do not block new trades (blocking happens at Gate 4 in `RiskManager.validate()`)
 - [ ] Alerts delivered via dashboard notification and configured channels
-- [ ] Each alert includes: trigger reason, current values, and relevant trade(s)
+- [ ] Each alert includes: trigger reason, current aggregate exposure, configured limit, open trade count
 
 ---
 

@@ -42,6 +42,7 @@ trading-bot/
 │   │   │   │   └── monitor.py       # Real-time threshold monitoring
 │   │   │   ├── execution/
 │   │   │   │   ├── order_manager.py
+│   │   │   │   ├── position_monitor.py  # Watches price feed, triggers stop/target closes
 │   │   │   │   └── trade_handler.py
 │   │   │   └── backtesting/
 │   │   │       ├── engine.py
@@ -217,6 +218,10 @@ All strategies must extend `core/strategy_engine/base.py`:
 class BaseStrategy(ABC):
     @abstractmethod
     async def generate_signal(self, market_data: MarketData) -> Signal: ...
+    # Signal may optionally include:
+    #   stop_loss_price   — suggestion; risk engine validates or overrides
+    #   take_profit_price — suggestion; accepted only if it meets min R:R
+    #   submit_stop_to_broker — opt-in to sending stop as native broker order
 
     @abstractmethod
     async def calculate_position_size(self, risk_params: RiskParams) -> Decimal: ...
@@ -224,6 +229,15 @@ class BaseStrategy(ABC):
     @abstractmethod
     def get_config_schema(self) -> dict: ...
 ```
+
+### Risk Engine Responsibilities
+The risk engine (`core/risk/`) is the sole authority on trade terms. It:
+1. Validates or overrides the strategy's suggested stop-loss
+2. Validates or calculates the take-profit target (must meet `min_reward_to_risk`, default 2:1)
+3. Sizes the position (`floor((balance × 0.01) / stop_distance)`)
+4. Enforces the portfolio max risk cap (default 5%, hard ceiling 10%)
+
+Strategies provide the entry signal and optional suggestions. The risk engine decides whether and how to enter.
 
 ### Log File Placement
 ```

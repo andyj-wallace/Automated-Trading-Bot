@@ -158,7 +158,7 @@ Build the `MockBroker` first so all subsequent layers can be developed and teste
 
 ### Layer 6 — Risk Engine
 
-The risk layer is a pure calculation and validation layer — no I/O, no DB calls. Build and fully test it before hooking up to execution.
+The risk layer is a pure calculation and validation layer — no I/O, no DB calls (except `RiskMonitor` which reads open trades). Build and fully test it before hooking up to execution.
 
 - [x] **6.1** Define `BaseStrategy` abstract class (`app/core/strategy_engine/base.py`): `generate_signal()`, `calculate_position_size()`, `get_config_schema()` *(S)*
   - This is needed here only for the `RiskParams` type that `RiskCalculator` depends on
@@ -180,6 +180,66 @@ The risk layer is a pure calculation and validation layer — no I/O, no DB call
 
 ---
 
+### Layer 6B — Risk Engine Enhancements
+
+Extends Layer 6 with R:R enforcement, portfolio-level cap, and internal position monitoring. These changes touch existing Layer 6 files plus add a new `PositionMonitor` component.
+
+- [ ] **6B.1** Update `Signal` model (`app/core/strategy_engine/base.py`) *(S)*
+  - Add `take_profit_price: Decimal | None = None` — strategy suggestion, optional
+  - Add `submit_stop_to_broker: bool = False` — opt-in flag per strategy
+  - *Depends on: 6.1*
+- [ ] **6B.2** Update `TradeRequest` and `ValidationResult` (`app/core/risk/manager.py`) *(S)*
+  - `TradeRequest`: add `take_profit_price: Decimal | None`, `submit_stop_to_broker: bool = False`
+  - `ValidationResult`: add `take_profit_price: Decimal`, `reward_to_risk_ratio: Decimal`
+  - *Depends on: 6.3*
+- [ ] **6B.3** Add R:R gate to `RiskManager.validate()` (`app/core/risk/manager.py`) *(M)*
+  - Add `min_reward_to_risk: Decimal = Decimal("2.0")` to `RiskManager.__init__`
+  - Gate 3: if strategy suggested `take_profit_price` and it's below `required_take_profit` → reject with `INSUFFICIENT_REWARD`
+  - Gate 3: if no suggestion → set `take_profit_price = entry + (stop_distance × min_rr_ratio)`
+  - Include `take_profit_price` and `reward_to_risk_ratio` in `ValidationResult`
+  - Log R:R rejections to `risk.log` with: entry, stop, required target, suggested target
+  - *Depends on: 6B.2*
+- [ ] **6B.4** Add portfolio max risk gate to `RiskManager.validate()` *(M)*
+  - Add `MAX_PORTFOLIO_RISK_HARD_LIMIT = Decimal("0.10")` constant (never overridable)
+  - `validate()` gains `current_aggregate_risk: Decimal` parameter
+  - Gate 4: reject with `PORTFOLIO_RISK_LIMIT_EXCEEDED` if `aggregate + new > max × balance`
+  - Log rejection with: current aggregate, new trade risk, configured limit
+  - *Depends on: 6B.3*
+- [ ] **6B.5** Enforce hard limit in `RiskMonitorConfig` (`app/core/risk/monitor.py`) *(S)*
+  - Add `MAX_PORTFOLIO_RISK_HARD_LIMIT = Decimal("0.10")` 
+  - Validate `max_aggregate_risk_pct ≤ MAX_PORTFOLIO_RISK_HARD_LIMIT` in `__post_init__`; raise `ValueError` if exceeded
+  - *Depends on: 6.4*
+- [ ] **6B.6** Alembic migration: add new columns and update `status` ENUM on `trades` table *(S)*
+  - Add `take_profit_price DECIMAL NOT NULL`
+  - Add `reward_to_risk_ratio DECIMAL NOT NULL`
+  - Add `exit_reason VARCHAR` nullable, ENUM values: `STOP_LOSS`, `TAKE_PROFIT`, `MANUAL`
+  - Expand `status` ENUM from `OPEN, CLOSED, CANCELLED` to `PENDING, SUBMITTED, OPEN, CLOSING, CLOSED, CANCELLED`
+  - Update `Trade` ORM model (`app/db/models/trade.py`) to match
+  - *Depends on: 3.3*
+- [ ] **6B.7** Implement `PositionMonitor` (`app/core/execution/position_monitor.py`) *(M)*
+  - Subscribes to `price:{ticker}` Redis channel for all open trades (loaded from `TradeRepo` on start)
+  - On price update: compare against `stop_loss_price` and `take_profit_price` for each matching open trade
+  - Triggers `OrderManager.close_position(trade_id, reason)` when a level is hit
+  - Updates subscription list when new trades open or close (via Redis trade events channel)
+  - Runs as a background asyncio task
+  - *Depends on: 6B.6, 5.1, 7.1*
+- [ ] **6B.8** Update `OrderManager` (`app/core/execution/order_manager.py`) *(M)*
+  - Create trade row at `PENDING` (via `TradeRepo`) before any broker call; write pre-submission audit entry
+  - Transition to `SUBMITTED` immediately before `place_order()` is called
+  - Transition to `OPEN` on `FILLED`/`PARTIAL` broker response; to `CANCELLED` on `REJECTED`/`ERROR`
+  - Conditionally include `stop_loss_price` on `OrderRequest` only when `request.submit_stop_to_broker=True`
+  - Add `close_position(trade_id, reason)` method — transitions to `CLOSING`, submits close order, transitions to `CLOSED` on confirmation; writes `exit_price`, `exit_reason`, `pnl`
+  - Include `take_profit_price`, `reward_to_risk_ratio`, `submit_stop_to_broker` in pre-submission audit entry
+  - Log any unexpected status transition as `CRITICAL` to `error.log`
+  - *Depends on: 6B.4, 6B.6, 6B.7*
+- [ ] **6B.9** Wire `PositionMonitor` startup into app lifecycle (`app/main.py`) *(S)*
+  - Start as background task on app startup; stop cleanly on shutdown
+  - *Depends on: 6B.7*
+
+**Checkpoint**: Unit tests — R:R gate rejects below-minimum take-profit and accepts/calculates valid targets. Portfolio gate rejects when aggregate would exceed limit. `RiskMonitorConfig` raises on invalid max. Integration test — `PositionMonitor` with `MockBroker` fires a close when price crosses stop or target in Redis. Audit entries include new fields.
+
+---
+
 ### Layer 7 — Trade Execution & Audit Trail ⚠️
 
 This is the highest-criticality layer. The audit trail is non-optional (see `INF-04`).
@@ -191,10 +251,11 @@ This is the highest-criticality layer. The audit trail is non-optional (see `INF
   - If post-confirmation log write fails → escalate to `error.log` + fire system alert
   - Audit entries are append-only; no update/delete path permitted anywhere in the codebase
   - *Depends on: 6.3, 4.1, 2.2*
-- [x] **7.2** Implement `TradeHandler` (`app/core/execution/trade_handler.py`): post-fill callback that persists trade to DB and publishes trade event to Redis *(M)*
+- [x] **7.2** Implement `TradeHandler` (`app/core/execution/trade_handler.py`): post-fill callback that updates trade status to `OPEN` in DB and publishes trade event to Redis *(M)*
+  - Note: trade row is now created at `PENDING` by `OrderManager` (task 6B.8); `TradeHandler` only handles the fill transition and downstream events
   - *Depends on: 7.1, 3.7, 5.1*
 
-**Checkpoint** ✅: Using MockBroker — (1) PRE_SUBMISSION audit entry written before broker call, (2) mock order placed and FILLED, (3) POST_CONFIRMATION entry written after fill, (4) trade row readable from DB via integration test, trade event published to `trade_events` Redis channel. Forced audit-write failure → `error_logger.critical` fired with trade_id and error detail. All 12 unit tests + 3 integration tests pass.
+**Checkpoint** ✅: Using MockBroker — (1) trade row created at `PENDING` before broker call, (2) status transitions to `SUBMITTED` → `OPEN` on fill, (3) PRE_SUBMISSION and POST_CONFIRMATION audit entries written, (4) trade row readable from DB with correct final status, (5) trade event published to `trade_events` Redis channel. Forced audit-write failure → `error_logger.critical` fired with trade_id and error detail. All 12 unit tests + 3 integration tests pass.
 
 ---
 
@@ -393,6 +454,7 @@ Build each panel separately, each wired to live data on completion.
 | 4 | Broker Abstraction | 5 |
 | 5 | Market Data | 3 |
 | 6 | Risk Engine | 4 |
+| 6B | Risk Engine Enhancements | 9 |
 | 7 | Trade Execution & Audit | 2 |
 | 8 | REST API & WebSocket | 7 |
 | 9 | Frontend Shell | 3 |
@@ -406,4 +468,4 @@ Build each panel separately, each wired to live data on completion.
 | 17 | System Hardening | 6 |
 | 18 | Expansion | 6 |
 | — | Backlog | 7 |
-| **Total** | | **98** |
+| **Total** | | **107** |
