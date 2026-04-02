@@ -308,22 +308,22 @@ With all backend logic complete, expose it via thin FastAPI routes.
 
 Build each panel separately, each wired to live data on completion.
 
-- [ ] **10.1** Build `SystemHealthPanel` component — broker, DB, Redis status indicators; polls `GET /api/v1/system/health` every 30s *(S)*
+- [x] **10.1** Build `SystemHealthPanel` component — broker, DB, Redis status indicators; polls `GET /api/v1/system/health` every 30s *(S)*
   - *Depends on: 9.2, 8.6*
-- [ ] **10.2** Build `ActiveTradesTable` component — symbol, direction, entry price, live P&L, duration; updates via WebSocket *(M)*
+- [x] **10.2** Build `ActiveTradesTable` component — symbol, direction, entry price, live P&L, duration; updates via WebSocket *(M)*
   - *Depends on: 9.3, 8.3*
-- [ ] **10.3** Build `RiskGauge` component — aggregate exposure as % of account balance, color states (green/amber/red), updates via WebSocket *(M)*
+- [x] **10.3** Build `RiskGauge` component — aggregate exposure as % of account balance, color states (green/amber/red), updates via WebSocket *(M)*
   - *Depends on: 9.3, 8.5*
-- [ ] **10.4** Build `WatchlistPanel` component — symbol rows with live price, day change %, strategy badge, position indicator; highlights rows with open positions; shows indicator on unassigned symbols *(M)*
+- [x] **10.4** Build `WatchlistPanel` component — symbol rows with live price, day change %, strategy badge, position indicator; highlights rows with open positions; shows indicator on unassigned symbols *(M)*
   - Click row → navigate to `SymbolDetail` page
   - "Market Closed" indicator when outside hours
   - *Depends on: 9.3, 8.2*
-- [ ] **10.5** Assemble Dashboard page from panels: `RiskGauge` (prominent), `ActiveTradesTable`, `WatchlistPanel`, `SystemHealthPanel` *(S)*
+- [x] **10.5** Assemble Dashboard page from panels: `RiskGauge` (prominent), `ActiveTradesTable`, `WatchlistPanel`, `SystemHealthPanel` *(S)*
   - *Depends on: 10.1, 10.2, 10.3, 10.4*
-- [ ] **10.6** Build `Watchlist` management page — add symbol (with inline broker validation error), remove symbol (confirm dialog if open position), list all symbols *(M)*
+- [x] **10.6** Build `Watchlist` management page — add symbol (with inline broker validation error), remove symbol (confirm dialog if open position), list all symbols *(M)*
   - *Depends on: 9.2, 8.2*
 
-**Checkpoint**: Full dashboard renders with live data from backend. Risk gauge updates when a mock trade fires. Watchlist panel rows update with price ticks.
+**Checkpoint** ✅: Full dashboard renders with live data from backend. Risk gauge updates when a mock trade fires. Watchlist panel rows update with price ticks.
 
 ---
 
@@ -331,11 +331,11 @@ Build each panel separately, each wired to live data on completion.
 
 ### Layer 11 — Strategy Infrastructure
 
-- [ ] **11.1** Implement `StrategyRegistry` (`app/core/strategy_engine/registry.py`) — register, enable/disable, and look up strategies at runtime *(M)*
+- [x] **11.1** Implement `StrategyRegistry` (`app/core/strategy_engine/registry.py`) — register, enable/disable, and look up strategies at runtime *(M)*
   - *Depends on: 6.1, 3.8*
-- [ ] **11.2** Implement strategy run scheduler (`app/core/strategy_engine/scheduler.py`) — poll or event-driven cycle; for each enabled strategy, iterates `config.symbols` and calls `generate_signal()` *(M)*
+- [x] **11.2** Implement strategy run scheduler (`app/core/strategy_engine/scheduler.py`) — poll or event-driven cycle; for each enabled strategy, iterates `config.symbols` and calls `generate_signal()` *(M)*
   - *Depends on: 11.1, 5.1*
-- [ ] **11.3** Build strategy unit test framework with mock market data (`tests/unit/strategy/conftest.py`) *(M)*
+- [x] **11.3** Build strategy unit test framework with mock market data (`tests/unit/strategy/conftest.py`) *(M)*
   - *Depends on: 6.1*
 
 ---

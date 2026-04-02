@@ -18,11 +18,12 @@ settings = get_settings()
 _API_PREFIX = "/api/v1"
 
 _position_monitor = None
+_strategy_scheduler = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _position_monitor
+    global _position_monitor, _strategy_scheduler
 
     setup_logging(log_level=settings.log_level)
     system_logger.info(
@@ -30,24 +31,28 @@ async def lifespan(app: FastAPI):
         extra={"environment": settings.environment, "log_level": settings.log_level},
     )
 
-    # ------------------------------------------------------------------
-    # Start PositionMonitor as a background task
-    # ------------------------------------------------------------------
     from app.core.execution.order_manager import OrderManager
     from app.core.execution.position_monitor import PositionMonitor
     from app.core.risk.manager import RiskManager
+    from app.core.strategy_engine.registry import registry
+    from app.core.strategy_engine.scheduler import StrategyScheduler
     from app.data.cache import RedisCache
     from app.db.session import AsyncSessionFactory
     from app.dependencies import _build_broker
 
     broker = _build_broker()
     cache = RedisCache(settings.redis_url)
+    risk_manager = RiskManager()
     order_manager = OrderManager(
         broker=broker,
-        risk_manager=RiskManager(),
+        risk_manager=risk_manager,
         session_factory=AsyncSessionFactory,
         cache=cache,
     )
+
+    # ------------------------------------------------------------------
+    # Start PositionMonitor
+    # ------------------------------------------------------------------
     _position_monitor = PositionMonitor(
         cache=cache,
         session_factory=AsyncSessionFactory,
@@ -55,11 +60,26 @@ async def lifespan(app: FastAPI):
     )
     await _position_monitor.start()
 
+    # ------------------------------------------------------------------
+    # Start StrategyScheduler
+    # ------------------------------------------------------------------
+    _strategy_scheduler = StrategyScheduler(
+        registry=registry,
+        broker=broker,
+        risk_manager=risk_manager,
+        cache=cache,
+        session_factory=AsyncSessionFactory,
+        order_manager=order_manager,
+    )
+    await _strategy_scheduler.start()
+
     yield
 
     # ------------------------------------------------------------------
     # Graceful shutdown
     # ------------------------------------------------------------------
+    if _strategy_scheduler:
+        await _strategy_scheduler.stop()
     if _position_monitor:
         await _position_monitor.stop()
     await cache.close()
