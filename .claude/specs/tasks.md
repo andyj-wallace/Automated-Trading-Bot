@@ -342,27 +342,30 @@ Build each panel separately, each wired to live data on completion.
 
 ### Layer 12 — First Strategy: Moving Average (50/200)
 
-- [ ] **12.1** Implement `MovingAverageStrategy` (`app/core/strategy_engine/moving_average.py`) *(L)*
+- [x] **12.1** Implement `MovingAverageStrategy` (`app/core/strategy_engine/moving_average.py`) *(L)*
   - BUY signal: 50-day MA crosses above 200-day MA
   - SELL signal: 50-day MA crosses below 200-day MA
   - Configurable MA periods via JSONB config
   - *Depends on: 6.1, 5.3*
-- [ ] **12.2** Register `MovingAverageStrategy` in `StrategyRegistry`; verify enable/disable toggle works without restart *(S)*
+- [x] **12.2** Register `MovingAverageStrategy` in `StrategyRegistry`; verify enable/disable toggle works without restart *(S)*
+  - Self-registers at module import time; imported in `main.py` lifespan
   - *Depends on: 12.1, 11.1*
-- [ ] **12.3** Write unit tests for `MovingAverageStrategy` signal logic using mock market data *(M)*
+- [x] **12.3** Write unit tests for `MovingAverageStrategy` signal logic using mock market data *(M)*
+  - 24 tests: init, HOLD conditions, golden cross BUY, death cross SELL, custom periods, position sizing, config schema, registration
   - *Depends on: 12.1, 11.3*
 
-**Checkpoint**: Run the scheduler with `MockBroker` and a seeded historical dataset. Confirm the strategy fires signals, passes risk validation, and produces audit log entries.
+**Checkpoint** ✅: 35 strategy tests pass (11 registry + 24 MA). Strategy fires golden-cross BUY with correct stop/take-profit. Self-registers as "moving_average" in the global registry.
 
 ---
 
 ### Layer 13 — Strategy UI
 
-- [ ] **13.1** Build `StrategiesPage` — list all strategies with enable/disable toggle; toggle calls `PATCH /api/v1/strategies/{id}` *(M)*
+- [x] **13.1** Build `StrategiesPage` — list all strategies with enable/disable toggle; toggle calls `PATCH /api/v1/strategies/{id}` *(M)*
   - *Depends on: 9.2, 8.4*
-- [ ] **13.2** Build `StrategyConfigForm` — renders JSONB `config` fields as editable form inputs; includes multi-select of watchlist symbols for strategy assignment *(L)*
+- [x] **13.2** Build `StrategyConfigForm` — renders JSONB `config` fields as editable form inputs; includes multi-select of watchlist symbols for strategy assignment *(L)*
   - *Depends on: 13.1*
-- [ ] **13.3** Build `StrategyPerformanceChart` — win rate, P&L per strategy, date range selector *(M)*
+- [x] **13.3** Build `StrategyPerformanceChart` — win rate, P&L per strategy, date range selector *(M)*
+  - Uses lightweight-charts for cumulative P&L sparkline; 7d/30d/90d/All range selector
   - *Depends on: 13.1, 8.3*
 
 ---

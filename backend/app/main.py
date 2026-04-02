@@ -31,6 +31,8 @@ async def lifespan(app: FastAPI):
         extra={"environment": settings.environment, "log_level": settings.log_level},
     )
 
+    import app.core.strategy_engine.moving_average  # noqa: F401 — triggers self-registration
+
     from app.core.execution.order_manager import OrderManager
     from app.core.execution.position_monitor import PositionMonitor
     from app.core.risk.manager import RiskManager
