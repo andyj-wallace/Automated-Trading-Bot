@@ -49,6 +49,13 @@ async def lifespan(app: FastAPI):
     from app.dependencies import _build_broker
 
     broker = _build_broker()
+    try:
+        await broker.connect()
+    except Exception as exc:
+        system_logger.warning(
+            "Broker connection failed at startup — health will show disconnected",
+            extra={"error": str(exc)},
+        )
     cache = RedisCache(settings.redis_url)
     risk_manager = RiskManager()
     order_manager = OrderManager(
@@ -144,6 +151,7 @@ async def lifespan(app: FastAPI):
         await _strategy_scheduler.stop()
     if _position_monitor:
         await _position_monitor.stop()
+    await broker.disconnect()
     if _risk_monitor_task and not _risk_monitor_task.done():
         _risk_monitor.stop()
         _risk_monitor_task.cancel()
