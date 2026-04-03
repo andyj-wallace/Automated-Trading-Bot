@@ -47,7 +47,7 @@ def _build_broker() -> BaseBroker:
     """
     settings = get_settings()
 
-    if settings.environment == "development":
+    if settings.broker == "mock":
         from app.brokers.mock.client import MockBroker
         return MockBroker()
 

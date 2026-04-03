@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     ibkr_password: str = ""
     ibkr_trading_mode: str = "paper"
 
+    # Broker selection
+    broker: str = "mock"  # "mock" | "ibkr"
+
     # Notifications (Phase 3+)
     notification_email_smtp: str = ""
 
