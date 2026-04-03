@@ -1,29 +1,46 @@
 """
-RiskMonitor — tracks aggregate open exposure and emits log-based alerts.
-
-Polls open trades via TradeRepo, computes the total risk as a percentage of
-account balance, and logs WARNING / CRITICAL entries when configurable
-thresholds are crossed.
+RiskMonitor — tracks aggregate open exposure, emits log alerts, and publishes
+risk_alert events to the Redis `risk_updates` pub/sub channel (Layer 14.1).
 
 Alert thresholds (relative to max_aggregate_risk_pct):
   WARNING  → aggregate exposure ≥ 75% of max  (default: 3.75%)
   CRITICAL → aggregate exposure ≥ 90% of max  (default: 4.50%)
 
-Redis pub/sub wiring is added in Layer 14. For now all alerts are log entries.
+When a WARNING or CRITICAL alert fires, a JSON event is published to the
+`risk_updates` Redis channel so the WebSocket endpoint can push it to the
+dashboard in real time:
 
-Depends on: TradeRepo (Layer 3.7).
+    {
+        "event": "risk_alert",
+        "payload": {
+            "alert_level": "WARNING",
+            "aggregate_risk_pct": "0.0375",
+            "aggregate_risk_amount": "3750.00",
+            "open_trade_count": 3,
+            "account_balance": "100000",
+            "warning_threshold_pct": "0.0375",
+            "critical_threshold_pct": "0.045"
+        },
+        "timestamp": "2026-04-01T12:00:00+00:00"
+    }
+
+Depends on: TradeRepo (Layer 3.7), RedisCache (Layer 5.1, optional).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.repositories.trade_repo import TradeRepo
 from app.monitoring.logger import risk_logger
+
+_RISK_UPDATES_CHANNEL = "risk_updates"
 
 # Hard ceiling: aggregate portfolio risk must never exceed 10% of account balance.
 # This constant is shared with RiskManager (which has its own copy) and enforced
@@ -86,12 +103,18 @@ class RiskMonitor:
         monitor = RiskMonitor()
         status = await monitor.check_exposure(session, account_balance=Decimal("100000"))
 
-    Usage (background loop):
+    Usage (background loop — publishes Redis alerts):
+        monitor = RiskMonitor(cache=redis_cache)
         await monitor.run_loop(session_factory, get_account_balance)
     """
 
-    def __init__(self, config: RiskMonitorConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: RiskMonitorConfig | None = None,
+        cache=None,  # RedisCache | None — optional, avoids circular import
+    ) -> None:
         self._config = config or RiskMonitorConfig()
+        self._cache = cache
         self._running = False
 
     # ------------------------------------------------------------------
@@ -133,6 +156,7 @@ class RiskMonitor:
         )
 
         self._log_status(status)
+        await self._publish_alert(status)
         return status
 
     # ------------------------------------------------------------------
@@ -173,6 +197,36 @@ class RiskMonitor:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    async def _publish_alert(self, status: ExposureStatus) -> None:
+        """
+        Publish a risk_alert event to Redis `risk_updates` channel.
+
+        Only publishes for WARNING and CRITICAL levels. NONE is silent.
+        Silently skips if no cache is configured or if publish fails.
+        """
+        if self._cache is None or status.alert_level == "NONE":
+            return
+        try:
+            event = {
+                "event": "risk_alert",
+                "payload": {
+                    "alert_level": status.alert_level,
+                    "aggregate_risk_pct": str(status.aggregate_risk_pct),
+                    "aggregate_risk_amount": str(status.aggregate_risk_amount),
+                    "open_trade_count": status.open_trade_count,
+                    "account_balance": str(status.account_balance),
+                    "warning_threshold_pct": str(self._config.warning_threshold),
+                    "critical_threshold_pct": str(self._config.critical_threshold),
+                },
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            await self._cache.publish(_RISK_UPDATES_CHANNEL, json.dumps(event))
+        except Exception as exc:
+            risk_logger.warning(
+                "RiskMonitor: failed to publish alert to Redis",
+                extra={"error": str(exc)},
+            )
 
     def _evaluate_alert(self, aggregate_pct: Decimal) -> str:
         if aggregate_pct >= self._config.critical_threshold:

@@ -374,22 +374,30 @@ Build each panel separately, each wired to live data on completion.
 
 ### Layer 14 — Risk Monitoring & Alerts
 
-- [ ] **14.1** Wire `RiskMonitor` alerts to Redis pub/sub → WebSocket push to dashboard *(M)*
+- [x] **14.1** Wire `RiskMonitor` alerts to Redis pub/sub → WebSocket push to dashboard *(M)*
+  - `RiskMonitor` now accepts optional `cache` arg; publishes JSON `risk_alert` events to `risk_updates` channel on WARNING/CRITICAL
+  - Background loop started in `main.py` lifespan alongside PositionMonitor and StrategyScheduler
   - *Depends on: 6.4, 8.7*
-- [ ] **14.2** Build `RiskMetricsPanel` — historical aggregate risk utilization chart for current trading day *(M)*
+- [x] **14.2** Build `RiskMetricsPanel` — historical aggregate risk utilization chart for current trading day *(M)*
+  - In-memory session history sparkline (SVG); dismissible alert banner on WS `risk_alert` events; wired into Portfolio page
   - *Depends on: 14.1, 9.2*
 
 ---
 
 ### Layer 15 — Backtesting System
 
-- [ ] **15.1** Implement `BacktestingEngine` (`app/core/backtesting/engine.py`) — replays signals against historical OHLCV with simulated risk-checked execution *(XL)*
+- [x] **15.1** Implement `BacktestingEngine` (`app/core/backtesting/engine.py`) — replays signals against historical OHLCV with simulated risk-checked execution *(XL)*
+  - Fill at next bar's open (no look-ahead bias); stop/take-profit exit on bar high/low; full risk gate applied per trade
   - *Depends on: 5.3, 6.1, 6.2*
-- [ ] **15.2** Implement backtest result metrics: total return, win rate, max drawdown, Sharpe ratio *(L)*
+- [x] **15.2** Implement backtest result metrics: total return, win rate, max drawdown, Sharpe ratio *(L)*
+  - `BacktestMetrics`: trade count, win/loss, win rate %, total return, avg P&L, largest winner/loser, max drawdown %, annualised Sharpe
   - *Depends on: 15.1*
-- [ ] **15.3** Build `POST /api/v1/backtesting/run` async endpoint with status polling *(M)*
+- [x] **15.3** Build `POST /api/v1/backtesting/run` async endpoint with status polling *(M)*
+  - Returns 202 + job_id immediately; `GET /api/v1/backtesting/{id}` polls status (pending→running→done/error)
+  - In-memory job store (MAX_JOBS=20, evicts oldest); validates strategy registration and OHLCV data before queuing
   - *Depends on: 15.1*
-- [ ] **15.4** Build `BacktestingPage` — form to run backtest, results visualization *(L)*
+- [x] **15.4** Build `BacktestingPage` — form to run backtest, results visualization *(L)*
+  - Config form (symbol, MA periods, stop%, balance); 2s polling loop; KPI grid + trade log table
   - *Depends on: 15.3, 9.1*
 
 ---

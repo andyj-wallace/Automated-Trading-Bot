@@ -1,9 +1,12 @@
+import asyncio
 from contextlib import asynccontextmanager
+from decimal import Decimal
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.middleware import ErrorHandlerMiddleware
+from app.api.v1.backtesting import router as backtesting_router
 from app.api.v1.portfolio import router as portfolio_router
 from app.api.v1.strategies import router as strategies_router
 from app.api.v1.symbols import router as symbols_router
@@ -19,11 +22,12 @@ _API_PREFIX = "/api/v1"
 
 _position_monitor = None
 _strategy_scheduler = None
+_risk_monitor_task = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _position_monitor, _strategy_scheduler
+    global _position_monitor, _strategy_scheduler, _risk_monitor_task
 
     setup_logging(log_level=settings.log_level)
     system_logger.info(
@@ -75,6 +79,29 @@ async def lifespan(app: FastAPI):
     )
     await _strategy_scheduler.start()
 
+    # ------------------------------------------------------------------
+    # Start RiskMonitor background loop (Layer 14.1)
+    # Publishes WARNING/CRITICAL alerts to Redis `risk_updates` channel
+    # so the WebSocket endpoint can push them to the dashboard.
+    # ------------------------------------------------------------------
+    from app.core.risk.monitor import RiskMonitor
+
+    _risk_monitor = RiskMonitor(cache=cache)
+
+    async def _get_balance() -> Decimal:
+        if broker.is_connected():
+            try:
+                summary = await broker.get_account_summary()
+                return summary.net_liquidation
+            except Exception:
+                pass
+        return Decimal("0")
+
+    _risk_monitor_task = asyncio.create_task(
+        _risk_monitor.run_loop(AsyncSessionFactory, _get_balance),
+        name="risk_monitor",
+    )
+
     yield
 
     # ------------------------------------------------------------------
@@ -84,6 +111,13 @@ async def lifespan(app: FastAPI):
         await _strategy_scheduler.stop()
     if _position_monitor:
         await _position_monitor.stop()
+    if _risk_monitor_task and not _risk_monitor_task.done():
+        _risk_monitor.stop()
+        _risk_monitor_task.cancel()
+        try:
+            await _risk_monitor_task
+        except asyncio.CancelledError:
+            pass
     await cache.close()
     system_logger.info("Application shutting down")
 
@@ -114,6 +148,7 @@ app.include_router(trades_router, prefix=_API_PREFIX)
 app.include_router(strategies_router, prefix=_API_PREFIX)
 app.include_router(portfolio_router, prefix=_API_PREFIX)
 app.include_router(system_router, prefix=_API_PREFIX)
+app.include_router(backtesting_router, prefix=_API_PREFIX)
 
 # WebSocket — no version prefix, path is /ws/dashboard
 app.include_router(ws_router)
