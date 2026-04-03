@@ -188,6 +188,20 @@ class OrderManager:
         if broker_error:
             raise broker_error
 
+        # ------------------------------------------------------------------
+        # Step 8 — Record KPI snapshot (non-fatal if it fails)
+        # ------------------------------------------------------------------
+        if self._session_factory and self._broker and order_result.status in ("FILLED", "PARTIAL"):
+            try:
+                from app.core.metrics.collector import MetricsCollector
+                async with self._session_factory() as session:
+                    await MetricsCollector().record_snapshot(session, self._broker)
+            except Exception as exc:
+                trading_logger.warning(
+                    "OrderManager: MetricsCollector snapshot failed",
+                    extra={"trade_id": str(request.trade_id), "error": str(exc)},
+                )
+
         return validation, order_result
 
     async def close_position(
@@ -319,6 +333,17 @@ class OrderManager:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
                 await self._cache.publish(TRADE_EVENTS_CHANNEL, json.dumps(event))
+
+            # Record KPI snapshot after close (non-fatal)
+            try:
+                from app.core.metrics.collector import MetricsCollector
+                async with self._session_factory() as session:
+                    await MetricsCollector().record_snapshot(session, self._broker)
+            except Exception as exc:
+                trading_logger.warning(
+                    "OrderManager: MetricsCollector snapshot failed on close",
+                    extra={"trade_id": str(trade_id), "error": str(exc)},
+                )
 
         else:
             error_logger.error(

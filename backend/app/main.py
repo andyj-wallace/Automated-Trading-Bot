@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.middleware import ErrorHandlerMiddleware
 from app.api.v1.backtesting import router as backtesting_router
+from app.api.v1.metrics import router as metrics_router
 from app.api.v1.portfolio import router as portfolio_router
 from app.api.v1.strategies import router as strategies_router
 from app.api.v1.symbols import router as symbols_router
@@ -23,11 +24,12 @@ _API_PREFIX = "/api/v1"
 _position_monitor = None
 _strategy_scheduler = None
 _risk_monitor_task = None
+_notification_task = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _position_monitor, _strategy_scheduler, _risk_monitor_task
+    global _position_monitor, _strategy_scheduler, _risk_monitor_task, _notification_task
 
     setup_logging(log_level=settings.log_level)
     system_logger.info(
@@ -102,6 +104,37 @@ async def lifespan(app: FastAPI):
         name="risk_monitor",
     )
 
+    # ------------------------------------------------------------------
+    # Start NotificationDispatcher subscriber (Layer 16.5)
+    # Listens on risk_updates + trade_events channels and emails alerts.
+    # ------------------------------------------------------------------
+    from app.notifications.dispatcher import NotificationDispatcher
+
+    _dispatcher = NotificationDispatcher(settings)
+
+    async def _notification_loop() -> None:
+        import json
+        try:
+            async for msg in cache.subscribe_many(
+                channels=["risk_updates", "trade_events"],
+                patterns=[],
+            ):
+                try:
+                    event = json.loads(msg["data"])
+                    await _dispatcher.dispatch(event)
+                except Exception as exc:
+                    system_logger.warning(
+                        "NotificationDispatcher: failed to process event",
+                        extra={"error": str(exc)},
+                    )
+        except asyncio.CancelledError:
+            pass
+
+    _notification_task = asyncio.create_task(
+        _notification_loop(),
+        name="notification_dispatcher",
+    )
+
     yield
 
     # ------------------------------------------------------------------
@@ -116,6 +149,12 @@ async def lifespan(app: FastAPI):
         _risk_monitor_task.cancel()
         try:
             await _risk_monitor_task
+        except asyncio.CancelledError:
+            pass
+    if _notification_task and not _notification_task.done():
+        _notification_task.cancel()
+        try:
+            await _notification_task
         except asyncio.CancelledError:
             pass
     await cache.close()
@@ -149,6 +188,7 @@ app.include_router(strategies_router, prefix=_API_PREFIX)
 app.include_router(portfolio_router, prefix=_API_PREFIX)
 app.include_router(system_router, prefix=_API_PREFIX)
 app.include_router(backtesting_router, prefix=_API_PREFIX)
+app.include_router(metrics_router, prefix=_API_PREFIX)
 
 # WebSocket — no version prefix, path is /ws/dashboard
 app.include_router(ws_router)
