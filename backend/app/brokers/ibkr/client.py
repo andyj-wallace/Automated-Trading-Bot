@@ -45,6 +45,8 @@ class IBKRClient(BaseBroker):
     submission during development.
     """
 
+    _RECONNECT_DELAYS = [5, 15, 30, 60]  # seconds between attempts
+
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._ib = IB()
@@ -52,6 +54,8 @@ class IBKRClient(BaseBroker):
         self._subscribed_contracts: dict[str, Stock] = {}
         self._price_callbacks: list[PriceFeedCallback] = []
         self._pending_tickers_handler_registered = False
+        self._reconnecting = False
+        self._ib.disconnectedEvent += self._on_disconnected
 
     # ------------------------------------------------------------------
     # Connection
@@ -82,12 +86,64 @@ class IBKRClient(BaseBroker):
         )
 
     async def disconnect(self) -> None:
+        self._reconnecting = False  # prevent reconnect loop from firing after intentional disconnect
         if self._ib.isConnected():
             self._ib.disconnect()
             system_logger.info("IBKRClient disconnected")
         self._subscribed_contracts.clear()
         self._price_callbacks.clear()
         self._pending_tickers_handler_registered = False
+
+    def _on_disconnected(self) -> None:
+        """
+        Fired by ib_async when IB Gateway drops the connection unexpectedly.
+        Schedules an async reconnect loop on the running event loop.
+        """
+        system_logger.warning(
+            "IBKRClient lost connection to IB Gateway — scheduling reconnect",
+            extra={
+                "host": self._settings.ibkr_host,
+                "port": self._settings.ibkr_port,
+            },
+        )
+        if not self._reconnecting:
+            try:
+                loop = asyncio.get_event_loop()
+                loop.create_task(self._reconnect_loop())
+            except RuntimeError:
+                pass  # no running loop (e.g. during shutdown) — ignore
+
+    async def _reconnect_loop(self) -> None:
+        """
+        Attempt to reconnect to IB Gateway with escalating delays.
+        Stops if disconnect() is called intentionally (self._reconnecting=False).
+        """
+        self._reconnecting = True
+        for delay in self._RECONNECT_DELAYS:
+            if not self._reconnecting:
+                return
+            system_logger.info(f"IBKRClient reconnect attempt in {delay}s")
+            await asyncio.sleep(delay)
+            if not self._reconnecting:
+                return
+            try:
+                await self._ib.connectAsync(
+                    self._settings.ibkr_host,
+                    self._settings.ibkr_port,
+                    clientId=self._settings.ibkr_client_id,
+                )
+                system_logger.info("IBKRClient reconnected successfully")
+                self._reconnecting = False
+                return
+            except Exception as exc:
+                system_logger.warning(
+                    "IBKRClient reconnect failed",
+                    extra={"error": str(exc)},
+                )
+        self._reconnecting = False
+        system_logger.error(
+            "IBKRClient gave up reconnecting after all attempts failed"
+        )
 
     def is_connected(self) -> bool:
         return self._ib.isConnected()
