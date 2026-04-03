@@ -404,14 +404,19 @@ Build each panel separately, each wired to live data on completion.
 
 ### Layer 16 — Performance Metrics & Notifications
 
-- [ ] **16.1** Implement `MetricsCollector` — writes KPIs to TimescaleDB on trade events *(M)*
+- [x] **16.1** Implement `MetricsCollector` — writes KPIs to TimescaleDB on trade events *(M)*
+  - `MetricsCollector.record_snapshot()` called non-fatally in `OrderManager` on fill and close
   - *Depends on: 3.9, 7.2*
-- [ ] **16.2** Build `PerformanceDashboard` — KPI panel (win/loss ratio, total P&L, trade count, avg duration) with date range selector *(L)*
+- [x] **16.2** Build `PerformanceDashboard` — KPI panel (win/loss ratio, total P&L, trade count, avg duration) with date range selector *(L)*
+  - `GET /metrics/performance?range=7d|30d|90d|all`; 6-card KPI grid in `SystemHealth` page
   - *Depends on: 16.1, 9.1*
-- [ ] **16.3** Build `SystemMetricsPanel` — API latency, DB query latency, cache hit rate; updates every 30s *(M)*
+- [x] **16.3** Build `SystemMetricsPanel` — API latency, DB query latency, cache hit rate; updates every 30s *(M)*
+  - Measures round-trip latency to API/DB/Redis endpoints via `performance.now()`; bar + colour coding
   - *Depends on: 9.1*
-- [ ] **16.4** Implement `NotificationDispatcher` with email delivery (SMTP) *(M)*
-- [ ] **16.5** Integrate risk alerts and trade events with `NotificationDispatcher` *(M)*
+- [x] **16.4** Implement `NotificationDispatcher` with email delivery (SMTP) *(M)*
+  - SMTP URL format `smtp://user:pass@host:port/to@example.com`; fire-and-forget; thread executor
+- [x] **16.5** Integrate risk alerts and trade events with `NotificationDispatcher` *(M)*
+  - Background asyncio task subscribes to `risk_updates` + `trade_events` Redis channels; routes to `dispatcher.dispatch()`
   - *Depends on: 16.4, 6.4*
 
 ---
