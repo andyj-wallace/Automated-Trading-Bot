@@ -54,7 +54,11 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         system_logger.warning(
             "Broker connection failed at startup — health will show disconnected",
-            extra={"error": str(exc)},
+            extra={
+                "error": str(exc),
+                "exception_type": type(exc).__name__,
+                "exception_repr": repr(exc),
+            },
         )
     cache = RedisCache(settings.redis_url)
     risk_manager = RiskManager()

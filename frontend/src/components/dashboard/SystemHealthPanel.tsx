@@ -1,5 +1,5 @@
 /**
- * SystemHealthPanel — polls GET /api/v1/system/health every 30 s.
+ * SystemHealthPanel — polls GET /api/v1/system/health every 60 s.
  *
  * Shows a coloured dot + label for broker, database, and Redis.
  * Overall banner turns red when any component is degraded.
@@ -16,7 +16,7 @@ export function SystemHealthPanel() {
       const res = await api.get<SystemHealth>("/system/health");
       return res.data;
     },
-    refetchInterval: 30_000,
+    refetchInterval: 60_000,
     retry: false,
   });
 

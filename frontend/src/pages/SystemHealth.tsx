@@ -56,7 +56,7 @@ export function SystemHealth() {
 }
 
 // ---------------------------------------------------------------------------
-// 16.3 SystemMetricsPanel — latency probes every 30s
+// 16.3 SystemMetricsPanel — latency probes every 60s
 // ---------------------------------------------------------------------------
 
 interface LatencyResult {
@@ -100,7 +100,7 @@ function SystemMetricsPanel() {
 
       return results;
     },
-    refetchInterval: 30_000,
+    refetchInterval: 60_000,
   });
 
   const lastChecked = dataUpdatedAt

@@ -8,6 +8,7 @@ GET /api/v1/system/health — Check broker, database, and Redis connectivity.
 """
 
 import asyncio
+import time
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
@@ -18,6 +19,7 @@ from app.api.v1.schemas import ComponentStatus, SystemHealthOut, ok
 from app.brokers.base import BaseBroker
 from app.data.cache import RedisCache
 from app.dependencies import get_broker, get_cache, get_db
+from app.monitoring.logger import system_logger
 
 router = APIRouter(prefix="/system", tags=["system"])
 
@@ -39,27 +41,48 @@ async def system_health(
 
     DB and Redis checks run concurrently via asyncio.gather.
     """
+    request_start = time.monotonic()
 
     # Broker — synchronous; no I/O required
-    broker_status = ComponentStatus(
-        status="ok" if broker.is_connected() else "disconnected"
+    broker_connected = broker.is_connected()
+    broker_status = ComponentStatus(status="ok" if broker_connected else "disconnected")
+    system_logger.info(
+        "Health check: broker",
+        extra={"status": broker_status.status, "broker_type": type(broker).__name__},
     )
 
     async def check_db() -> ComponentStatus:
+        t = time.monotonic()
         try:
             await asyncio.wait_for(
                 db.execute(text("SELECT 1")),
                 timeout=_COMPONENT_TIMEOUT,
             )
+            elapsed_ms = round((time.monotonic() - t) * 1000)
+            system_logger.info("Health check: database", extra={"status": "ok", "elapsed_ms": elapsed_ms})
             return ComponentStatus(status="ok")
         except Exception as exc:
+            elapsed_ms = round((time.monotonic() - t) * 1000)
+            system_logger.warning(
+                "Health check: database failed",
+                extra={"status": "error", "elapsed_ms": elapsed_ms, "error": str(exc)},
+            )
             return ComponentStatus(status="error", detail=str(exc))
 
     async def check_redis() -> ComponentStatus:
+        t = time.monotonic()
         try:
             reachable = await asyncio.wait_for(cache.ping(), timeout=_COMPONENT_TIMEOUT)
-            return ComponentStatus(status="ok" if reachable else "error")
+            status = "ok" if reachable else "error"
+            elapsed_ms = round((time.monotonic() - t) * 1000)
+            system_logger.info("Health check: redis", extra={"status": status, "elapsed_ms": elapsed_ms})
+            return ComponentStatus(status=status)
         except Exception as exc:
+            elapsed_ms = round((time.monotonic() - t) * 1000)
+            system_logger.warning(
+                "Health check: redis failed",
+                extra={"status": "error", "elapsed_ms": elapsed_ms, "error": str(exc)},
+            )
             return ComponentStatus(status="error", detail=str(exc))
 
     db_status, redis_status = await asyncio.gather(check_db(), check_redis())
@@ -68,6 +91,18 @@ async def system_health(
         s.status == "ok" for s in [broker_status, db_status, redis_status]
     )
     overall = "ok" if all_healthy else "degraded"
+    total_ms = round((time.monotonic() - request_start) * 1000)
+
+    system_logger.info(
+        "Health check: complete",
+        extra={
+            "overall": overall,
+            "broker": broker_status.status,
+            "database": db_status.status,
+            "redis": redis_status.status,
+            "total_ms": total_ms,
+        },
+    )
 
     health = SystemHealthOut(
         status=overall,
