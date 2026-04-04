@@ -82,6 +82,29 @@ Frontend available at http://localhost:5173
 └── .env.example
 ```
 
+## IB Gateway Setup
+
+The backend connects to a locally running IB Gateway via TCP. When running inside Docker the backend reaches the host Mac via `host.docker.internal`.
+
+**Required Gateway API settings** (*Configure → Settings → API → Settings*):
+- Socket port: `4002` (paper) / `4001` (live)
+- **Uncheck** "Allow connections from localhost only" — Docker containers connect from the bridge network IP, not `127.0.0.1`, so this option blocks them even when the host is in Trusted IPs
+- Trusted IPs: `host.docker.internal`, `127.0.0.1`
+
+**`.env` must have:**
+```
+BROKER=ibkr
+IBKR_HOST=host.docker.internal
+IBKR_PORT=4002
+IBKR_TRADING_MODE=paper
+```
+
+**Verify connection after starting the backend:**
+```bash
+curl -s http://localhost:8000/api/v1/system/health | python3 -m json.tool
+# broker.status should be "ok"
+```
+
 ## Risk Model
 
 Every trade is hard-blocked if it would risk more than **1% of account balance**.

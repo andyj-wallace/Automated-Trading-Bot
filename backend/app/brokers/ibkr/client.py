@@ -56,6 +56,7 @@ class IBKRClient(BaseBroker):
         self._pending_tickers_handler_registered = False
         self._reconnecting = False
         self._ib.disconnectedEvent += self._on_disconnected
+        self._ib.errorEvent += self._on_error
 
     # ------------------------------------------------------------------
     # Connection
@@ -112,6 +113,38 @@ class IBKRClient(BaseBroker):
                 loop.create_task(self._reconnect_loop())
             except RuntimeError:
                 pass  # no running loop (e.g. during shutdown) — ignore
+
+    def _on_error(self, req_id: int, error_code: int, error_string: str, contract) -> None:
+        """
+        Fired by ib_async for every error or informational message from IB Gateway.
+
+        Error codes 1100-1300 relate to connectivity. Key ones:
+          1100 — connection lost
+          1101 — reconnected, data lost
+          1102 — reconnected, data maintained
+          2110 — connectivity between TWS and server is broken
+        See: https://ibkrcampus.com/ibkr-api-page/trader-workstation-api/#error-codes
+        """
+        # IB uses low codes (1-9xx) for normal info messages; only log as warning/error for real problems
+        if error_code < 2000:
+            system_logger.warning(
+                "IBKRClient: IB Gateway error",
+                extra={
+                    "req_id": req_id,
+                    "error_code": error_code,
+                    "error": error_string,
+                    "symbol": contract.symbol if contract else None,
+                },
+            )
+        else:
+            system_logger.info(
+                "IBKRClient: IB Gateway message",
+                extra={
+                    "req_id": req_id,
+                    "error_code": error_code,
+                    "message": error_string,
+                },
+            )
 
     async def _reconnect_loop(self) -> None:
         """

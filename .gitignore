@@ -66,6 +66,9 @@ logs/
 *.swo
 Thumbs.db
 
+# --- Local test / scratch scripts --------------------------------------------
+test_ibkr_connection.py
+
 # --- Alembic -----------------------------------------------------------------
 # Keep versions/ committed; exclude compiled pyc inside it
 alembic/versions/*.pyc
