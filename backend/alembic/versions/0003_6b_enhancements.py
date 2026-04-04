@@ -29,20 +29,20 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     # ------------------------------------------------------------------
     # Expand tradestatus ENUM with new lifecycle values.
-    # ALTER TYPE ... ADD VALUE must run outside a transaction in older
-    # PostgreSQL versions. We use the connection's autocommit context
-    # to be safe on all supported versions (PG 12+).
+    # ALTER TYPE ... ADD VALUE must be committed before the new values
+    # can be used (e.g. as a column default) in the same migration.
+    # autocommit_block() runs these statements outside the transaction.
     # ------------------------------------------------------------------
-    conn = op.get_bind()
-    conn.execute(
-        sa.text("ALTER TYPE tradestatus ADD VALUE IF NOT EXISTS 'PENDING' BEFORE 'OPEN'")
-    )
-    conn.execute(
-        sa.text("ALTER TYPE tradestatus ADD VALUE IF NOT EXISTS 'SUBMITTED' BEFORE 'OPEN'")
-    )
-    conn.execute(
-        sa.text("ALTER TYPE tradestatus ADD VALUE IF NOT EXISTS 'CLOSING' BEFORE 'CLOSED'")
-    )
+    with op.get_context().autocommit_block():
+        op.execute(
+            sa.text("ALTER TYPE tradestatus ADD VALUE IF NOT EXISTS 'PENDING' BEFORE 'OPEN'")
+        )
+        op.execute(
+            sa.text("ALTER TYPE tradestatus ADD VALUE IF NOT EXISTS 'SUBMITTED' BEFORE 'OPEN'")
+        )
+        op.execute(
+            sa.text("ALTER TYPE tradestatus ADD VALUE IF NOT EXISTS 'CLOSING' BEFORE 'CLOSED'")
+        )
 
     # ------------------------------------------------------------------
     # Create exitreason ENUM
