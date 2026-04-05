@@ -218,13 +218,13 @@ class BacktestingEngine:
                     signals_rejected += 1
                     continue
 
-                risk_amt = Decimal(str(quantity)) * (fill_price - validation.stop_loss_price)
+                risk_amt = Decimal(str(quantity)) * (fill_price - request.stop_loss_price)
                 open_trade = SimulatedTrade(
                     trade_id=request.trade_id,
                     symbol=symbol,
                     direction="BUY",
                     entry_price=fill_price,
-                    stop_loss_price=validation.stop_loss_price,
+                    stop_loss_price=request.stop_loss_price,
                     take_profit_price=validation.take_profit_price,
                     quantity=quantity,
                     risk_amount=risk_amt,

@@ -19,7 +19,7 @@ from app.db.repositories.symbol_repo import SymbolRepo
 from app.monitoring.logger import system_logger
 
 # Default lookback period and granularity for all historical fetches.
-_DEFAULT_DURATION = "1 Y"
+_DEFAULT_DURATION = "5 Y"
 _DEFAULT_BAR_SIZE = "1 day"
 
 

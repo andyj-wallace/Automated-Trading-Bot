@@ -82,6 +82,7 @@ export function Backtesting() {
   const [balance, setBalance] = useState("100000");
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [submitErrorCode, setSubmitErrorCode] = useState<string | null>(null);
   const [fetchConfirm, setFetchConfirm] = useState<string | null>(null);
   const [job, setJob] = useState<BacktestJob | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -109,6 +110,7 @@ export function Backtesting() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setSubmitError(null);
+    setSubmitErrorCode(null);
     setFetchConfirm(null);
     setJob(null);
     setSubmitting(true);
@@ -124,7 +126,11 @@ export function Backtesting() {
         },
         account_balance: balance,
       });
-      if (res.error) throw new Error(res.error.message);
+      if (res.error) {
+        setSubmitError(res.error.message);
+        setSubmitErrorCode(res.error.code);
+        return;
+      }
       if (res.data) setJob(res.data);
     } catch (err: unknown) {
       setSubmitError(err instanceof Error ? err.message : "Unknown error");
@@ -213,11 +219,11 @@ export function Backtesting() {
             </div>
           </div>
 
-          {submitError && !submitError.includes("NO_HISTORICAL_DATA") && (
+          {submitError && submitErrorCode !== "NO_HISTORICAL_DATA" && (
             <p className="text-xs text-red-400">{submitError}</p>
           )}
 
-          {submitError && submitError.includes("NO_HISTORICAL_DATA") && (
+          {submitError && submitErrorCode === "NO_HISTORICAL_DATA" && (
             <NoHistoricalDataPanel
               symbol={symbol}
               errorMessage={submitError}
