@@ -170,6 +170,27 @@ function SymbolRow({
   const queryClient = useQueryClient();
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [removeError, setRemoveError] = useState<string | null>(null);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [fetchSuccess, setFetchSuccess] = useState(false);
+
+  const fetchHistoryMutation = useMutation({
+    mutationFn: async () => {
+      const res = await api.post<{ ticker: string; bars_stored: number }>(
+        `/symbols/${symbol.ticker}/fetch-history`,
+        {}
+      );
+      if (res.error) throw new Error(res.error.message);
+      return res.data;
+    },
+    onSuccess: () => {
+      setFetchError(null);
+      setFetchSuccess(true);
+      setTimeout(() => setFetchSuccess(false), 3000);
+    },
+    onError: (err: Error) => {
+      setFetchError(err.message);
+    },
+  });
 
   const removeMutation = useMutation({
     mutationFn: async (confirmed: boolean) => {
@@ -246,6 +267,17 @@ function SymbolRow({
             Added {addedAt}
           </span>
           <button
+            onClick={() => fetchHistoryMutation.mutate()}
+            disabled={fetchHistoryMutation.isPending}
+            className="text-xs text-gray-500 hover:text-blue-400 disabled:text-gray-700 transition-colors"
+          >
+            {fetchHistoryMutation.isPending
+              ? "Fetching…"
+              : fetchSuccess
+              ? "Fetched ✓"
+              : "Fetch History"}
+          </button>
+          <button
             onClick={handleRemoveClick}
             disabled={removeMutation.isPending}
             className="text-xs text-gray-500 hover:text-red-400 disabled:text-gray-700 transition-colors"
@@ -258,6 +290,12 @@ function SymbolRow({
       {removeError && (
         <div className="px-5 pb-2">
           <p className="text-xs text-red-400">{removeError}</p>
+        </div>
+      )}
+
+      {fetchError && (
+        <div className="px-5 pb-2">
+          <p className="text-xs text-red-400">{fetchError}</p>
         </div>
       )}
 

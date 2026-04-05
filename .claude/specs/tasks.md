@@ -269,6 +269,10 @@ With all backend logic complete, expose it via thin FastAPI routes.
   - `POST` validates ticker against broker before saving
   - `DELETE` with open position requires confirmation flag in request body
   - *Depends on: 3.6, 4.1, 8.1*
+- [x] **8.2a** Add `POST /api/v1/symbols/{ticker}/fetch-history` endpoint — triggers `HistoricalDataFetcher.fetch_and_store()` for a single symbol; required prerequisite for backtesting *(S)*
+  - Returns bar count on success; 422 if broker returns no bars; 404 if symbol not on watchlist
+  - UI trigger added to `Watchlist.tsx` (per-row button) and `Backtesting.tsx` (inline on NO_HISTORICAL_DATA error)
+  - *Depends on: 5.3, 8.2*
 - [x] **8.3** Implement trades endpoints (`app/api/v1/trades.py`): `GET /api/v1/trades`, `GET /api/v1/trades/{id}` *(S)*
   - *Depends on: 3.7, 8.1*
 - [x] **8.4** Implement strategies endpoints (`app/api/v1/strategies.py`): `GET /api/v1/strategies`, `PATCH /api/v1/strategies/{id}` *(M)*

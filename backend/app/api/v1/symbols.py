@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.schemas import SymbolCreateIn, SymbolDeleteConfirmIn, SymbolOut, err, ok
 from app.brokers.base import BaseBroker
+from app.data.historical import HistoricalDataFetcher
 from app.db.repositories.symbol_repo import SymbolRepo
 from app.dependencies import get_broker, get_db
 from app.monitoring.logger import system_logger
@@ -116,3 +117,34 @@ async def remove_symbol(
 
     await db.commit()
     return JSONResponse(content=ok({"ticker": ticker, "deleted": True}))
+
+
+@router.post("/{ticker}/fetch-history")
+async def fetch_symbol_history(
+    ticker: str = Path(..., description="Ticker symbol to fetch history for"),
+    db: AsyncSession = Depends(get_db),
+    broker: BaseBroker = Depends(get_broker),
+) -> JSONResponse:
+    ticker = ticker.upper()
+
+    repo = SymbolRepo(db)
+    symbol = await repo.get_by_ticker(ticker)
+    if not symbol:
+        return JSONResponse(
+            status_code=404,
+            content=err("NOT_FOUND", f"Symbol {ticker!r} not found"),
+        )
+
+    fetcher = HistoricalDataFetcher(broker)
+    count = await fetcher.fetch_and_store(ticker, db)
+
+    if count == 0:
+        return JSONResponse(
+            status_code=422,
+            content=err(
+                "NO_DATA_RETURNED",
+                f"Broker returned no bars for {ticker}. Ensure IB Gateway is connected and the symbol is valid.",
+            ),
+        )
+
+    return JSONResponse(content=ok({"ticker": ticker, "bars_stored": count}))
