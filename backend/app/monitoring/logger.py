@@ -120,7 +120,7 @@ class JsonFormatter(logging.Formatter):
         if record.exc_text:
             log_entry["exception"] = record.exc_text
 
-        return json.dumps(log_entry, default=str)
+        return json.dumps(log_entry, default=str, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
