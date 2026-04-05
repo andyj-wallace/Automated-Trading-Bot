@@ -164,6 +164,7 @@ GET    /api/v1/trades/{id}         # Get specific trade
 GET    /api/v1/symbols             # List watchlist symbols
 POST   /api/v1/symbols             # Add symbol to watchlist
 DELETE /api/v1/symbols/{ticker}    # Remove symbol from watchlist
+POST   /api/v1/symbols/{ticker}/fetch-history  # Fetch and store 1-year OHLCV history for a symbol
 GET    /api/v1/strategies          # List strategies
 PATCH  /api/v1/strategies/{id}     # Update strategy config (incl. symbol assignments)
 GET    /api/v1/portfolio/risk      # Current risk metrics
