@@ -127,16 +127,9 @@ async def fetch_symbol_history(
 ) -> JSONResponse:
     ticker = ticker.upper()
 
-    repo = SymbolRepo(db)
-    symbol = await repo.get_by_ticker(ticker)
-    if not symbol:
-        return JSONResponse(
-            status_code=404,
-            content=err("NOT_FOUND", f"Symbol {ticker!r} not found"),
-        )
-
     fetcher = HistoricalDataFetcher(broker)
     count = await fetcher.fetch_and_store(ticker, db)
+    await db.commit()
 
     if count == 0:
         return JSONResponse(

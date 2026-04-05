@@ -33,6 +33,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.schemas import err, ok
+from app.brokers.base import PriceBar
 from app.core.backtesting.engine import BacktestResult, BacktestingEngine
 from app.core.risk.manager import RiskManager
 from app.core.strategy_engine.registry import registry
@@ -108,10 +109,10 @@ async def run_backtest(
     # Check historical data exists
     from datetime import timedelta
     end = datetime.now(timezone.utc)
-    start = end - timedelta(days=365)
+    start = end - timedelta(days=365 * 5)
     ohlcv_repo = OHLCVRepo(db)
-    sample = await ohlcv_repo.get_bars(ticker, start=start, end=end)
-    if not sample:
+    db_bars = await ohlcv_repo.get_bars(ticker, start=start, end=end)
+    if not db_bars:
         return JSONResponse(
             status_code=422,
             content=err(
@@ -120,6 +121,19 @@ async def run_backtest(
                 "Fetch historical data first via HistoricalDataFetcher.",
             ),
         )
+
+    bars = [
+        PriceBar(
+            timestamp=bar.time,
+            open=bar.open,
+            high=bar.high,
+            low=bar.low,
+            close=bar.close,
+            volume=bar.volume,
+            bar_size=bar.bar_size,
+        )
+        for bar in db_bars
+    ]
 
     # Evict oldest job if at capacity
     if len(_jobs) >= MAX_JOBS:
@@ -130,7 +144,7 @@ async def run_backtest(
     job = _Job(job_id=job_id, request=body)
     _jobs[job_id] = job
 
-    asyncio.create_task(_run_job(job, list(sample)), name=f"backtest-{job_id}")
+    asyncio.create_task(_run_job(job, bars), name=f"backtest-{job_id}")
 
     return JSONResponse(
         status_code=202,
