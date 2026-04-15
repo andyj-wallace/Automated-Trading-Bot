@@ -52,7 +52,7 @@ def _build_broker() -> BaseBroker:
         return MockBroker()
 
     from app.brokers.ibkr.client import IBKRClient
-    return IBKRClient(settings)
+    return IBKRClient(settings, cache=_build_cache())
 
 
 async def get_broker() -> BaseBroker:

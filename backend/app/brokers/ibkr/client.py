@@ -8,8 +8,10 @@ See .claude/specs/ibkr-gateway.md for setup and daily startup procedure.
 """
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from ib_async import IB, LimitOrder, MarketOrder, Stock
 
@@ -25,7 +27,10 @@ from app.brokers.base import (
 )
 from app.brokers.ibkr import mapper
 from app.config import Settings
-from app.monitoring.logger import system_logger
+from app.monitoring.logger import error_logger, system_logger
+
+if TYPE_CHECKING:
+    from app.data.cache import RedisCache
 
 # How long (seconds) to wait for an order fill before returning with
 # whatever status we have.  Market orders on paper typically fill in <1s;
@@ -45,10 +50,12 @@ class IBKRClient(BaseBroker):
     submission during development.
     """
 
-    _RECONNECT_DELAYS = [5, 15, 30, 60]  # seconds between attempts
+    # Exponential backoff delays in seconds — 5 attempts: 5, 10, 20, 40, 80
+    _RECONNECT_DELAYS = [5, 10, 20, 40, 80]
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, cache: "RedisCache | None" = None) -> None:
         self._settings = settings
+        self._cache = cache
         self._ib = IB()
         # symbol → Stock Contract (needed to cancel subscriptions)
         self._subscribed_contracts: dict[str, Stock] = {}
@@ -148,14 +155,31 @@ class IBKRClient(BaseBroker):
 
     async def _reconnect_loop(self) -> None:
         """
-        Attempt to reconnect to IB Gateway with escalating delays.
-        Stops if disconnect() is called intentionally (self._reconnecting=False).
+        Attempt to reconnect to IB Gateway with exponential backoff.
+
+        Makes up to 5 attempts with delays of 5, 10, 20, 40, and 80 seconds.
+        Each attempt is logged at WARNING. On exhaustion, logs CRITICAL and
+        publishes a system_alert event to Redis (if cache is available).
+        Stops early if disconnect() is called intentionally.
         """
         self._reconnecting = True
-        for delay in self._RECONNECT_DELAYS:
+        total = len(self._RECONNECT_DELAYS)
+        for attempt, delay in enumerate(self._RECONNECT_DELAYS, start=1):
             if not self._reconnecting:
                 return
-            system_logger.info(f"IBKRClient reconnect attempt in {delay}s")
+            system_logger.warning(
+                "IBKRClient: reconnect attempt %d/%d in %ds",
+                attempt,
+                total,
+                delay,
+                extra={
+                    "host": self._settings.ibkr_host,
+                    "port": self._settings.ibkr_port,
+                    "attempt": attempt,
+                    "total_attempts": total,
+                    "delay_seconds": delay,
+                },
+            )
             await asyncio.sleep(delay)
             if not self._reconnecting:
                 return
@@ -165,18 +189,56 @@ class IBKRClient(BaseBroker):
                     self._settings.ibkr_port,
                     clientId=self._settings.ibkr_client_id,
                 )
-                system_logger.info("IBKRClient reconnected successfully")
+                system_logger.info(
+                    "IBKRClient: reconnected successfully on attempt %d/%d",
+                    attempt,
+                    total,
+                    extra={"attempt": attempt},
+                )
                 self._reconnecting = False
                 return
             except Exception as exc:
                 system_logger.warning(
-                    "IBKRClient reconnect failed",
-                    extra={"error": str(exc)},
+                    "IBKRClient: reconnect attempt %d/%d failed",
+                    attempt,
+                    total,
+                    extra={"attempt": attempt, "error": str(exc)},
                 )
+
+        # All attempts exhausted — fire system alert
         self._reconnecting = False
-        system_logger.error(
-            "IBKRClient gave up reconnecting after all attempts failed"
+        error_logger.critical(
+            "IBKRClient: broker reconnection exhausted — all %d attempts failed",
+            total,
+            extra={
+                "host": self._settings.ibkr_host,
+                "port": self._settings.ibkr_port,
+                "attempts": total,
+            },
         )
+        if self._cache is not None:
+            try:
+                await self._cache.publish(
+                    "system_alerts",
+                    json.dumps({
+                        "event": "system_alert",
+                        "payload": {
+                            "alert_type": "BROKER_RECONNECT_EXHAUSTED",
+                            "message": (
+                                f"Broker reconnection failed after {total} attempts. "
+                                "Manual intervention required."
+                            ),
+                            "host": self._settings.ibkr_host,
+                            "port": self._settings.ibkr_port,
+                            "attempts": total,
+                        },
+                    }),
+                )
+            except Exception as pub_exc:
+                system_logger.warning(
+                    "IBKRClient: failed to publish system_alert to Redis",
+                    extra={"error": str(pub_exc)},
+                )
 
     def is_connected(self) -> bool:
         return self._ib.isConnected()
