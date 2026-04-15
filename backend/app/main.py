@@ -38,6 +38,9 @@ async def lifespan(app: FastAPI):
     )
 
     import app.core.strategy_engine.moving_average  # noqa: F401 — triggers self-registration
+    import app.core.strategy_engine.mean_reversion  # noqa: F401 — triggers self-registration
+    import app.core.strategy_engine.stock_trend  # noqa: F401 — triggers self-registration
+    import app.core.strategy_engine.composite  # noqa: F401 — triggers self-registration
 
     from app.core.execution.order_manager import OrderManager
     from app.core.execution.position_monitor import PositionMonitor
@@ -127,7 +130,7 @@ async def lifespan(app: FastAPI):
         import json
         try:
             async for msg in cache.subscribe_many(
-                channels=["risk_updates", "trade_events"],
+                channels=["risk_updates", "trade_events", "system_alerts"],
                 patterns=[],
             ):
                 try:

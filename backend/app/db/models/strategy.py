@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, String, func
+from sqlalchemy import Boolean, Index, String, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -19,6 +19,10 @@ class TradingStrategy(Base):
     """
 
     __tablename__ = "trading_strategies"
+    __table_args__ = (
+        # Hot path: get_enabled() called every 60s by StrategyScheduler
+        Index("ix_trading_strategies_is_enabled_name", "is_enabled", "name"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4

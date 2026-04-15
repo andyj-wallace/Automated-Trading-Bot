@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import TIMESTAMP, ForeignKey, Numeric, String, func
+from sqlalchemy import TIMESTAMP, ForeignKey, Index, Numeric, String, func
 from sqlalchemy.dialects.postgresql import ENUM as PGENUM, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -45,6 +45,14 @@ class Trade(Base):
     """
 
     __tablename__ = "trades"
+    __table_args__ = (
+        # Hot path: get_open_trades() called every 30s by RiskMonitor, PositionMonitor, MetricsCollector
+        Index("ix_trades_status_executed_at", "status", "executed_at"),
+        # On-demand: GET /metrics/performance — WHERE status=CLOSED AND closed_at>=cutoff
+        Index("ix_trades_status_closed_at", "status", "closed_at"),
+        # API list: optional filters on status, symbol, strategy_id + ORDER BY executed_at
+        Index("ix_trades_status_symbol_strategy", "status", "symbol", "strategy_id"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4

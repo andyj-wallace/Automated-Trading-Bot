@@ -427,23 +427,23 @@ Build each panel separately, each wired to live data on completion.
 
 ### Layer 17 — System Hardening
 
-- [ ] **17.1** Implement broker reconnection with exponential backoff (max 5 attempts); log all retries at WARNING; fire system alert on exhaustion *(M)*
+- [x] **17.1** Implement broker reconnection with exponential backoff (max 5 attempts); log all retries at WARNING; fire system alert on exhaustion *(M)*
   - *Depends on: 4.3*
-- [ ] **17.2** Audit and optimize slow DB queries; add indexes where needed *(M)*
-- [ ] **17.3** Enable TimescaleDB chunk compression for `portfolio_snapshots` (7-day threshold) *(S)*
+- [x] **17.2** Audit and optimize slow DB queries; add indexes where needed *(M)*
+- [x] **17.3** Enable TimescaleDB chunk compression for `portfolio_snapshots` (7-day threshold) *(S)*
   - *Depends on: 16.1*
-- [ ] **17.4** Add integration test suite for full trade execution flow end-to-end *(L)*
+- [x] **17.4** Add integration test suite for full trade execution flow end-to-end *(L)*
   - *Depends on: 7.1, 12.2*
-- [ ] **17.5** Implement `MeanReversionStrategy` (`app/core/strategy_engine/mean_reversion.py`) *(L)*
+- [x] **17.5** Implement `MeanReversionStrategy` (`app/core/strategy_engine/mean_reversion.py`) *(L)*
   - *Depends on: 6.1, 5.3*
-- [ ] **17.6** Implement `StockTrendStrategy` (stock vs 200-day MA) *(L)*
+- [x] **17.6** Implement `StockTrendStrategy` (stock vs 200-day MA) *(L)*
   - *Depends on: 6.1, 5.3*
 
 ---
 
 ## Phase 5 — Expansion & Refinement
 
-- [ ] **18.1** Strategy combination framework — chain signal outputs between strategies *(XL)*
+- [x] **18.1** Strategy combination framework — chain signal outputs between strategies *(XL)*
 - [ ] **18.2** Advanced analytics: rolling Sharpe, drawdown charts, trade heatmaps *(L)*
 - [ ] **18.3** Mobile notification delivery (push or SMS) *(M)*
 - [ ] **18.4** Security hardening: API bound to localhost, secrets audit, HTTPS for webhooks *(M)*

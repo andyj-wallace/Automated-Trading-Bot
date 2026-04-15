@@ -1,8 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, String
-from sqlalchemy import TIMESTAMP, Numeric
+from sqlalchemy import BigInteger, Index, Numeric, String, TIMESTAMP
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -21,6 +20,11 @@ class OHLCVBar(Base):
     """
 
     __tablename__ = "ohlcv_bars"
+    __table_args__ = (
+        # StrategyScheduler: WHERE symbol = ? AND bar_size = ? ORDER BY time (every 60s per symbol)
+        # TimescaleDB chunk exclusion handles the time range; this index narrows symbol + bar_size.
+        Index("ix_ohlcv_bars_symbol_bar_size", "symbol", "bar_size"),
+    )
 
     time: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), primary_key=True, nullable=False

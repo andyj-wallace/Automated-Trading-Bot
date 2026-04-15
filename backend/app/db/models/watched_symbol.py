@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, String, func
+from sqlalchemy import Boolean, Index, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -16,6 +16,10 @@ class WatchedSymbol(Base):
     """
 
     __tablename__ = "watched_symbols"
+    __table_args__ = (
+        # GET /api/v1/symbols?active_only=true: WHERE is_active = TRUE ORDER BY added_at
+        Index("ix_watched_symbols_is_active_added_at", "is_active", "added_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4

@@ -5,6 +5,7 @@ Supported notification types:
   - risk_alert:    WARNING or CRITICAL aggregate risk threshold crossed
   - trade_executed: a trade was filled (BUY/SELL confirmed)
   - trade_closed:  a position was closed (with P&L summary)
+  - system_alert:  critical system fault (e.g. broker reconnection exhausted)
 
 Configuration (via Settings):
   notification_email_smtp — SMTP URL string:
@@ -111,6 +112,12 @@ class NotificationDispatcher:
                 pnl=payload.get("pnl", "?"),
             )
 
+        elif event_type == "system_alert":
+            await self.notify_system_alert(
+                alert_type=payload.get("alert_type", "UNKNOWN"),
+                message=payload.get("message", "No details provided."),
+            )
+
     async def notify_risk_alert(
         self,
         alert_level: str,
@@ -160,6 +167,23 @@ class NotificationDispatcher:
         _log.info(
             "NotificationDispatcher: trade executed notification",
             extra={"symbol": symbol, "direction": direction},
+        )
+        await self._send(subject, body)
+
+    async def notify_system_alert(
+        self,
+        alert_type: str,
+        message: str,
+    ) -> None:
+        """Send a critical system fault notification."""
+        subject = f"[TradingBot] CRITICAL system alert — {alert_type}"
+        body = (
+            f"System Alert: {alert_type}\n\n"
+            f"{message}\n"
+        )
+        _log.critical(
+            "NotificationDispatcher: system alert",
+            extra={"alert_type": alert_type, "message": message},
         )
         await self._send(subject, body)
 
