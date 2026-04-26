@@ -1,5 +1,5 @@
 """
-NotificationDispatcher — delivers event notifications via email (SMTP).
+NotificationDispatcher — delivers event notifications via email (SMTP) and SMS (Twilio).
 
 Supported notification types:
   - risk_alert:    WARNING or CRITICAL aggregate risk threshold crossed
@@ -12,13 +12,20 @@ Configuration (via Settings):
       "smtp://user:pass@host:port/recipient@example.com"
       "smtps://user:pass@smtp.gmail.com:465/you@gmail.com"
 
-  If notification_email_smtp is empty, all notifications are logged at DEBUG
-  and silently skipped (no error raised).
+  notification_sms_twilio — Twilio SMS URL string:
+      "twilio://account_sid:auth_token@+15551234567/+15559876543"
+      (host = from-number, path = to-number)
+
+  If either is empty, those notifications are silently skipped (no error raised).
 
 SMTP URL format:
   scheme://user:pass@host:port/to_address
   - scheme: smtp (STARTTLS on port 587) or smtps (SSL on port 465)
   - to_address is the path component (after the final /)
+
+Twilio URL format:
+  twilio://account_sid:auth_token@from_number/to_number
+  - from_number and to_number are E.164 format (e.g. +15551234567)
 
 The dispatcher is fire-and-forget — it never raises. All failures are logged
 to system.log at WARNING level so the trading pipeline is never blocked.
@@ -36,11 +43,11 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-import logging
+import base64
 import smtplib
 import ssl
 from email.message import EmailMessage
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 from app.monitoring.logger import system_logger
 
@@ -59,6 +66,9 @@ class NotificationDispatcher:
         self._smtp_url: str = getattr(settings, "notification_email_smtp", "")
         self._enabled = bool(self._smtp_url)
 
+        self._twilio_url: str = getattr(settings, "notification_sms_twilio", "")
+        self._sms_enabled = bool(self._twilio_url)
+
         if self._enabled:
             _log.info(
                 "NotificationDispatcher: SMTP notifications enabled",
@@ -67,7 +77,15 @@ class NotificationDispatcher:
         else:
             _log.info(
                 "NotificationDispatcher: notification_email_smtp not set — "
-                "notifications will be logged only"
+                "email notifications will be logged only"
+            )
+
+        if self._sms_enabled:
+            _log.info("NotificationDispatcher: Twilio SMS notifications enabled")
+        else:
+            _log.info(
+                "NotificationDispatcher: notification_sms_twilio not set — "
+                "SMS notifications disabled"
             )
 
     # ------------------------------------------------------------------
@@ -136,11 +154,13 @@ class NotificationDispatcher:
             f"Open trades:    {open_trade_count}\n"
             f"Account balance: ${account_balance}\n"
         )
+        sms_body = f"[TradingBot] {alert_level}: Portfolio risk at {pct_display} ({open_trade_count} open trades)"
         _log.warning(
             f"NotificationDispatcher: {alert_level} risk alert",
             extra={"aggregate_risk_pct": aggregate_risk_pct, "open_trade_count": open_trade_count},
         )
         await self._send(subject, body)
+        await self._send_sms(sms_body)
 
     async def notify_trade_executed(
         self,
@@ -164,11 +184,13 @@ class NotificationDispatcher:
             f"Take-profit:  ${take_profit_price}\n"
             f"Risk amount:  ${risk_amount}\n"
         )
+        sms_body = f"[TradingBot] {direction} {quantity} {symbol} @ ${entry_price} | SL ${stop_loss_price} | TP ${take_profit_price}"
         _log.info(
             "NotificationDispatcher: trade executed notification",
             extra={"symbol": symbol, "direction": direction},
         )
         await self._send(subject, body)
+        await self._send_sms(sms_body)
 
     async def notify_system_alert(
         self,
@@ -181,11 +203,13 @@ class NotificationDispatcher:
             f"System Alert: {alert_type}\n\n"
             f"{message}\n"
         )
+        sms_body = f"[TradingBot] CRITICAL: {alert_type} — {message[:100]}"
         _log.critical(
             "NotificationDispatcher: system alert",
             extra={"alert_type": alert_type, "message": message},
         )
         await self._send(subject, body)
+        await self._send_sms(sms_body)
 
     async def notify_trade_closed(
         self,
@@ -205,11 +229,13 @@ class NotificationDispatcher:
             f"Exit price:  ${exit_price}\n"
             f"P&L:         {pnl_sign}${pnl_val:.2f}\n"
         )
+        sms_body = f"[TradingBot] {symbol} closed ({reason}) @ ${exit_price} | P&L {pnl_sign}${pnl_val:.2f}"
         _log.info(
             "NotificationDispatcher: trade closed notification",
             extra={"symbol": symbol, "reason": reason, "pnl": pnl},
         )
         await self._send(subject, body)
+        await self._send_sms(sms_body)
 
     # ------------------------------------------------------------------
     # Internal: SMTP delivery
@@ -262,6 +288,67 @@ class NotificationDispatcher:
                 if user and password:
                     server.login(user, password)
                 server.send_message(msg)
+
+    # ------------------------------------------------------------------
+    # Internal: Twilio SMS delivery
+    # ------------------------------------------------------------------
+
+    async def _send_sms(self, body: str) -> None:
+        """
+        Send an SMS via Twilio REST API. Fire-and-forget — never raises.
+
+        Parses NOTIFICATION_SMS_TWILIO in the format:
+            twilio://account_sid:auth_token@from_number/to_number
+        Uses httpx for the HTTP call, run in a thread executor to avoid
+        blocking the event loop.
+        """
+        if not self._sms_enabled:
+            return
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._send_sms_sync, body
+            )
+        except Exception as exc:
+            _log.warning(
+                "NotificationDispatcher: SMS delivery failed",
+                extra={"error": str(exc)},
+            )
+
+    def _send_sms_sync(self, body: str) -> None:
+        """Blocking Twilio REST call — invoked from thread executor."""
+        import urllib.request
+        import urllib.parse as _urlparse
+
+        parsed = urlparse(self._twilio_url)
+        account_sid = unquote(parsed.username or "")
+        auth_token = unquote(parsed.password or "")
+        from_number = parsed.hostname or ""
+        to_number = parsed.path.lstrip("/")
+
+        if not (account_sid and auth_token and from_number and to_number):
+            _log.warning("NotificationDispatcher: SMS URL missing required fields")
+            return
+
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+        data = _urlparse.urlencode({
+            "From": from_number,
+            "To": to_number,
+            "Body": body[:1600],  # Twilio message limit
+        }).encode("utf-8")
+
+        credentials = base64.b64encode(f"{account_sid}:{auth_token}".encode()).decode()
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Authorization": f"Basic {credentials}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status not in (200, 201):
+                _log.warning(
+                    "NotificationDispatcher: Twilio returned unexpected status",
+                    extra={"status": resp.status},
+                )
 
     def _parse_smtp_host(self) -> str:
         try:

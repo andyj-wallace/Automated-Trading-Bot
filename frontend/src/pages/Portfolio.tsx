@@ -7,6 +7,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { RiskMetricsPanel } from "../components/portfolio/RiskMetricsPanel";
+import { AdvancedAnalyticsPanel } from "../components/portfolio/AdvancedAnalyticsPanel";
 import { RiskGauge } from "../components/dashboard/RiskGauge";
 import { ActiveTradesTable } from "../components/dashboard/ActiveTradesTable";
 import { useWebSocket } from "../hooks/useWebSocket";
@@ -42,6 +43,9 @@ export function Portfolio() {
 
       {/* Open positions */}
       <ActiveTradesTable lastEvent={lastEvent} />
+
+      {/* Advanced analytics */}
+      <AdvancedAnalyticsPanel />
 
       {/* Closed trade history */}
       <div className="rounded-lg border border-gray-800 bg-gray-900 p-5 flex flex-col gap-4">

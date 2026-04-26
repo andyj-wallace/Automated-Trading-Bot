@@ -444,23 +444,112 @@ Build each panel separately, each wired to live data on completion.
 ## Phase 5 — Expansion & Refinement
 
 - [x] **18.1** Strategy combination framework — chain signal outputs between strategies *(XL)*
-- [ ] **18.2** Advanced analytics: rolling Sharpe, drawdown charts, trade heatmaps *(L)*
-- [ ] **18.3** Mobile notification delivery (push or SMS) *(M)*
-- [ ] **18.4** Security hardening: API bound to localhost, secrets audit, HTTPS for webhooks *(M)*
-- [ ] **18.5** Automated test coverage review — target ≥ 80% on core business logic *(L)*
-- [ ] **18.6** Performance load test — simulate 5 strategies firing simultaneously *(M)*
+- [x] **18.2** Advanced analytics: rolling Sharpe, drawdown charts, trade heatmaps *(L)*
+  - `GET /api/v1/metrics/analytics?range=30d|90d|all` — drawdown series, rolling 20-snapshot Sharpe, day-of-week P&L heatmap
+  - `AdvancedAnalyticsPanel` component wired into Portfolio page with range selector and SVG charts
+- [x] **18.3** Mobile notification delivery (push or SMS) *(M)*
+  - Twilio SMS via `NOTIFICATION_SMS_TWILIO=twilio://account_sid:auth_token@+from/+to` URL format
+  - All four event types (risk_alert, trade_executed, trade_closed, system_alert) send SMS concurrently with email
+  - Fire-and-forget; uses stdlib `urllib` (no new dependencies)
+- [x] **18.4** Security hardening: API bound to localhost, secrets audit, HTTPS for webhooks *(M)*
+  - Startup `_run_security_audit()` in `main.py`: checks SECRET_KEY strength, production API_HOST, SMTP TLS, mock broker in prod
+  - `API_HOST` / `API_PORT` settings added to `config.py` and `.env.example`
+  - All warnings logged to `system.log`; never blocks startup
+- [x] **18.5** Automated test coverage review — target ≥ 80% on core business logic *(L)*
+  - Added `tests/unit/backtesting/test_engine.py` — 8 BacktestingEngine tests (no-trade, take-profit, stop-loss, end-of-data, Sharpe, drawdown)
+  - Added `tests/unit/notifications/test_dispatcher.py` — 15 NotificationDispatcher tests (dispatch routing, fire-and-forget, SMS/email config, PnL formatting)
+  - Added `tests/unit/test_security_audit.py` — 9 security audit tests
+  - Added `TestAnalyticsEndpoint` class to `test_layer8.py` — 4 analytics endpoint tests
+- [x] **18.6** Performance load test — simulate 5 strategies firing simultaneously *(M)*
+  - `tests/load/test_concurrent_strategies.py` — 3 tests: 5 concurrent BacktestingEngine runs < 10s, independence check, shared RiskManager thread-safety with 20 concurrent validations
+
+**Checkpoint** ✅: 307 unit tests pass. 35 new Phase 5 tests pass (8 backtesting engine, 15 notification dispatcher, 9 security audit, 4 analytics endpoint, 3 load tests). Integration tests skipped — require live Redis + PostgreSQL.
 
 ---
 
-## Phase 6 — Future Backlog
+## Phase 6 — Expansion
 
-- [ ] Options trading strategy support (iron condor)
-- [ ] Bull/bear market prediction strategy
-- [ ] Intra-week mean reversion strategy
-- [ ] Mobile PWA frontend
-- [ ] Additional broker integration (abstraction layer ready)
-- [ ] Machine learning signal integration
-- [ ] Advanced backtesting: multi-strategy portfolio simulation
+> Items requiring significant new infrastructure (options trading, machine learning, mobile PWA, additional broker) have been moved to `README.md § Backlog` with full design notes.
+
+---
+
+### Layer 19 — Bull/Bear Market Regime Strategy
+
+A strategy that detects whether the market is in a bull or bear regime and only opens positions aligned with that regime. Uses the S&P 500 (SPY) as a regime indicator: price above its 200-day MA = bull, below = bear.
+
+- [ ] **19.1** Implement `BullBearStrategy` (`app/core/strategy_engine/bull_bear.py`) *(M)*
+  - Regime detection: fetch SPY bars alongside the target symbol; regime = `BUY`-eligible only when SPY close > SPY 200-day MA
+  - In bull regime: emit BUY signal when target symbol crosses above its own 50-day MA
+  - In bear regime: emit HOLD for all symbols (no longs in a downtrend market)
+  - Configurable: `regime_symbol` (default `"SPY"`), `regime_period` (default `200`), `entry_period` (default `50`) via JSONB config
+  - Stop-loss: ATR-based (14-day ATR × 1.5) so the stop widens in volatile regimes
+  - *Depends on: 6.1, 5.3*
+- [ ] **19.2** Register `BullBearStrategy` in `StrategyRegistry`; self-registers at import *(S)*
+  - Import in `main.py` lifespan alongside existing strategies
+  - *Depends on: 19.1, 11.1*
+- [ ] **19.3** Write unit tests for `BullBearStrategy` *(M)*
+  - Regime detection: SPY above 200-day → BUY-eligible; below → HOLD
+  - Entry: target above 50-day in bull regime → BUY; below → HOLD
+  - Bear regime overrides entry signal regardless of target MA state
+  - ATR stop calculation: stop = entry − (ATR × multiplier)
+  - Insufficient bars (< 200): returns HOLD
+  - Config schema validation; registry self-registration
+  - *Depends on: 19.1, 11.3*
+
+---
+
+### Layer 20 — Intra-Week Mean Reversion Strategy
+
+A strategy that exploits short-term price extensions — buys pullbacks to the weekly VWAP when the stock is in a longer-term uptrend and has pulled back ≥ 2% intra-week.
+
+- [ ] **20.1** Implement `IntraWeekMeanReversionStrategy` (`app/core/strategy_engine/intra_week_reversion.py`) *(M)*
+  - Trend filter: only BUY-eligible when close > 50-day MA (position in uptrend)
+  - Entry trigger: current price ≤ weekly VWAP − (weekly VWAP × `pullback_pct`, default `0.02`)
+  - Weekly VWAP: computed from the current week's bars (Mon–current bar) using `sum(close × volume) / sum(volume)`
+  - Stop-loss: prior week's low
+  - Take-profit: weekly VWAP + (weekly VWAP − stop_loss) × `rr_ratio` (default `2.0`)
+  - Only one open position per symbol; emits HOLD if already in a trade
+  - Configurable: `pullback_pct`, `ma_period`, `rr_ratio` via JSONB config
+  - *Depends on: 6.1, 5.3*
+- [ ] **20.2** Register `IntraWeekMeanReversionStrategy` in `StrategyRegistry` *(S)*
+  - *Depends on: 20.1, 11.1*
+- [ ] **20.3** Write unit tests for `IntraWeekMeanReversionStrategy` *(M)*
+  - Trend filter: price below 50-day MA → HOLD
+  - Pullback trigger: price at/below VWAP − threshold → BUY; above → HOLD
+  - Stop set to prior week's low; take-profit at computed R:R target
+  - Weekly VWAP calculation correctness across multi-day sequences
+  - Insufficient bars: HOLD
+  - Config schema; registry registration
+  - *Depends on: 20.1, 11.3*
+
+---
+
+### Layer 21 — Multi-Strategy Portfolio Backtesting
+
+Extends the existing `BacktestingEngine` to run multiple strategies across multiple symbols simultaneously, tracking combined portfolio equity and enforcing aggregate risk limits across the full run.
+
+- [ ] **21.1** Implement `PortfolioBacktestEngine` (`app/core/backtesting/portfolio_engine.py`) *(L)*
+  - Accepts a list of `(strategy, symbol, bars)` tuples and a single shared `account_balance`
+  - Runs all strategy-symbol pairs bar-by-bar in lock-step (same bar index across all pairs)
+  - Shared position tracker: enforces the portfolio aggregate risk gate (same 10% hard limit as live) across all open simulated trades
+  - Fills at next bar's open per pair, same as single-strategy engine
+  - Produces a `PortfolioBacktestResult` with per-strategy metrics plus combined equity curve, combined drawdown, and combined Sharpe
+  - *Depends on: 15.1, 6.3*
+- [ ] **21.2** Add `POST /api/v1/backtesting/run-portfolio` endpoint *(M)*
+  - Request body: list of `{strategy_type, symbol, config}` objects + `account_balance`, `range`
+  - Validates all strategy types are registered and all symbols have OHLCV data before queuing
+  - Same async job pattern as 15.3: returns `202 + job_id`; `GET /api/v1/backtesting/{id}` polls status
+  - *Depends on: 21.1, 15.3*
+- [ ] **21.3** Extend `BacktestingPage` with portfolio run mode *(M)*
+  - Toggle between single-strategy and portfolio mode
+  - Portfolio mode: add/remove rows of `(strategy, symbol)` pairs; renders combined equity curve alongside per-strategy P&L breakdown table
+  - *Depends on: 21.2, 15.4*
+- [ ] **21.4** Write unit tests for `PortfolioBacktestEngine` *(M)*
+  - Two strategies, two symbols: verify combined equity curve is sum of individual P&Ls
+  - Portfolio risk gate fires when aggregate open risk would exceed limit: second trade rejected
+  - Single strategy-symbol pair produces same result as single-strategy engine
+  - Empty strategy list raises `ValueError`
+  - *Depends on: 21.1*
 
 ---
 
