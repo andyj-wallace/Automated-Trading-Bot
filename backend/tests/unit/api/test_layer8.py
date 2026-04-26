@@ -410,3 +410,71 @@ class TestSystemHealthEndpoint:
         assert data["broker"]["status"] in valid
         assert data["database"]["status"] in valid
         assert data["redis"]["status"] in valid
+
+
+# ---------------------------------------------------------------------------
+# 18.2 — Advanced analytics endpoint
+# ---------------------------------------------------------------------------
+
+class TestAnalyticsEndpoint:
+    def test_analytics_returns_required_fields(self, client):
+        """GET /metrics/analytics returns drawdown_series, rolling_sharpe_series, trade_heatmap."""
+        with patch("app.api.v1.metrics.select") as mock_select:
+            # Both queries return empty lists → zeroed analytics
+            execute_result = MagicMock()
+            execute_result.scalars.return_value.all.return_value = []
+            mock_db = AsyncMock()
+            mock_db.execute = AsyncMock(return_value=execute_result)
+            app.dependency_overrides[get_db] = lambda: mock_db
+
+            response = client.get("/api/v1/metrics/analytics?range=30d")
+
+        data = response.json()["data"]
+        assert response.status_code == 200
+        assert "drawdown_series" in data
+        assert "rolling_sharpe_series" in data
+        assert "trade_heatmap" in data
+        assert data["range"] == "30d"
+
+    def test_analytics_heatmap_has_seven_days(self, client):
+        """trade_heatmap always has exactly 7 entries (Mon–Sun)."""
+        execute_result = MagicMock()
+        execute_result.scalars.return_value.all.return_value = []
+        mock_db = AsyncMock()
+        mock_db.execute = AsyncMock(return_value=execute_result)
+        app.dependency_overrides[get_db] = lambda: mock_db
+
+        response = client.get("/api/v1/metrics/analytics")
+
+        assert response.status_code == 200
+        heatmap = response.json()["data"]["trade_heatmap"]
+        assert len(heatmap) == 7
+        day_names = [d["day_name"] for d in heatmap]
+        assert "Monday" in day_names
+        assert "Sunday" in day_names
+
+    def test_analytics_empty_snapshots_returns_empty_series(self, client):
+        """No portfolio snapshots → empty drawdown and sharpe series."""
+        execute_result = MagicMock()
+        execute_result.scalars.return_value.all.return_value = []
+        mock_db = AsyncMock()
+        mock_db.execute = AsyncMock(return_value=execute_result)
+        app.dependency_overrides[get_db] = lambda: mock_db
+
+        response = client.get("/api/v1/metrics/analytics?range=all")
+
+        data = response.json()["data"]
+        assert data["drawdown_series"] == []
+        assert data["rolling_sharpe_series"] == []
+
+    def test_analytics_range_all_accepted(self, client):
+        """range=all should be accepted (no cutoff applied)."""
+        execute_result = MagicMock()
+        execute_result.scalars.return_value.all.return_value = []
+        mock_db = AsyncMock()
+        mock_db.execute = AsyncMock(return_value=execute_result)
+        app.dependency_overrides[get_db] = lambda: mock_db
+
+        response = client.get("/api/v1/metrics/analytics?range=all")
+        assert response.status_code == 200
+        assert response.json()["data"]["range"] == "all"

@@ -34,6 +34,12 @@ class Settings(BaseSettings):
 
     # Notifications (Phase 3+)
     notification_email_smtp: str = ""
+    # Twilio SMS: twilio://account_sid:auth_token@+from_number/+to_number
+    notification_sms_twilio: str = ""
+
+    # API binding (production should use 127.0.0.1)
+    api_host: str = "127.0.0.1"
+    api_port: int = 8000
 
     # VNC (cloud deployment only)
     vnc_password: str = ""

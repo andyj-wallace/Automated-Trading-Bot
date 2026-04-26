@@ -21,6 +21,55 @@ settings = get_settings()
 
 _API_PREFIX = "/api/v1"
 
+# ---------------------------------------------------------------------------
+# Security audit — runs at startup, logs findings to system.log
+# ---------------------------------------------------------------------------
+
+_WEAK_SECRET_PATTERNS = {"", "change-me", "changeme", "secret", "secret-key", "dev", "development"}
+
+
+def _run_security_audit(cfg) -> None:
+    """
+    Log security posture at startup. Emits WARNING for each issue found.
+    Never blocks startup — awareness only.
+    """
+    issues: list[str] = []
+
+    # Secret key must be non-empty and not a known weak default
+    sk = (cfg.secret_key or "").lower().strip()
+    if sk in _WEAK_SECRET_PATTERNS or len(sk) < 32:
+        issues.append(
+            "SECRET_KEY is weak or too short — generate with: "
+            "python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
+
+    # In production: API host should be localhost-only
+    if cfg.is_production and cfg.api_host not in ("127.0.0.1", "localhost"):
+        issues.append(
+            f"API_HOST is '{cfg.api_host}' — production APIs should bind to "
+            "127.0.0.1 (localhost) or sit behind a reverse proxy"
+        )
+
+    # In production: SMTP should use TLS (smtps://)
+    smtp = cfg.notification_email_smtp or ""
+    if cfg.is_production and smtp and not smtp.startswith("smtps://"):
+        issues.append(
+            "NOTIFICATION_EMAIL_SMTP uses plain smtp:// in production — "
+            "use smtps:// for TLS-encrypted delivery"
+        )
+
+    # In production: paper trading mode should not be used with live broker
+    if cfg.is_production and cfg.broker == "mock":
+        issues.append(
+            "BROKER=mock in production — live trading will not execute real orders"
+        )
+
+    if issues:
+        for issue in issues:
+            system_logger.warning(f"[SECURITY AUDIT] {issue}")
+    else:
+        system_logger.info("[SECURITY AUDIT] All checks passed")
+
 _position_monitor = None
 _strategy_scheduler = None
 _risk_monitor_task = None
@@ -36,6 +85,7 @@ async def lifespan(app: FastAPI):
         "Application starting",
         extra={"environment": settings.environment, "log_level": settings.log_level},
     )
+    _run_security_audit(settings)
 
     import app.core.strategy_engine.moving_average  # noqa: F401 — triggers self-registration
     import app.core.strategy_engine.mean_reversion  # noqa: F401 — triggers self-registration
