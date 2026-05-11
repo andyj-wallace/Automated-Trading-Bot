@@ -36,12 +36,18 @@ class MarketData(BaseModel):
 
     `bars` contains historical OHLCV data (most recent bar last); the strategy
     uses this to compute indicators and decide on a signal.
+
+    `extra_bars` carries bars for additional symbols a strategy needs (e.g. a
+    regime filter symbol like SPY). Keyed by upper-case ticker. Defaults to an
+    empty dict so existing strategies are unaffected.
     """
 
     symbol: str
     current_price: Decimal
     bars: list[PriceBar]
     timestamp: datetime
+    extra_bars: dict[str, list[PriceBar]] = {}
+    open_position: bool = False
 
 
 class RiskParams(BaseModel):
