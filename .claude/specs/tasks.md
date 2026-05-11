@@ -477,17 +477,17 @@ Build each panel separately, each wired to live data on completion.
 
 A strategy that detects whether the market is in a bull or bear regime and only opens positions aligned with that regime. Uses the S&P 500 (SPY) as a regime indicator: price above its 200-day MA = bull, below = bear.
 
-- [ ] **19.1** Implement `BullBearStrategy` (`app/core/strategy_engine/bull_bear.py`) *(M)*
+- [x] **19.1** Implement `BullBearStrategy` (`app/core/strategy_engine/bull_bear.py`) *(M)*
   - Regime detection: fetch SPY bars alongside the target symbol; regime = `BUY`-eligible only when SPY close > SPY 200-day MA
   - In bull regime: emit BUY signal when target symbol crosses above its own 50-day MA
   - In bear regime: emit HOLD for all symbols (no longs in a downtrend market)
   - Configurable: `regime_symbol` (default `"SPY"`), `regime_period` (default `200`), `entry_period` (default `50`) via JSONB config
   - Stop-loss: ATR-based (14-day ATR × 1.5) so the stop widens in volatile regimes
   - *Depends on: 6.1, 5.3*
-- [ ] **19.2** Register `BullBearStrategy` in `StrategyRegistry`; self-registers at import *(S)*
+- [x] **19.2** Register `BullBearStrategy` in `StrategyRegistry`; self-registers at import *(S)*
   - Import in `main.py` lifespan alongside existing strategies
   - *Depends on: 19.1, 11.1*
-- [ ] **19.3** Write unit tests for `BullBearStrategy` *(M)*
+- [x] **19.3** Write unit tests for `BullBearStrategy` *(M)*
   - Regime detection: SPY above 200-day → BUY-eligible; below → HOLD
   - Entry: target above 50-day in bull regime → BUY; below → HOLD
   - Bear regime overrides entry signal regardless of target MA state
@@ -502,7 +502,7 @@ A strategy that detects whether the market is in a bull or bear regime and only 
 
 A strategy that exploits short-term price extensions — buys pullbacks to the weekly VWAP when the stock is in a longer-term uptrend and has pulled back ≥ 2% intra-week.
 
-- [ ] **20.1** Implement `IntraWeekMeanReversionStrategy` (`app/core/strategy_engine/intra_week_reversion.py`) *(M)*
+- [x] **20.1** Implement `IntraWeekMeanReversionStrategy` (`app/core/strategy_engine/intra_week_reversion.py`) *(M)*
   - Trend filter: only BUY-eligible when close > 50-day MA (position in uptrend)
   - Entry trigger: current price ≤ weekly VWAP − (weekly VWAP × `pullback_pct`, default `0.02`)
   - Weekly VWAP: computed from the current week's bars (Mon–current bar) using `sum(close × volume) / sum(volume)`
@@ -511,9 +511,9 @@ A strategy that exploits short-term price extensions — buys pullbacks to the w
   - Only one open position per symbol; emits HOLD if already in a trade
   - Configurable: `pullback_pct`, `ma_period`, `rr_ratio` via JSONB config
   - *Depends on: 6.1, 5.3*
-- [ ] **20.2** Register `IntraWeekMeanReversionStrategy` in `StrategyRegistry` *(S)*
+- [x] **20.2** Register `IntraWeekMeanReversionStrategy` in `StrategyRegistry` *(S)*
   - *Depends on: 20.1, 11.1*
-- [ ] **20.3** Write unit tests for `IntraWeekMeanReversionStrategy` *(M)*
+- [x] **20.3** Write unit tests for `IntraWeekMeanReversionStrategy` *(M)*
   - Trend filter: price below 50-day MA → HOLD
   - Pullback trigger: price at/below VWAP − threshold → BUY; above → HOLD
   - Stop set to prior week's low; take-profit at computed R:R target
