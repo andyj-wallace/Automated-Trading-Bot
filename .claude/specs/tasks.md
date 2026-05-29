@@ -528,23 +528,23 @@ A strategy that exploits short-term price extensions — buys pullbacks to the w
 
 Extends the existing `BacktestingEngine` to run multiple strategies across multiple symbols simultaneously, tracking combined portfolio equity and enforcing aggregate risk limits across the full run.
 
-- [ ] **21.1** Implement `PortfolioBacktestEngine` (`app/core/backtesting/portfolio_engine.py`) *(L)*
+- [x] **21.1** Implement `PortfolioBacktestEngine` (`app/core/backtesting/portfolio_engine.py`) *(L)*
   - Accepts a list of `(strategy, symbol, bars)` tuples and a single shared `account_balance`
   - Runs all strategy-symbol pairs bar-by-bar in lock-step (same bar index across all pairs)
   - Shared position tracker: enforces the portfolio aggregate risk gate (same 10% hard limit as live) across all open simulated trades
   - Fills at next bar's open per pair, same as single-strategy engine
   - Produces a `PortfolioBacktestResult` with per-strategy metrics plus combined equity curve, combined drawdown, and combined Sharpe
   - *Depends on: 15.1, 6.3*
-- [ ] **21.2** Add `POST /api/v1/backtesting/run-portfolio` endpoint *(M)*
+- [x] **21.2** Add `POST /api/v1/backtesting/run-portfolio` endpoint *(M)*
   - Request body: list of `{strategy_type, symbol, config}` objects + `account_balance`, `range`
   - Validates all strategy types are registered and all symbols have OHLCV data before queuing
   - Same async job pattern as 15.3: returns `202 + job_id`; `GET /api/v1/backtesting/{id}` polls status
   - *Depends on: 21.1, 15.3*
-- [ ] **21.3** Extend `BacktestingPage` with portfolio run mode *(M)*
+- [x] **21.3** Extend `BacktestingPage` with portfolio run mode *(M)*
   - Toggle between single-strategy and portfolio mode
   - Portfolio mode: add/remove rows of `(strategy, symbol)` pairs; renders combined equity curve alongside per-strategy P&L breakdown table
   - *Depends on: 21.2, 15.4*
-- [ ] **21.4** Write unit tests for `PortfolioBacktestEngine` *(M)*
+- [x] **21.4** Write unit tests for `PortfolioBacktestEngine` *(M)*
   - Two strategies, two symbols: verify combined equity curve is sum of individual P&Ls
   - Portfolio risk gate fires when aggregate open risk would exceed limit: second trade rejected
   - Single strategy-symbol pair produces same result as single-strategy engine
