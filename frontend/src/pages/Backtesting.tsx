@@ -146,6 +146,7 @@ export function Backtesting() {
       if (res.data) setJob(res.data);
     }, 2000);
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [job?.job_id, job?.status]);
 
   // Portfolio polling
@@ -159,6 +160,7 @@ export function Backtesting() {
       if (res.data) setPortJob(res.data);
     }, 2000);
     return () => { if (portPollRef.current) clearInterval(portPollRef.current); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [portJob?.job_id, portJob?.status]);
 
   async function handleSingleSubmit(e: React.FormEvent) {

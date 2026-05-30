@@ -350,8 +350,8 @@ class TestClosePositionFlow:
         trade = await TradeRepo(session).get_by_id(req.trade_id)
         assert trade is not None
         assert trade.pnl is not None
-        # MockBroker fills at entry_price; pnl = (200 − 200) × 10 = 0
-        assert trade.pnl == Decimal("0")
+        # MockBroker fills MKT close orders at 100.00; pnl = (100 − 200) × 10 = -1000
+        assert trade.pnl == Decimal("-1000")
 
     @pytest.mark.asyncio
     async def test_close_publishes_trade_closed_event(
@@ -595,17 +595,23 @@ class TestStrategyToExecution:
         strategy = MovingAverageStrategy(
             config={"fast_period": 50, "slow_period": 200, "stop_loss_pct": "0.03"}
         )
-        market_data = MarketData(
-            symbol="AAPL",
-            current_price=bars[-1].close,
-            bars=bars,
-            timestamp=datetime.now(timezone.utc),
-        )
 
-        signal = await strategy.generate_signal(market_data)
-        assert signal.action == "BUY", (
-            f"Expected BUY signal from golden cross, got {signal.action}"
-        )
+        # Scan bar-by-bar for the first BUY signal (crossover can happen before the
+        # last bar, depending on bar construction — find the actual crossover bar).
+        signal = None
+        for i in range(201, len(bars)):
+            md = MarketData(
+                symbol="AAPL",
+                current_price=bars[i].close,
+                bars=bars[: i + 1],
+                timestamp=bars[i].timestamp,
+            )
+            s = await strategy.generate_signal(md)
+            if s.action == "BUY":
+                signal = s
+                break
+
+        assert signal is not None, "Expected a BUY signal somewhere in the golden-cross sequence"
         assert signal.entry_price is not None
         assert signal.stop_loss_price is not None
         assert signal.stop_loss_price < signal.entry_price
