@@ -11,14 +11,13 @@ Verifies the full Checkpoint requirement:
 
 import uuid
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import patch
 
 import pytest
 
 from app.brokers.mock.client import MockBroker
 from app.core.execution.order_manager import OrderManager
 from app.core.risk.manager import RiskManager, RiskRejectionError, TradeRequest
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -243,9 +242,8 @@ async def test_risk_rejection_propagates(manager: OrderManager) -> None:
 @pytest.mark.asyncio
 async def test_no_audit_entry_on_risk_rejection(manager: OrderManager) -> None:
     req = _request(stop_loss_price=None)
-    with patch("app.core.execution.order_manager.audit_logger") as mock_audit:
-        with pytest.raises(RiskRejectionError):
-            await manager.submit_order(req)
+    with patch("app.core.execution.order_manager.audit_logger") as mock_audit, pytest.raises(RiskRejectionError):
+        await manager.submit_order(req)
     mock_audit.info.assert_not_called()
 
 
@@ -290,9 +288,8 @@ async def test_broker_error_still_writes_post_confirmation_as_error(
 
     broker.place_order = failing_place_order
 
-    with patch("app.core.execution.order_manager.audit_logger") as mock_audit:
-        with pytest.raises(ConnectionError):
-            await manager.submit_order(req)
+    with patch("app.core.execution.order_manager.audit_logger") as mock_audit, pytest.raises(ConnectionError):
+        await manager.submit_order(req)
 
     messages = [c.args[0] for c in mock_audit.info.call_args_list]
     assert "PRE_SUBMISSION" in messages

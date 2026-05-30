@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from decimal import Decimal
 
 from fastapi import FastAPI
@@ -87,13 +87,12 @@ async def lifespan(app: FastAPI):
     )
     _run_security_audit(settings)
 
-    import app.core.strategy_engine.moving_average  # noqa: F401 — triggers self-registration
-    import app.core.strategy_engine.mean_reversion  # noqa: F401 — triggers self-registration
-    import app.core.strategy_engine.stock_trend  # noqa: F401 — triggers self-registration
-    import app.core.strategy_engine.composite  # noqa: F401 — triggers self-registration
     import app.core.strategy_engine.bull_bear  # noqa: F401 — triggers self-registration
+    import app.core.strategy_engine.composite  # noqa: F401 — triggers self-registration
     import app.core.strategy_engine.intra_week_reversion  # noqa: F401 — triggers self-registration
-
+    import app.core.strategy_engine.mean_reversion  # noqa: F401 — triggers self-registration
+    import app.core.strategy_engine.moving_average  # noqa: F401 — triggers self-registration
+    import app.core.strategy_engine.stock_trend  # noqa: F401 — triggers self-registration
     from app.core.execution.order_manager import OrderManager
     from app.core.execution.position_monitor import PositionMonitor
     from app.core.risk.manager import RiskManager
@@ -214,16 +213,12 @@ async def lifespan(app: FastAPI):
     if _risk_monitor_task and not _risk_monitor_task.done():
         _risk_monitor.stop()
         _risk_monitor_task.cancel()
-        try:
+        with suppress(asyncio.CancelledError):
             await _risk_monitor_task
-        except asyncio.CancelledError:
-            pass
     if _notification_task and not _notification_task.done():
         _notification_task.cancel()
-        try:
+        with suppress(asyncio.CancelledError):
             await _notification_task
-        except asyncio.CancelledError:
-            pass
     await cache.close()
     system_logger.info("Application shutting down")
 

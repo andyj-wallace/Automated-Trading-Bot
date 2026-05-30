@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -27,7 +27,6 @@ from app.brokers.base import PriceBar
 from app.core.backtesting.engine import BacktestingEngine
 from app.core.risk.manager import RiskManager
 from app.core.strategy_engine.base import BaseStrategy, MarketData, RiskParams, Signal
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -45,7 +44,7 @@ def _make_bars(
     """Generate synthetic daily bars."""
     bars = []
     price = start_price
-    base_date = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    base_date = datetime(2024, 1, 1, tzinfo=UTC)
 
     for i in range(count):
         ts = base_date + timedelta(days=i)
@@ -154,7 +153,7 @@ async def test_five_strategies_run_concurrently_without_error() -> None:
         assert result.metrics.bars_tested == len(bars)
         assert result.metrics.trade_count >= 0
         assert 0.0 <= result.metrics.win_rate_pct <= 100.0
-        assert not (result.metrics.sharpe_ratio != result.metrics.sharpe_ratio)  # not NaN
+        assert result.metrics.sharpe_ratio == result.metrics.sharpe_ratio  # not NaN
         assert result.metrics.max_drawdown_pct >= 0.0
 
         return symbol, elapsed
@@ -164,16 +163,16 @@ async def test_five_strategies_run_concurrently_without_error() -> None:
     wall_t0 = time.perf_counter()
 
     results = await asyncio.gather(
-        *[_run_one(sym, per) for sym, per in zip(_SYMBOLS, periods)]
+        *[_run_one(sym, per) for sym, per in zip(_SYMBOLS, periods, strict=False)]
     )
 
     total_elapsed = time.perf_counter() - wall_t0
 
-    print(f"\n--- Load test results (5 concurrent strategies) ---")
+    print("\n--- Load test results (5 concurrent strategies) ---")
     for sym, t in results:
         print(f"  {sym}: {t * 1000:.1f} ms")
     print(f"  Total wall time: {total_elapsed * 1000:.1f} ms")
-    print(f"---")
+    print("---")
 
     assert len(results) == 5, "All 5 strategies should complete"
     assert total_elapsed < 10.0, (
@@ -220,8 +219,9 @@ async def test_concurrent_risk_manager_calls_are_thread_safe() -> None:
     shared_risk_manager = RiskManager()
 
     async def _validate_and_assert(account_balance: Decimal) -> None:
-        from app.core.risk.manager import TradeRequest
         import uuid
+
+        from app.core.risk.manager import TradeRequest
 
         req = TradeRequest(
             trade_id=uuid.uuid4(),

@@ -40,7 +40,7 @@ import json
 import os
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -55,7 +55,7 @@ from app.core.execution.position_monitor import PositionMonitor
 from app.core.risk.manager import RiskManager, RiskRejectionError, TradeRequest
 from app.core.strategy_engine.moving_average import MovingAverageStrategy
 from app.data.cache import RedisCache
-from app.db.models.trade import TradeStatus
+from app.db.models.trade import Trade, TradeStatus
 from app.db.repositories.trade_repo import TradeRepo
 
 _DB_URL = os.environ.get(
@@ -161,7 +161,7 @@ async def _poll_for_status(
     expected: TradeStatus,
     timeout: float = 5.0,
     interval: float = 0.1,
-) -> "Trade | None":
+) -> Trade | None:
     """Poll the DB until trade reaches expected status or timeout expires."""
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
@@ -285,7 +285,7 @@ class TestFullEntryFlow:
                 filled_quantity=Decimal("0"),
                 avg_fill_price=Decimal("0"),
                 error_message="Insufficient buying power",
-                timestamp=datetime.now(timezone.utc),
+                timestamp=datetime.now(UTC),
             )
 
         broker.place_order = _reject
@@ -572,7 +572,6 @@ class TestStrategyToExecution:
         MovingAverageStrategy generates a BUY signal from golden-cross data
         and submit_order() creates an OPEN trade in the DB.
         """
-        from app.brokers.base import PriceBar
         from app.core.strategy_engine.base import MarketData
         from tests.unit.strategy.conftest import make_bars
 
@@ -582,7 +581,7 @@ class TestStrategyToExecution:
         bars = base + rally
 
         # Re-timestamp to be contiguous
-        end_date = datetime.now(timezone.utc).replace(
+        end_date = datetime.now(UTC).replace(
             hour=16, minute=0, second=0, microsecond=0
         )
         from app.brokers.base import PriceBar as PB

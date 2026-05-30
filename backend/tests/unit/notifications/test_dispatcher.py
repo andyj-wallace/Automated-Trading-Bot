@@ -14,7 +14,6 @@ import pytest
 
 from app.notifications.dispatcher import NotificationDispatcher
 
-
 # ---------------------------------------------------------------------------
 # Stub settings
 # ---------------------------------------------------------------------------
@@ -227,8 +226,6 @@ async def test_trade_closed_positive_pnl_sign() -> None:
     """notify_trade_closed subject should include + sign for wins."""
     d = NotificationDispatcher(_Settings())
     subjects: list[str] = []
-
-    original_send = d._send
 
     async def capture_send(subject, body):
         subjects.append(subject)

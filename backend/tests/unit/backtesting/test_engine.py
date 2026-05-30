@@ -7,22 +7,22 @@ end-of-data close, metrics computation, invalid input handling.
 
 from __future__ import annotations
 
-import sys
 import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
 from app.brokers.base import PriceBar
-from app.core.backtesting.engine import BacktestingEngine, BacktestMetrics
+from app.core.backtesting.engine import BacktestingEngine
 from app.core.risk.manager import RiskManager
 from app.core.strategy_engine.base import BaseStrategy, MarketData, RiskParams, Signal
 
-_TS = datetime(2025, 1, 1, tzinfo=timezone.utc)
+_TS = datetime(2025, 1, 1, tzinfo=UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -37,7 +37,7 @@ def _bar(
     low: float,
     close: float,
 ) -> PriceBar:
-    ts = datetime(2025, 1, 1, tzinfo=timezone.utc) + timedelta(days=i)
+    ts = datetime(2025, 1, 1, tzinfo=UTC) + timedelta(days=i)
     return PriceBar(
         timestamp=ts,
         open=Decimal(str(open_)),
@@ -229,7 +229,7 @@ async def test_metrics_sharpe_ratio_non_zero_when_trades_exist(risk_manager: Ris
 
     result = await engine.run(bars, symbol="SHARP", account_balance=Decimal("100000"))
     assert result.metrics is not None
-    assert not (result.metrics.sharpe_ratio != result.metrics.sharpe_ratio)  # not NaN
+    assert result.metrics.sharpe_ratio == result.metrics.sharpe_ratio  # not NaN
 
 
 @pytest.mark.asyncio

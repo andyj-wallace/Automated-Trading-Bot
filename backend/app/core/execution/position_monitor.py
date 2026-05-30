@@ -15,13 +15,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from decimal import Decimal
 
 from app.data.cache import RedisCache
-from app.db.models.trade import Trade, TradeStatus
+from app.db.models.trade import Trade
 from app.monitoring.logger import system_logger, trading_logger
 
 TRADE_EVENTS_CHANNEL = "trade_events"
@@ -87,10 +87,8 @@ class PositionMonitor:
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
         system_logger.info("PositionMonitor stopped")
 
     # ------------------------------------------------------------------
@@ -244,20 +242,16 @@ class PositionMonitor:
             stop_str = payload.get("stop_loss_price")
             tp_str = payload.get("take_profit_price")
             if trade_id_str and stop_str and tp_str:
-                try:
+                with suppress(Exception):
                     self._tracked[uuid.UUID(trade_id_str)] = _TrackedTrade(
                         trade_id=uuid.UUID(trade_id_str),
                         symbol=symbol,
                         stop_loss_price=Decimal(stop_str),
                         take_profit_price=Decimal(tp_str),
                     )
-                except Exception:
-                    pass
 
         elif event_type == "trade_closed":
             trade_id_str = payload.get("trade_id")
             if trade_id_str:
-                try:
+                with suppress(Exception):
                     self._tracked.pop(uuid.UUID(trade_id_str), None)
-                except Exception:
-                    pass
