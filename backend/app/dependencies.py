@@ -4,10 +4,16 @@ Shared FastAPI dependency providers.
 Each function here is injected via FastAPI's Depends() mechanism.
 """
 
+from __future__ import annotations
+
+from collections.abc import AsyncGenerator
 from functools import lru_cache
-from typing import AsyncGenerator
+from typing import TYPE_CHECKING
 
 from sqlalchemy.ext.asyncio import AsyncSession
+
+if TYPE_CHECKING:
+    from app.data.cache import RedisCache
 
 from app.brokers.base import BaseBroker
 from app.config import get_settings
@@ -21,13 +27,13 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 @lru_cache
-def _build_cache() -> "RedisCache":
+def _build_cache() -> RedisCache:
     from app.data.cache import RedisCache
     settings = get_settings()
     return RedisCache(settings.redis_url)
 
 
-async def get_cache() -> "RedisCache":
+async def get_cache() -> RedisCache:
     """
     Redis cache dependency.
 

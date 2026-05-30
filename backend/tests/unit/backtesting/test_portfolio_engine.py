@@ -10,12 +10,12 @@ Covers:
 
 from __future__ import annotations
 
-import sys
 import os
+import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -26,14 +26,13 @@ from app.core.backtesting.portfolio_engine import PortfolioBacktestEngine, Portf
 from app.core.risk.manager import RiskManager
 from app.core.strategy_engine.base import BaseStrategy, MarketData, RiskParams, Signal
 
-
 # ---------------------------------------------------------------------------
 # Shared helpers (duplicated from test_engine.py to keep tests self-contained)
 # ---------------------------------------------------------------------------
 
 
 def _bar(i: int, open_: float, high: float, low: float, close: float) -> PriceBar:
-    ts = datetime(2025, 1, 2, tzinfo=timezone.utc) + timedelta(days=i)
+    ts = datetime(2025, 1, 2, tzinfo=UTC) + timedelta(days=i)
     return PriceBar(
         timestamp=ts,
         open=Decimal(str(open_)),
@@ -330,7 +329,7 @@ async def test_single_slot_matches_single_strategy_engine() -> None:
         f"Trade counts differ: portfolio={len(per_strat.trades)}, single={len(ref_result.trades)}"
     )
 
-    for i, (pt, rt) in enumerate(zip(per_strat.trades, ref_result.trades)):
+    for i, (pt, rt) in enumerate(zip(per_strat.trades, ref_result.trades, strict=False)):
         assert pt.entry_price == rt.entry_price, f"Trade {i}: entry_price mismatch"
         assert pt.exit_reason == rt.exit_reason, f"Trade {i}: exit_reason mismatch"
         assert pt.pnl == rt.pnl, f"Trade {i}: pnl mismatch"

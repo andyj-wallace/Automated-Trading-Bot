@@ -8,21 +8,18 @@ Includes checkpoint verifications:
   - RiskMonitorConfig raises on invalid max_aggregate_risk_pct
 """
 
-import logging
 import uuid
 from decimal import Decimal
 
 import pytest
 
-from app.core.risk.calculator import RiskValidationError
 from app.core.risk.manager import (
     MAX_PORTFOLIO_RISK_HARD_LIMIT,
     RiskManager,
     RiskRejectionError,
     TradeRequest,
 )
-from app.core.risk.monitor import ExposureStatus, RiskMonitor, RiskMonitorConfig
-
+from app.core.risk.monitor import RiskMonitor, RiskMonitorConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -98,9 +95,8 @@ def test_missing_stop_loss_is_logged(manager: RiskManager) -> None:
     from unittest.mock import patch
 
     req = _request(stop_loss_price=None)
-    with patch("app.core.risk.manager.risk_logger") as mock_log:
-        with pytest.raises(RiskRejectionError):
-            manager.validate(req)
+    with patch("app.core.risk.manager.risk_logger") as mock_log, pytest.raises(RiskRejectionError):
+        manager.validate(req)
     mock_log.warning.assert_called_once()
     extra = mock_log.warning.call_args.kwargs["extra"]
     assert extra["reason"] == "MISSING_STOP_LOSS"
@@ -138,9 +134,8 @@ def test_rejection_logged_with_context(manager: RiskManager) -> None:
     from unittest.mock import patch
 
     req = _request(quantity=Decimal("201"))
-    with patch("app.core.risk.manager.risk_logger") as mock_log:
-        with pytest.raises(RiskRejectionError):
-            manager.validate(req)
+    with patch("app.core.risk.manager.risk_logger") as mock_log, pytest.raises(RiskRejectionError):
+        manager.validate(req)
     mock_log.warning.assert_called_once()
     extra = mock_log.warning.call_args.kwargs["extra"]
     assert extra["symbol"] == "AAPL"
@@ -190,9 +185,8 @@ def test_rr_rejection_logged(manager: RiskManager) -> None:
     from unittest.mock import patch
 
     req = _request(take_profit_price=Decimal("203"))
-    with patch("app.core.risk.manager.risk_logger") as mock_log:
-        with pytest.raises(RiskRejectionError):
-            manager.validate(req)
+    with patch("app.core.risk.manager.risk_logger") as mock_log, pytest.raises(RiskRejectionError):
+        manager.validate(req)
     mock_log.warning.assert_called_once()
     extra = mock_log.warning.call_args.kwargs["extra"]
     assert extra["reason"] == "INSUFFICIENT_REWARD"

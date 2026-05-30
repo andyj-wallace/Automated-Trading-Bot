@@ -10,7 +10,7 @@ need a real database connection.
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -22,12 +22,11 @@ from app.data.cache import RedisCache
 from app.dependencies import get_broker, get_cache, get_db
 from app.main import app
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-_NOW = datetime.now(timezone.utc)
+_NOW = datetime.now(UTC)
 
 
 def _make_symbol(ticker: str = "AAPL") -> MagicMock:
@@ -419,7 +418,7 @@ class TestSystemHealthEndpoint:
 class TestAnalyticsEndpoint:
     def test_analytics_returns_required_fields(self, client):
         """GET /metrics/analytics returns drawdown_series, rolling_sharpe_series, trade_heatmap."""
-        with patch("app.api.v1.metrics.select") as mock_select:
+        with patch("app.api.v1.metrics.select"):
             # Both queries return empty lists → zeroed analytics
             execute_result = MagicMock()
             execute_result.scalars.return_value.all.return_value = []

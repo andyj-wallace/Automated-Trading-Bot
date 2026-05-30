@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -27,10 +27,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.schemas import err, ok
 from app.brokers.base import PriceBar
-from app.core.backtesting.engine import BacktestMetrics, BacktestResult, BacktestingEngine
+from app.core.backtesting.engine import BacktestingEngine, BacktestMetrics, BacktestResult
 from app.core.backtesting.portfolio_engine import (
-    PortfolioBacktestResult,
     PortfolioBacktestEngine,
+    PortfolioBacktestResult,
     PortfolioSlot,
 )
 from app.core.risk.manager import RiskManager
@@ -56,7 +56,7 @@ class _Job:
         self.error: str | None = None
         self.result: BacktestResult | None = None
         self.portfolio_result: PortfolioBacktestResult | None = None
-        self.created_at: datetime = datetime.now(timezone.utc)
+        self.created_at: datetime = datetime.now(UTC)
         self.started_at: datetime | None = None
         self.finished_at: datetime | None = None
 
@@ -125,7 +125,7 @@ async def run_backtest(
         )
 
     # Check historical data exists
-    end = datetime.now(timezone.utc)
+    end = datetime.now(UTC)
     start = end - timedelta(days=365 * 5)
     ohlcv_repo = OHLCVRepo(db)
     db_bars = await ohlcv_repo.get_bars(ticker, start=start, end=end)
@@ -193,7 +193,7 @@ async def run_portfolio_backtest(
         )
 
     lookback_days = _RANGE_DAYS.get(body.range, _RANGE_DAYS["5y"])
-    end = datetime.now(timezone.utc)
+    end = datetime.now(UTC)
     start = end - timedelta(days=lookback_days)
     ohlcv_repo = OHLCVRepo(db)
 
@@ -319,7 +319,7 @@ async def get_backtest_result(job_id: uuid.UUID) -> JSONResponse:
 
 async def _run_job(job: _Job, bars) -> None:
     job.status = "running"
-    job.started_at = datetime.now(timezone.utc)
+    job.started_at = datetime.now(UTC)
 
     try:
         strategy = registry.build(
@@ -341,7 +341,7 @@ async def _run_job(job: _Job, bars) -> None:
         job.error = str(exc)
         job.status = "error"
     finally:
-        job.finished_at = datetime.now(timezone.utc)
+        job.finished_at = datetime.now(UTC)
 
 
 async def _run_portfolio_job(
@@ -351,7 +351,7 @@ async def _run_portfolio_job(
     account_balance_str: str,
 ) -> None:
     job.status = "running"
-    job.started_at = datetime.now(timezone.utc)
+    job.started_at = datetime.now(UTC)
 
     try:
         slots = [
@@ -362,7 +362,7 @@ async def _run_portfolio_job(
                 strategy_type=sr.strategy_type,
                 strategy_config=sr.config,
             )
-            for sr, bars in zip(slot_requests, bars_by_slot)
+            for sr, bars in zip(slot_requests, bars_by_slot, strict=False)
         ]
         engine = PortfolioBacktestEngine(RiskManager())
         result = await engine.run(slots, account_balance=Decimal(account_balance_str))
@@ -372,7 +372,7 @@ async def _run_portfolio_job(
         job.error = str(exc)
         job.status = "error"
     finally:
-        job.finished_at = datetime.now(timezone.utc)
+        job.finished_at = datetime.now(UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +409,7 @@ def _serialise_result(result: BacktestResult) -> dict:
     }
 
 
-def _serialise_metrics(m: "BacktestMetrics") -> dict:
+def _serialise_metrics(m: BacktestMetrics) -> dict:
     return {
         "trade_count": m.trade_count,
         "win_count": m.win_count,

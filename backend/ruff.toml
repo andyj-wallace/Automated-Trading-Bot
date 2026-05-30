@@ -1,10 +1,13 @@
-[tool.ruff]
 target-version = "py311"
 line-length = 100
 
-[tool.ruff.lint]
+[lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
-ignore = ["E501"]
+ignore = [
+  "E501",   # line too long (handled by formatter)
+  "B008",   # Depends() in default args — FastAPI idiom, not a bug
+  "UP042",  # StrEnum migration — safe but risky on SQLAlchemy enum columns
+]
 
-[tool.ruff.lint.isort]
+[lint.isort]
 known-first-party = ["app"]

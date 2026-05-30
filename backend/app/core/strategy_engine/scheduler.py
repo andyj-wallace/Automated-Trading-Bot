@@ -29,7 +29,8 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from datetime import datetime, timedelta, timezone
+from contextlib import suppress
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from app.brokers.base import BaseBroker, PriceBar
@@ -90,10 +91,8 @@ class StrategyScheduler:
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
         system_logger.info("StrategyScheduler stopped")
 
     # ------------------------------------------------------------------
@@ -222,7 +221,7 @@ class StrategyScheduler:
             symbol=symbol,
             current_price=current_price,
             bars=bars,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
         )
 
         signal: Signal = await strategy.generate_signal(market_data)
@@ -243,14 +242,13 @@ class StrategyScheduler:
 
         # Size position if strategy did not set quantity
         quantity = signal.quantity
-        if quantity is None or quantity <= 0:
-            if signal.entry_price and signal.stop_loss_price:
-                risk_params = RiskParams(
-                    account_balance=account_balance,
-                    entry_price=signal.entry_price,
-                    stop_loss_price=signal.stop_loss_price,
-                )
-                quantity = await strategy.calculate_position_size(risk_params)
+        if (quantity is None or quantity <= 0) and signal.entry_price and signal.stop_loss_price:
+            risk_params = RiskParams(
+                account_balance=account_balance,
+                entry_price=signal.entry_price,
+                stop_loss_price=signal.stop_loss_price,
+            )
+            quantity = await strategy.calculate_position_size(risk_params)
 
         if not quantity or quantity <= 0:
             trading_logger.info(
@@ -345,12 +343,10 @@ class StrategyScheduler:
         Falls back to broker.get_historical_data() if no DB rows.
         """
         try:
-            from datetime import timezone as tz
 
-            from app.db.models.ohlcv_bar import OHLCVBar
             from app.db.repositories.ohlcv_repo import OHLCVRepo
 
-            end = datetime.now(tz.utc)
+            end = datetime.now(UTC)
             start = end - timedelta(days=_HISTORY_LOOKBACK_DAYS)
 
             async with self._session_factory() as session:
