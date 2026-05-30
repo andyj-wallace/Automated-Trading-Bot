@@ -4,7 +4,8 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import TIMESTAMP, ForeignKey, Index, Numeric, String, func
-from sqlalchemy.dialects.postgresql import ENUM as PGENUM, UUID
+from sqlalchemy.dialects.postgresql import ENUM as PGENUM
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base

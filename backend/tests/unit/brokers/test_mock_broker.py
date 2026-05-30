@@ -14,7 +14,6 @@ import pytest
 from app.brokers.base import OrderRequest
 from app.brokers.mock.client import MockBroker
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

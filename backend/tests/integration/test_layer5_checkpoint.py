@@ -16,7 +16,7 @@ Then:
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -159,8 +159,8 @@ async def test_historical_fetcher_writes_hypertable(
 
     bars = await repo.get_bars(
         _TEST_SYMBOL,
-        start=datetime.now(timezone.utc) - timedelta(days=400),
-        end=datetime.now(timezone.utc),
+        start=datetime.now(UTC) - timedelta(days=400),
+        end=datetime.now(UTC),
     )
     assert len(bars) > 200, "Rows written but not readable back from DB"
     assert all(b.symbol == _TEST_SYMBOL for b in bars)

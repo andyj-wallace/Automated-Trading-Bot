@@ -10,17 +10,16 @@ Uses an in-memory fake cache and a mock DB session — no Redis or PostgreSQL ne
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
 from app.brokers.base import OrderResult
 from app.core.execution.trade_handler import TRADE_EVENTS_CHANNEL, TradeHandler
 from app.core.risk.manager import TradeRequest, ValidationResult
-from app.db.models.trade import ExitReason, TradeDirection, TradeStatus
-
+from app.db.models.trade import TradeDirection, TradeStatus
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -72,7 +71,7 @@ def _make_order_result(request: TradeRequest, **kwargs) -> OrderResult:
         "status": "FILLED",
         "filled_quantity": request.quantity,
         "avg_fill_price": Decimal("200.01"),
-        "timestamp": datetime.now(timezone.utc),
+        "timestamp": datetime.now(UTC),
     }
     defaults.update(kwargs)
     return OrderResult(**defaults)

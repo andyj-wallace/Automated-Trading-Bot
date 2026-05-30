@@ -11,7 +11,7 @@ Depends on: PortfolioRepo (3.9), TradeRepo (3.7), BaseBroker (4.1)
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -78,7 +78,7 @@ class MetricsCollector:
             )
 
         snapshot = PortfolioSnapshot(
-            time=datetime.now(timezone.utc),
+            time=datetime.now(UTC),
             total_equity=total_equity,
             cash_balance=cash_balance,
             open_position_value=gross_position_value,

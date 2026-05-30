@@ -29,7 +29,7 @@ Price-below case — bars = [10, 10, 10, 10, 10, 10, 9.0]:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -37,8 +37,7 @@ import pytest
 from app.core.strategy_engine.base import MarketData, RiskParams
 from app.core.strategy_engine.stock_trend import StockTrendStrategy, _sma
 
-from .conftest import make_bars_from_closes, make_market_data
-
+from .conftest import make_bars_from_closes
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -81,7 +80,7 @@ def _market(
         symbol=symbol,
         current_price=price,
         bars=bars,
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(UTC),
     )
 
 

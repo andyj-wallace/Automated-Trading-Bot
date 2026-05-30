@@ -34,7 +34,7 @@ Default BUY scenario (ma_period=5, pullback_pct="0.02", rr_ratio="2.0"):
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -49,27 +49,26 @@ from app.core.strategy_engine.intra_week_reversion import (
     _vwap,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixed dates — explicit weekday-only timestamps for reproducible week grouping
 # ---------------------------------------------------------------------------
 
 # ISO week 2 of 2024: Jan 8 (Mon) – Jan 12 (Fri)
 _WEEK_A = [
-    datetime(2024, 1, 8,  16, 0, tzinfo=timezone.utc),
-    datetime(2024, 1, 9,  16, 0, tzinfo=timezone.utc),
-    datetime(2024, 1, 10, 16, 0, tzinfo=timezone.utc),
-    datetime(2024, 1, 11, 16, 0, tzinfo=timezone.utc),
-    datetime(2024, 1, 12, 16, 0, tzinfo=timezone.utc),
+    datetime(2024, 1, 8,  16, 0, tzinfo=UTC),
+    datetime(2024, 1, 9,  16, 0, tzinfo=UTC),
+    datetime(2024, 1, 10, 16, 0, tzinfo=UTC),
+    datetime(2024, 1, 11, 16, 0, tzinfo=UTC),
+    datetime(2024, 1, 12, 16, 0, tzinfo=UTC),
 ]
 
 # ISO week 3 of 2024: Jan 15 (Mon) – Jan 19 (Fri)
 _WEEK_B = [
-    datetime(2024, 1, 15, 16, 0, tzinfo=timezone.utc),
-    datetime(2024, 1, 16, 16, 0, tzinfo=timezone.utc),
-    datetime(2024, 1, 17, 16, 0, tzinfo=timezone.utc),
-    datetime(2024, 1, 18, 16, 0, tzinfo=timezone.utc),
-    datetime(2024, 1, 19, 16, 0, tzinfo=timezone.utc),
+    datetime(2024, 1, 15, 16, 0, tzinfo=UTC),
+    datetime(2024, 1, 16, 16, 0, tzinfo=UTC),
+    datetime(2024, 1, 17, 16, 0, tzinfo=UTC),
+    datetime(2024, 1, 18, 16, 0, tzinfo=UTC),
+    datetime(2024, 1, 19, 16, 0, tzinfo=UTC),
 ]
 
 
@@ -146,7 +145,7 @@ def _market(
         symbol=symbol,
         current_price=price,
         bars=bars,
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(UTC),
         open_position=open_position,
     )
 
@@ -508,7 +507,7 @@ class TestWeekHelpers:
     def test_prior_week_excludes_older_bars(self):
         """Bars older than the prior week are excluded."""
         # Add a third (oldest) week before Week A
-        week_c_date = datetime(2024, 1, 1, 16, 0, tzinfo=timezone.utc)  # ISO week 1
+        week_c_date = datetime(2024, 1, 1, 16, 0, tzinfo=UTC)  # ISO week 1
         old_bar = _make_bar(80.0, week_c_date)
         prior = [_make_bar(99.0, _WEEK_A[i]) for i in range(5)]
         current = [_make_bar(105.0, _WEEK_B[i]) for i in range(3)]

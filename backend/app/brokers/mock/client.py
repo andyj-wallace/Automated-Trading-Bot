@@ -8,7 +8,7 @@ Used automatically when ENVIRONMENT=development (see app/dependencies.py).
 """
 
 import random
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from app.brokers.base import (
@@ -99,7 +99,7 @@ class MockBroker(BaseBroker):
         update = PriceUpdate(
             ticker=ticker,
             price=price,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
         )
         for cb in self._price_callbacks:
             await cb(update)
@@ -128,7 +128,7 @@ class MockBroker(BaseBroker):
             status="FILLED",
             filled_quantity=order.quantity,
             avg_fill_price=fill_price,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
         )
 
     async def cancel_order(self, broker_order_id: str) -> bool:
@@ -170,7 +170,7 @@ class MockBroker(BaseBroker):
         self._require_connected()
 
         rng = random.Random(hash(symbol) & 0xFFFFFFFF)
-        end = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         start = end - timedelta(days=365)
 
         bars: list[PriceBar] = []

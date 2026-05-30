@@ -43,7 +43,6 @@ from app.core.backtesting.engine import (
 from app.core.risk.manager import RiskManager, RiskRejectionError, TradeRequest
 from app.core.strategy_engine.base import BaseStrategy, MarketData, RiskParams
 
-
 # ---------------------------------------------------------------------------
 # Input / output types
 # ---------------------------------------------------------------------------

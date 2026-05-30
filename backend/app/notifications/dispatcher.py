@@ -47,7 +47,7 @@ import base64
 import smtplib
 import ssl
 from email.message import EmailMessage
-from urllib.parse import urlparse, unquote
+from urllib.parse import unquote, urlparse
 
 from app.monitoring.logger import system_logger
 
@@ -316,8 +316,8 @@ class NotificationDispatcher:
 
     def _send_sms_sync(self, body: str) -> None:
         """Blocking Twilio REST call — invoked from thread executor."""
-        import urllib.request
         import urllib.parse as _urlparse
+        import urllib.request
 
         parsed = urlparse(self._twilio_url)
         account_sid = unquote(parsed.username or "")

@@ -34,20 +34,18 @@ Test data (7 bars, ma_period=4, lookback=4, z_score_threshold="1.0"):
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
 
-from app.core.strategy_engine.base import MarketData, RiskParams
-from app.core.strategy_engine.composite import CompositeStrategy
-
 # Importing these triggers their self-registration in the global registry
 import app.core.strategy_engine.mean_reversion  # noqa: F401
 import app.core.strategy_engine.stock_trend  # noqa: F401
+from app.core.strategy_engine.base import MarketData, RiskParams
+from app.core.strategy_engine.composite import CompositeStrategy
 
 from .conftest import make_bars_from_closes
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -64,7 +62,7 @@ def _market(closes: list[float], symbol: str = "TEST") -> MarketData:
         symbol=symbol,
         current_price=bars[-1].close,
         bars=bars,
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(UTC),
     )
 
 

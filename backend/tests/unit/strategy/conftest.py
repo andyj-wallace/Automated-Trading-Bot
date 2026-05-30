@@ -16,14 +16,13 @@ Or using the low-level helpers directly:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 
 from app.brokers.base import PriceBar
 from app.core.strategy_engine.base import MarketData
-
 
 # ---------------------------------------------------------------------------
 # Low-level helpers — usable directly in test files
@@ -51,7 +50,7 @@ def make_bars(
         end_date:    Date of the last bar. Defaults to today UTC.
     """
     if end_date is None:
-        end_date = datetime.now(timezone.utc).replace(
+        end_date = datetime.now(UTC).replace(
             hour=16, minute=0, second=0, microsecond=0
         )
 
@@ -93,7 +92,7 @@ def make_bars_from_closes(
     e.g. engineering a golden-cross crossover at a specific bar index.
     """
     if end_date is None:
-        end_date = datetime.now(timezone.utc).replace(
+        end_date = datetime.now(UTC).replace(
             hour=16, minute=0, second=0, microsecond=0
         )
 
@@ -139,7 +138,7 @@ def make_market_data(
         symbol=symbol,
         current_price=current_price,
         bars=bars,
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(UTC),
     )
 
 
@@ -162,7 +161,7 @@ def _golden_cross_bars(fast: int = 50, slow: int = 200) -> list[PriceBar]:
     rally = make_bars(fast, start_price=base[-1].close, trend=0.6, volatility=0.2)
     # Stitch together, re-timestamp so dates are contiguous
     combined = base + rally
-    end_date = datetime.now(timezone.utc).replace(
+    end_date = datetime.now(UTC).replace(
         hour=16, minute=0, second=0, microsecond=0
     )
     for i, bar in enumerate(combined):
@@ -180,7 +179,7 @@ def _death_cross_bars(fast: int = 50, slow: int = 200) -> list[PriceBar]:
     # Sharp reversal — fast MA drops below slow MA
     decline = make_bars(fast, start_price=base[-1].close, trend=-0.6, volatility=0.2)
     combined = base + decline
-    end_date = datetime.now(timezone.utc).replace(
+    end_date = datetime.now(UTC).replace(
         hour=16, minute=0, second=0, microsecond=0
     )
     for i, bar in enumerate(combined):

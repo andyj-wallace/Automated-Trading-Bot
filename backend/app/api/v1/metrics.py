@@ -13,7 +13,7 @@ GET /api/v1/metrics/analytics    — Advanced analytics: drawdown time series,
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Query
@@ -46,7 +46,7 @@ async def get_performance(
     stmt = select(Trade).where(Trade.status == TradeStatus.CLOSED)
 
     if range in _RANGE_DAYS:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=_RANGE_DAYS[range])
+        cutoff = datetime.now(UTC) - timedelta(days=_RANGE_DAYS[range])
         stmt = stmt.where(Trade.closed_at >= cutoff)
 
     result = await db.execute(stmt.order_by(Trade.closed_at))
@@ -115,7 +115,7 @@ async def get_analytics(
     """
     cutoff: datetime | None = None
     if range in _ANALYTICS_RANGE_DAYS:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=_ANALYTICS_RANGE_DAYS[range])
+        cutoff = datetime.now(UTC) - timedelta(days=_ANALYTICS_RANGE_DAYS[range])
 
     # --- Portfolio snapshots for drawdown + rolling Sharpe ---
     snap_stmt = select(PortfolioSnapshot).order_by(PortfolioSnapshot.time)

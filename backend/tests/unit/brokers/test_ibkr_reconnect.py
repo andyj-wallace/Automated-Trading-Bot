@@ -11,15 +11,13 @@ Covers:
   - disconnect() mid-loop stops retrying without firing exhaustion alert
 """
 
-import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app.brokers.ibkr.client import IBKRClient
 from app.config import Settings
-
 
 # ---------------------------------------------------------------------------
 # Fixture helpers

@@ -20,8 +20,7 @@ import logging
 import logging.handlers
 import os
 import re
-import traceback
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -100,7 +99,7 @@ class JsonFormatter(logging.Formatter):
         if record.exc_info and not record.exc_text:
             record.exc_text = self.formatException(record.exc_info)
 
-        timestamp = datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
+        timestamp = datetime.fromtimestamp(record.created, tz=UTC).isoformat()
 
         context: dict[str, Any] = {}
         for key, value in record.__dict__.items():
