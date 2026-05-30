@@ -57,6 +57,7 @@ def make_bars(
 
     bars: list[PriceBar] = []
     price = float(start_price)
+    trend = float(trend)
 
     for i in range(count):
         ts = end_date - timedelta(days=(count - 1 - i))
