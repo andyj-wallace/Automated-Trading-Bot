@@ -55,6 +55,11 @@ jobs:
       - name: Lint with ruff
         run: ruff check .
 
+      - name: Run migrations
+        env:
+          DATABASE_URL: postgresql+asyncpg://trading:trading@localhost:5432/trading_bot_test
+        run: alembic upgrade head
+
       - name: Run tests
         env:
           ENVIRONMENT: development
