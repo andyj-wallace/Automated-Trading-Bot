@@ -27,14 +27,13 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from datetime import datetime
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 from app.brokers.base import PriceBar
 from app.core.risk.manager import RiskManager, RiskRejectionError, TradeRequest
 from app.core.strategy_engine.base import BaseStrategy, MarketData, RiskParams
-
 
 # ---------------------------------------------------------------------------
 # Domain models

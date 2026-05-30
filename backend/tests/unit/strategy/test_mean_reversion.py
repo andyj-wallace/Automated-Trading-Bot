@@ -31,7 +31,7 @@ Min-R:R take_profit case — bars = [5, 5, 5, 5, 5, 5, 3.8], stop_pct="0.15":
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -39,8 +39,7 @@ import pytest
 from app.core.strategy_engine.base import MarketData, RiskParams
 from app.core.strategy_engine.mean_reversion import MeanReversionStrategy, _mean, _pstdev
 
-from .conftest import make_bars_from_closes, make_market_data
-
+from .conftest import make_bars_from_closes
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -90,7 +89,7 @@ def _market(closes: list[float], symbol: str = "TEST", current_price: float | No
         symbol=symbol,
         current_price=price,
         bars=bars,
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(UTC),
     )
 
 

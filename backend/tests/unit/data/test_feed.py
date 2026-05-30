@@ -5,15 +5,12 @@ Uses MockBroker and an in-memory fake cache — no Redis or DB required.
 """
 
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
 from app.brokers.mock.client import MockBroker
-from app.brokers.base import PriceUpdate
-from app.data.feed import MarketDataFeed, WATCHLIST_PRICES_CHANNEL
-from datetime import datetime, timezone
-
+from app.data.feed import WATCHLIST_PRICES_CHANNEL, MarketDataFeed
 
 # ---------------------------------------------------------------------------
 # Fake cache for testing (no Redis needed)

@@ -12,8 +12,8 @@ from alembic import context
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import Base and all models so their tables are registered on Base.metadata.
-from app.db.base import Base  # noqa: E402
 import app.db.models  # noqa: E402, F401
+from app.db.base import Base  # noqa: E402
 
 # Alembic Config object — gives access to alembic.ini values.
 config = context.config

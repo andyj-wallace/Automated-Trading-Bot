@@ -30,13 +30,12 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Callable, Awaitable
 
 from app.brokers.base import BaseBroker, OrderRequest, OrderResult
 from app.core.risk.calculator import RiskCalculator
-from app.core.risk.manager import RiskManager, RiskRejectionError, TradeRequest, ValidationResult
+from app.core.risk.manager import RiskManager, TradeRequest, ValidationResult
 from app.monitoring.logger import audit_logger, error_logger, trading_logger
 
 _calculator = RiskCalculator()
@@ -154,7 +153,7 @@ class OrderManager:
                 filled_quantity=Decimal("0"),
                 avg_fill_price=Decimal("0"),
                 error_message=str(exc),
-                timestamp=datetime.now(timezone.utc),
+                timestamp=datetime.now(UTC),
             )
 
         # ------------------------------------------------------------------
@@ -330,7 +329,7 @@ class OrderManager:
                         "exit_price": str(fill_price),
                         "pnl": str(pnl),
                     },
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": datetime.now(UTC).isoformat(),
                 }
                 await self._cache.publish(TRADE_EVENTS_CHANNEL, json.dumps(event))
 

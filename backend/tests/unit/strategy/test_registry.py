@@ -2,13 +2,13 @@
 Unit tests for StrategyRegistry (Layer 11.1).
 """
 
+from datetime import UTC
 from decimal import Decimal
 
 import pytest
 
 from app.core.strategy_engine.base import BaseStrategy, MarketData, RiskParams, Signal
 from app.core.strategy_engine.registry import StrategyRegistry
-
 
 # ---------------------------------------------------------------------------
 # Minimal concrete strategy for testing
@@ -20,9 +20,9 @@ class AlwaysHoldStrategy(BaseStrategy):
         self.config = config
 
     async def generate_signal(self, market_data: MarketData) -> Signal:
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        return Signal(symbol=market_data.symbol, action="HOLD", timestamp=datetime.now(timezone.utc))
+        return Signal(symbol=market_data.symbol, action="HOLD", timestamp=datetime.now(UTC))
 
     async def calculate_position_size(self, risk_params: RiskParams) -> int:
         return 0
@@ -36,14 +36,14 @@ class AlwaysBuyStrategy(BaseStrategy):
         self.config = config
 
     async def generate_signal(self, market_data: MarketData) -> Signal:
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         return Signal(
             symbol=market_data.symbol,
             action="BUY",
             entry_price=market_data.current_price,
             stop_loss_price=market_data.current_price - Decimal("5"),
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
         )
 
     async def calculate_position_size(self, risk_params: RiskParams) -> int:

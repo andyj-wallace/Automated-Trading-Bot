@@ -9,7 +9,7 @@ See .claude/specs/ibkr-gateway.md for setup and daily startup procedure.
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -306,7 +306,7 @@ class IBKRClient(BaseBroker):
                 price=Decimal(str(price)),
                 bid=Decimal(str(ticker.bid)) if ticker.bid is not None else None,
                 ask=Decimal(str(ticker.ask)) if ticker.ask is not None else None,
-                timestamp=datetime.now(timezone.utc),
+                timestamp=datetime.now(UTC),
             )
             loop = asyncio.get_event_loop()
             for cb in self._price_callbacks:

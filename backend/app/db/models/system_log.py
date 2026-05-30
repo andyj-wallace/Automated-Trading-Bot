@@ -1,8 +1,9 @@
 import enum
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Text, String, func
-from sqlalchemy.dialects.postgresql import ENUM as PGENUM, JSONB
+from sqlalchemy import BigInteger, String, Text, func
+from sqlalchemy.dialects.postgresql import ENUM as PGENUM
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base

@@ -52,7 +52,7 @@ Registration:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 
 from app.brokers.base import PriceBar
@@ -214,7 +214,7 @@ class IntraWeekMeanReversionStrategy(BaseStrategy):
         return Signal(
             symbol=symbol,
             action="HOLD",
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
         )
 
 

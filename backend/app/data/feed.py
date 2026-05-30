@@ -13,8 +13,6 @@ Depends on: BaseBroker (Layer 4), RedisCache (Layer 5.1), SymbolRepo (Layer 3).
 
 from __future__ import annotations
 
-import json
-
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.brokers.base import BaseBroker, PriceUpdate

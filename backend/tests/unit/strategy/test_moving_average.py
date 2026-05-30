@@ -17,7 +17,6 @@ from app.core.strategy_engine.moving_average import MovingAverageStrategy
 
 from .conftest import make_bars_from_closes, make_market_data
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

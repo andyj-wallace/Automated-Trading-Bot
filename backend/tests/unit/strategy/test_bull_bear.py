@@ -37,7 +37,7 @@ ATR for atr_period=3 on the buy-cross bars (make_bars_from_closes):
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -45,8 +45,7 @@ import pytest
 from app.core.strategy_engine.base import MarketData, RiskParams
 from app.core.strategy_engine.bull_bear import BullBearStrategy, _atr, _sma
 
-from .conftest import make_bars_from_closes, make_market_data
-
+from .conftest import make_bars_from_closes
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -110,7 +109,7 @@ def _market(
         current_price=price,
         bars=target_bars,
         extra_bars={regime_symbol: spy_bars},
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(UTC),
     )
 
 
@@ -220,7 +219,7 @@ class TestRegimeDetection:
             current_price=target_bars[-1].close,
             bars=target_bars,
             extra_bars={},  # SPY absent
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
         )
         signal = await s.generate_signal(data)
         assert signal.action == "HOLD"

@@ -16,7 +16,7 @@ Depends on: OrderResult/ValidationResult (Layer 7.1), TradeRepo (Layer 3.7),
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -105,7 +105,7 @@ class TradeHandler:
                 "reward_to_risk_ratio": str(validation.reward_to_risk_ratio),
                 "status": trade.status.value,
             },
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
         }
         await self._cache.publish(TRADE_EVENTS_CHANNEL, json.dumps(event))
 

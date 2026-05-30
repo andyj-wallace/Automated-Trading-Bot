@@ -37,7 +37,7 @@ Registration:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.core.strategy_engine.base import BaseStrategy, MarketData, RiskParams, Signal
 
@@ -172,7 +172,7 @@ class CompositeStrategy(BaseStrategy):
         return Signal(
             symbol=symbol,
             action="HOLD",
-            timestamp=datetime.now(timezone.utc),
+            timestamp=datetime.now(UTC),
         )
 
 

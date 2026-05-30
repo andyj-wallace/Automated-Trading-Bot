@@ -6,13 +6,13 @@ All strategy and execution code depends on these types — never on broker-speci
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from decimal import Decimal
-from typing import Awaitable, Callable, Literal
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel
-
 
 # ---------------------------------------------------------------------------
 # Internal Pydantic models

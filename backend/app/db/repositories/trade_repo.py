@@ -11,7 +11,7 @@ backward movement allowed is to CANCELLED (from PENDING or SUBMITTED).
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -159,7 +159,7 @@ class TradeRepo:
         trade.pnl = pnl
         trade.exit_reason = exit_reason
         trade.status = TradeStatus.CLOSED
-        trade.closed_at = closed_at or datetime.now(timezone.utc)
+        trade.closed_at = closed_at or datetime.now(UTC)
 
         await self.session.flush()
         await self.session.refresh(trade)

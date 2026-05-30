@@ -16,13 +16,12 @@ Error response shape:
     }
 """
 
-from datetime import datetime, timezone
+import uuid
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
-import uuid
 
 from pydantic import BaseModel, ConfigDict
-
 
 # ---------------------------------------------------------------------------
 # Envelope helpers
@@ -30,7 +29,7 @@ from pydantic import BaseModel, ConfigDict
 
 def _meta(request_id: str | None = None) -> dict:
     return {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "request_id": request_id or str(uuid.uuid4()),
     }
 

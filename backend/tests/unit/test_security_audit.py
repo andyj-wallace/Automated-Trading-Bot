@@ -7,10 +7,7 @@ misconfigurations and passes cleanly when correctly configured.
 
 from __future__ import annotations
 
-import logging
-from unittest.mock import patch, call
-
-import pytest
+from unittest.mock import patch
 
 from app.main import _run_security_audit
 

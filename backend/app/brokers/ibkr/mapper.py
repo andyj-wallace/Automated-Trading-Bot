@@ -5,18 +5,15 @@ All conversions from IBKR-specific types live here, keeping IBKRClient
 free of mapping logic and making the translations easy to test in isolation.
 """
 
-from datetime import datetime, timezone
+import datetime as dt
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from uuid import UUID
 
-import datetime as dt
-
-from ib_async import AccountValue, BarData
+from ib_async import AccountValue, BarData, Trade
 from ib_async import Position as IBPosition
-from ib_async import Trade
 
 from app.brokers.base import AccountSummary, OrderResult, Position, PriceBar
-
 
 # ---------------------------------------------------------------------------
 # AccountSummary
@@ -123,19 +120,19 @@ def map_price_bar(bar: BarData, bar_size: str) -> PriceBar:
     """
     raw_date = bar.date
     if isinstance(raw_date, dt.datetime):
-        timestamp = raw_date if raw_date.tzinfo else raw_date.replace(tzinfo=dt.timezone.utc)
+        timestamp = raw_date if raw_date.tzinfo else raw_date.replace(tzinfo=dt.UTC)
     elif isinstance(raw_date, dt.date):
-        timestamp = dt.datetime(raw_date.year, raw_date.month, raw_date.day, tzinfo=dt.timezone.utc)
+        timestamp = dt.datetime(raw_date.year, raw_date.month, raw_date.day, tzinfo=dt.UTC)
     else:
         # Fallback: string in "YYYYMMDD" or "YYYYMMDD HH:MM:SS" format
         raw_str = str(raw_date).strip()
         if " " in raw_str:
             timestamp = dt.datetime.strptime(raw_str, "%Y%m%d %H:%M:%S").replace(
-                tzinfo=dt.timezone.utc
+                tzinfo=dt.UTC
             )
         else:
             parsed = dt.datetime.strptime(raw_str[:8], "%Y%m%d")
-            timestamp = parsed.replace(tzinfo=dt.timezone.utc)
+            timestamp = parsed.replace(tzinfo=dt.UTC)
 
     return PriceBar(
         timestamp=timestamp,
@@ -179,5 +176,5 @@ def map_order_result(trade_id: UUID, trade: Trade) -> OrderResult:
         filled_quantity=filled_qty,
         avg_fill_price=avg_price,
         error_message=error_message,
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(dt.UTC),
     )

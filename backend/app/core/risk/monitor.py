@@ -32,7 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -219,7 +219,7 @@ class RiskMonitor:
                     "warning_threshold_pct": str(self._config.warning_threshold),
                     "critical_threshold_pct": str(self._config.critical_threshold),
                 },
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
             }
             await self._cache.publish(_RISK_UPDATES_CHANNEL, json.dumps(event))
         except Exception as exc:

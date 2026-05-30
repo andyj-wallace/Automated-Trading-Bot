@@ -4,7 +4,7 @@ Repository for the watched_symbols table.
 All database access for WatchedSymbol goes through this class.
 """
 
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.watched_symbol import WatchedSymbol
