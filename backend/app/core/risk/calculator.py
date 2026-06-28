@@ -94,6 +94,45 @@ class RiskCalculator:
         )
 
     # ------------------------------------------------------------------
+    # Short selling — not implemented (see ENABLE_SHORT_SELLING in config.py)
+    # ------------------------------------------------------------------
+
+    def max_quantity_short(
+        self,
+        account_balance: Decimal,
+        entry_price: Decimal,
+        stop_loss_price: Decimal,
+    ) -> int:
+        """
+        Stub for short-side position sizing. Not implemented.
+
+        For a short, risk is realized when price rises, so the formula
+        inverts: risk_per_share = stop_loss_price − entry_price, with
+        stop_loss_price required to be ABOVE entry_price (the opposite of
+        the long-side validation in _validate_inputs). This module is pure
+        computation with no settings dependency, so the ENABLE_SHORT_SELLING
+        gate lives in RiskManager, not here — this stub exists purely so the
+        missing short-side formula is visible to anyone grepping this class.
+        """
+        raise NotImplementedError(
+            "Short-side position sizing is not implemented. Required: "
+            "risk_per_share = stop_loss_price - entry_price (stop above entry), "
+            "max_quantity = floor((account_balance * 0.01) / risk_per_share)."
+        )
+
+    def risk_amount_short(
+        self,
+        quantity: int | Decimal,
+        entry_price: Decimal,
+        stop_loss_price: Decimal,
+    ) -> Decimal:
+        """Stub for short-side risk amount. Not implemented — see max_quantity_short."""
+        raise NotImplementedError(
+            "Short-side risk amount is not implemented. Required: "
+            "quantity * (stop_loss_price - entry_price), stop above entry."
+        )
+
+    # ------------------------------------------------------------------
     # Internal validation
     # ------------------------------------------------------------------
 

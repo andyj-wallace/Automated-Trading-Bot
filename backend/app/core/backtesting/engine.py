@@ -16,11 +16,23 @@ Usage:
     engine = BacktestingEngine(strategy, risk_manager)
     result = await engine.run(bars, account_balance=Decimal("100000"))
 
+Friction modelling:
+  Fills apply `slippage_pct` against the raw bar price — unfavorably, in
+  both directions (entry fills slightly worse, exits fill slightly worse)
+  — plus a flat `commission_per_trade` charged on both the entry and exit
+  leg. Defaults (5bps slippage, $1/leg commission) are a deliberately
+  conservative approximation, not a real broker's fee schedule; the point
+  is that backtest results are no longer a frictionless best case. Set both
+  to 0 to restore the original frictionless behavior.
+
 Limitations (intentional scope):
   - One open trade at a time (no pyramiding)
   - Long-only (SELL signals are skipped — RiskManager rejects shorts)
-  - Market-order fills at next open, no slippage or commission modelling
   - No partial fills
+  - No walk-forward / train-test split — see backtesting/walk_forward.py for
+    an explicit out-of-sample harness built on top of this engine; calling
+    .run() directly on the same data used to tune strategy parameters can
+    still overfit if you don't use it.
 """
 
 from __future__ import annotations
@@ -28,7 +40,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from uuid import UUID, uuid4
 
 from app.brokers.base import PriceBar
@@ -56,6 +68,7 @@ class SimulatedTrade:
     exit_time: datetime | None = None
     exit_reason: str | None = None   # "STOP_LOSS" | "TAKE_PROFIT" | "END_OF_DATA"
     pnl: Decimal | None = None
+    commission_paid: Decimal = Decimal("0")  # entry + exit leg, already netted into pnl
 
 
 @dataclass
@@ -81,6 +94,7 @@ class BacktestMetrics:
     bars_tested: int
     signals_generated: int
     signals_rejected: int        # by RiskManager
+    total_commission_paid: Decimal = Decimal("0")
 
 
 @dataclass
@@ -105,13 +119,26 @@ class BacktestingEngine:
     Drives a strategy through historical bars and collects simulated trades.
 
     Args:
-        strategy:     A BaseStrategy instance configured for the backtest.
-        risk_manager: RiskManager instance (uses default 2:1 R:R, 1% rule).
+        strategy:             A BaseStrategy instance configured for the backtest.
+        risk_manager:         RiskManager instance (uses default 2:1 R:R, 1% rule).
+        slippage_pct:         Unfavorable price adjustment applied to every fill
+                              (entry and exit), as a fraction of price. Default
+                              "0.0005" (5bps). Set to "0" to disable.
+        commission_per_trade: Flat fee charged on the entry leg and again on the
+                              exit leg. Default "1.00". Set to "0" to disable.
     """
 
-    def __init__(self, strategy: BaseStrategy, risk_manager: RiskManager) -> None:
+    def __init__(
+        self,
+        strategy: BaseStrategy,
+        risk_manager: RiskManager,
+        slippage_pct: Decimal = Decimal("0.0005"),
+        commission_per_trade: Decimal = Decimal("1.00"),
+    ) -> None:
         self._strategy = strategy
         self._risk_manager = risk_manager
+        self._slippage_pct = slippage_pct
+        self._commission_per_trade = commission_per_trade
 
     async def run(
         self,
@@ -184,13 +211,17 @@ class BacktestingEngine:
                 if i + 1 >= len(bars):
                     continue
                 fill_bar = bars[i + 1]
-                fill_price = fill_bar.open
+                raw_fill_price = fill_bar.open
 
-                # Size the position
+                # Risk gates run on the intended (pre-slippage) price, matching
+                # live OrderManager: validation happens before the broker call,
+                # using the requested price — slippage is only realized after,
+                # in the actual fill. This keeps gate accept/reject decisions
+                # identical to the frictionless case; only PnL is affected.
                 risk_params = RiskParams(
                     account_balance=account_balance,
-                    entry_price=fill_price,
-                    stop_loss_price=signal.stop_loss_price or (fill_price * Decimal("0.97")),
+                    entry_price=raw_fill_price,
+                    stop_loss_price=signal.stop_loss_price or (raw_fill_price * Decimal("0.97")),
                 )
                 quantity = await self._strategy.calculate_position_size(risk_params)
                 if quantity <= 0:
@@ -198,7 +229,7 @@ class BacktestingEngine:
                     continue
 
                 # Run through risk gates
-                stop = signal.stop_loss_price or (fill_price * Decimal("0.97")).quantize(Decimal("0.01"))
+                stop = signal.stop_loss_price or (raw_fill_price * Decimal("0.97")).quantize(Decimal("0.01"))
                 tp_hint = signal.take_profit_price
 
                 request = TradeRequest(
@@ -206,7 +237,7 @@ class BacktestingEngine:
                     symbol=symbol,
                     direction="BUY",
                     quantity=Decimal(str(quantity)),
-                    entry_price=fill_price,
+                    entry_price=raw_fill_price,
                     stop_loss_price=stop,
                     account_balance=account_balance,
                     take_profit_price=tp_hint,
@@ -217,6 +248,8 @@ class BacktestingEngine:
                     signals_rejected += 1
                     continue
 
+                # Long entry: slippage works against us — we pay slightly more.
+                fill_price = self._apply_slippage(raw_fill_price, worse_direction=1)
                 risk_amt = Decimal(str(quantity)) * (fill_price - request.stop_loss_price)
                 open_trade = SimulatedTrade(
                     trade_id=request.trade_id,
@@ -229,15 +262,21 @@ class BacktestingEngine:
                     risk_amount=risk_amt,
                     entry_bar_index=i + 1,
                     entry_time=fill_bar.timestamp,
+                    commission_paid=self._commission_per_trade,  # entry leg
                 )
 
         # Close any trade still open at end of data
         if open_trade is not None:
             last_bar = bars[-1]
-            open_trade.exit_price = last_bar.close
+            # Long exit: slippage works against us — we receive slightly less.
+            open_trade.exit_price = self._apply_slippage(last_bar.close, worse_direction=-1)
             open_trade.exit_time = last_bar.timestamp
             open_trade.exit_reason = "END_OF_DATA"
-            open_trade.pnl = (last_bar.close - open_trade.entry_price) * open_trade.quantity
+            open_trade.commission_paid += self._commission_per_trade  # exit leg
+            open_trade.pnl = (
+                (open_trade.exit_price - open_trade.entry_price) * open_trade.quantity
+                - open_trade.commission_paid
+            )
             result.trades.append(open_trade)
 
         result.metrics = _compute_metrics(
@@ -262,19 +301,42 @@ class BacktestingEngine:
         Bar's low ≤ stop → stopped out at stop price.
         Bar's high ≥ take-profit → target hit at take-profit price.
         If both hit on the same bar, stop wins (conservative assumption).
+
+        Exit fills apply slippage (unfavorable) and the exit-leg commission,
+        same as a real close order would incur.
         """
         if bar.low <= trade.stop_loss_price:
-            trade.exit_price = trade.stop_loss_price
+            trade.exit_price = self._apply_slippage(trade.stop_loss_price, worse_direction=-1)
             trade.exit_reason = "STOP_LOSS"
         elif bar.high >= trade.take_profit_price:
-            trade.exit_price = trade.take_profit_price
+            trade.exit_price = self._apply_slippage(trade.take_profit_price, worse_direction=-1)
             trade.exit_reason = "TAKE_PROFIT"
 
         if trade.exit_price is not None:
             trade.exit_time = bar.timestamp
-            trade.pnl = (trade.exit_price - trade.entry_price) * trade.quantity
+            trade.commission_paid += self._commission_per_trade  # exit leg
+            trade.pnl = (
+                (trade.exit_price - trade.entry_price) * trade.quantity - trade.commission_paid
+            )
 
         return trade
+
+    def _apply_slippage(self, price: Decimal, *, worse_direction: int) -> Decimal:
+        """Adjust `price` unfavorably by this engine's `_slippage_pct`."""
+        return apply_slippage(price, worse_direction, self._slippage_pct)
+
+
+def apply_slippage(price: Decimal, worse_direction: int, slippage_pct: Decimal) -> Decimal:
+    """
+    Adjust `price` unfavorably by `slippage_pct`.
+
+    worse_direction=+1 for a buy (we pay more), -1 for a sell (we receive
+    less). Rounded to 2dp like a real stock price. Shared between
+    BacktestingEngine and PortfolioBacktestEngine so both apply identical
+    friction.
+    """
+    adjusted = price * (Decimal("1") + worse_direction * slippage_pct)
+    return adjusted.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +366,7 @@ def _compute_metrics(
     winners = [p for p in pnls if p > 0]
     losers = [p for p in pnls if p <= 0]
     total_return = sum(pnls, Decimal("0"))
+    total_commission = sum((t.commission_paid for t in trades), Decimal("0"))
 
     # Equity curve for drawdown and Sharpe
     equity = Decimal("0")
@@ -348,4 +411,5 @@ def _compute_metrics(
         bars_tested=bars_tested,
         signals_generated=signals_generated,
         signals_rejected=signals_rejected,
+        total_commission_paid=total_commission,
     )

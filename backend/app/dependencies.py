@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 from app.brokers.base import BaseBroker
 from app.config import get_settings
+from app.core.risk.circuit_breaker import CircuitBreaker
 from app.db.session import AsyncSessionFactory
 
 
@@ -69,4 +70,19 @@ async def get_broker() -> BaseBroker:
     the process lifetime (cached by _build_broker).
     """
     return _build_broker()
+
+
+@lru_cache
+def _build_circuit_breaker() -> CircuitBreaker:
+    """
+    Build and cache the single CircuitBreaker instance for the process
+    lifetime. Shared by RiskManager, OrderManager (wired in app/main.py's
+    lifespan), and the /risk/circuit-breaker admin endpoints below.
+    """
+    return CircuitBreaker()
+
+
+async def get_circuit_breaker() -> CircuitBreaker:
+    """Circuit breaker dependency. Same instance used by RiskManager/OrderManager."""
+    return _build_circuit_breaker()
 

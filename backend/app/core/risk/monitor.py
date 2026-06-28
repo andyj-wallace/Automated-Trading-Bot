@@ -6,6 +6,14 @@ Alert thresholds (relative to max_aggregate_risk_pct):
   WARNING  → aggregate exposure ≥ 75% of max  (default: 3.75%)
   CRITICAL → aggregate exposure ≥ 90% of max  (default: 4.50%)
 
+Alerts are edge-triggered: a WARNING/CRITICAL event is only logged at that
+severity and published to Redis when the alert level *changes* (e.g.
+NONE → WARNING, WARNING → CRITICAL, CRITICAL → WARNING), or when the same
+elevated level has persisted for at least `renotify_interval_seconds`
+(default 15 minutes). This avoids re-paging on every poll cycle while a
+known, unchanged elevated-risk condition persists. Every check is still
+logged at INFO level regardless, so the full history remains in system.log.
+
 When a WARNING or CRITICAL alert fires, a JSON event is published to the
 `risk_updates` Redis channel so the WebSocket endpoint can push it to the
 dashboard in real time:
@@ -32,7 +40,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -57,6 +65,10 @@ _CRITICAL_FRACTION = Decimal("0.90")
 # Default polling interval when running as a background loop.
 DEFAULT_POLL_INTERVAL_SECONDS = 30
 
+# How long an unchanged WARNING/CRITICAL level must persist before we
+# re-notify at that same severity (avoids paging every poll cycle).
+DEFAULT_RENOTIFY_INTERVAL_SECONDS = 900
+
 
 @dataclass
 class RiskMonitorConfig:
@@ -66,6 +78,7 @@ class RiskMonitorConfig:
     warning_fraction: Decimal = field(default=_WARNING_FRACTION)
     critical_fraction: Decimal = field(default=_CRITICAL_FRACTION)
     poll_interval_seconds: int = field(default=DEFAULT_POLL_INTERVAL_SECONDS)
+    renotify_interval_seconds: int = field(default=DEFAULT_RENOTIFY_INTERVAL_SECONDS)
 
     def __post_init__(self) -> None:
         if self.max_aggregate_risk_pct > MAX_PORTFOLIO_RISK_HARD_LIMIT:
@@ -116,6 +129,8 @@ class RiskMonitor:
         self._config = config or RiskMonitorConfig()
         self._cache = cache
         self._running = False
+        self._last_alert_level: str = "NONE"
+        self._last_notified_at: datetime | None = None
 
     # ------------------------------------------------------------------
     # Single exposure check
@@ -155,9 +170,30 @@ class RiskMonitor:
             alert_level=alert_level,
         )
 
-        self._log_status(status)
-        await self._publish_alert(status)
+        should_notify = self._should_notify(alert_level)
+        self._log_status(status, should_notify=should_notify)
+        if should_notify:
+            await self._publish_alert(status)
+
+        self._last_alert_level = alert_level
+        if should_notify:
+            self._last_notified_at = datetime.now(UTC)
+
         return status
+
+    def _should_notify(self, alert_level: str) -> bool:
+        """
+        Edge-triggered notification: notify on a level change, or once the
+        same elevated level has persisted past the re-notify cooldown.
+        """
+        if alert_level == "NONE":
+            return alert_level != self._last_alert_level
+        if alert_level != self._last_alert_level:
+            return True
+        if self._last_notified_at is None:
+            return True
+        elapsed = datetime.now(UTC) - self._last_notified_at
+        return elapsed >= timedelta(seconds=self._config.renotify_interval_seconds)
 
     # ------------------------------------------------------------------
     # Background polling loop
@@ -235,7 +271,14 @@ class RiskMonitor:
             return "WARNING"
         return "NONE"
 
-    def _log_status(self, status: ExposureStatus) -> None:
+    def _log_status(self, status: ExposureStatus, *, should_notify: bool) -> None:
+        """
+        Log the exposure check. Every check is recorded at INFO level so the
+        full history is always in system.log; WARNING/CRITICAL severity is
+        only used when `should_notify` is True (level changed, or the same
+        elevated level has persisted past the re-notify cooldown) so an
+        unchanged elevated reading doesn't re-page on every poll cycle.
+        """
         extra = {
             "aggregate_risk_amount": str(status.aggregate_risk_amount),
             "aggregate_risk_pct": f"{status.aggregate_risk_pct:.4%}",
@@ -243,20 +286,21 @@ class RiskMonitor:
             "account_balance": str(status.account_balance),
             "warning_threshold": f"{self._config.warning_threshold:.4%}",
             "critical_threshold": f"{self._config.critical_threshold:.4%}",
+            "repeat": not should_notify,
         }
 
-        if status.alert_level == "CRITICAL":
+        if status.alert_level == "CRITICAL" and should_notify:
             risk_logger.critical(
                 "RISK MONITOR: aggregate exposure at CRITICAL level",
                 extra=extra,
             )
-        elif status.alert_level == "WARNING":
+        elif status.alert_level == "WARNING" and should_notify:
             risk_logger.warning(
                 "RISK MONITOR: aggregate exposure at WARNING level",
                 extra=extra,
             )
         else:
             risk_logger.info(
-                "RISK MONITOR: exposure check — within limits",
+                "RISK MONITOR: exposure check",
                 extra=extra,
             )

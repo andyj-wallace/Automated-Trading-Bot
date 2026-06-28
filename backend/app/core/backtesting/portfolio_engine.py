@@ -39,6 +39,7 @@ from app.core.backtesting.engine import (
     BacktestResult,
     SimulatedTrade,
     _compute_metrics,
+    apply_slippage,
 )
 from app.core.risk.manager import RiskManager, RiskRejectionError, TradeRequest
 from app.core.strategy_engine.base import BaseStrategy, MarketData, RiskParams
@@ -87,12 +88,23 @@ class PortfolioBacktestEngine:
     Drives multiple strategy/symbol pairs through historical bars simultaneously.
 
     Args:
-        risk_manager: Shared RiskManager instance. The same aggregate risk cap
-                      that governs live trading applies here.
+        risk_manager:         Shared RiskManager instance. The same aggregate
+                              risk cap that governs live trading applies here.
+        slippage_pct:         Unfavorable price adjustment applied to every fill,
+                              same semantics as BacktestingEngine. Default "0.0005".
+        commission_per_trade: Flat fee on entry and exit legs, same semantics
+                              as BacktestingEngine. Default "1.00".
     """
 
-    def __init__(self, risk_manager: RiskManager) -> None:
+    def __init__(
+        self,
+        risk_manager: RiskManager,
+        slippage_pct: Decimal = Decimal("0.0005"),
+        commission_per_trade: Decimal = Decimal("1.00"),
+    ) -> None:
         self._risk = risk_manager
+        self._slippage_pct = slippage_pct
+        self._commission_per_trade = commission_per_trade
 
     async def run(
         self,
@@ -128,7 +140,9 @@ class PortfolioBacktestEngine:
                     continue
 
                 bar = slot.bars[bar_idx]
-                trade = _apply_exit(open_trades[si], bar)  # type: ignore[arg-type]
+                trade = _apply_exit(
+                    open_trades[si], bar, self._slippage_pct, self._commission_per_trade  # type: ignore[arg-type]
+                )
 
                 if trade.exit_price is not None:
                     completed[si].append(trade)
@@ -169,15 +183,18 @@ class PortfolioBacktestEngine:
                 if bar_idx + 1 >= len(slot.bars):
                     continue
                 fill_bar = slot.bars[bar_idx + 1]
-                fill_price = fill_bar.open
+                raw_fill_price = fill_bar.open
 
+                # Risk gates run on the intended (pre-slippage) price, matching
+                # live OrderManager — see BacktestingEngine.run() for the same
+                # reasoning. Only the recorded fill/PnL reflects slippage.
                 stop = (
                     signal.stop_loss_price
-                    or (fill_price * Decimal("0.97")).quantize(Decimal("0.01"))
+                    or (raw_fill_price * Decimal("0.97")).quantize(Decimal("0.01"))
                 )
                 risk_params = RiskParams(
                     account_balance=account_balance,
-                    entry_price=fill_price,
+                    entry_price=raw_fill_price,
                     stop_loss_price=stop,
                 )
                 quantity = await slot.strategy.calculate_position_size(risk_params)
@@ -190,7 +207,7 @@ class PortfolioBacktestEngine:
                     symbol=slot.symbol,
                     direction="BUY",
                     quantity=Decimal(str(quantity)),
-                    entry_price=fill_price,
+                    entry_price=raw_fill_price,
                     stop_loss_price=stop,
                     account_balance=account_balance,
                     take_profit_price=signal.take_profit_price,
@@ -203,6 +220,8 @@ class PortfolioBacktestEngine:
                     sig_rejected[si] += 1
                     continue
 
+                # Long entry: slippage works against us — we pay slightly more.
+                fill_price = apply_slippage(raw_fill_price, 1, self._slippage_pct)
                 risk_amt = Decimal(str(quantity)) * (fill_price - stop)
                 open_trades[si] = SimulatedTrade(
                     trade_id=request.trade_id,
@@ -215,6 +234,7 @@ class PortfolioBacktestEngine:
                     risk_amount=risk_amt,
                     entry_bar_index=bar_idx + 1,
                     entry_time=fill_bar.timestamp,
+                    commission_paid=self._commission_per_trade,  # entry leg
                 )
                 # Update aggregate so subsequent slots in this bar see the new exposure
                 agg_risk += risk_amt
@@ -228,10 +248,14 @@ class PortfolioBacktestEngine:
             last_bar = slot.bars[-1]
             trade = open_trades[si]
             assert trade is not None
-            trade.exit_price = last_bar.close
+            # Long exit: slippage works against us — we receive slightly less.
+            trade.exit_price = apply_slippage(last_bar.close, -1, self._slippage_pct)
             trade.exit_time = last_bar.timestamp
             trade.exit_reason = "END_OF_DATA"
-            trade.pnl = (last_bar.close - trade.entry_price) * trade.quantity
+            trade.commission_paid += self._commission_per_trade  # exit leg
+            trade.pnl = (
+                (trade.exit_price - trade.entry_price) * trade.quantity - trade.commission_paid
+            )
             completed[si].append(trade)
             cumulative_pnl += trade.pnl
             equity_events.append((last_bar.timestamp, cumulative_pnl))
@@ -290,22 +314,31 @@ class PortfolioBacktestEngine:
 # ---------------------------------------------------------------------------
 
 
-def _apply_exit(trade: SimulatedTrade, bar: PriceBar) -> SimulatedTrade:
+def _apply_exit(
+    trade: SimulatedTrade,
+    bar: PriceBar,
+    slippage_pct: Decimal,
+    commission_per_trade: Decimal,
+) -> SimulatedTrade:
     """
     Check bar for stop-loss or take-profit hit.
 
     Conservative tie-break: if both levels are breached on the same bar,
-    the stop wins. This matches BacktestingEngine._check_exit behaviour.
+    the stop wins. This matches BacktestingEngine._check_exit behaviour,
+    including identical slippage/commission friction on the exit fill.
     """
     if bar.low <= trade.stop_loss_price:
-        trade.exit_price = trade.stop_loss_price
+        trade.exit_price = apply_slippage(trade.stop_loss_price, -1, slippage_pct)
         trade.exit_reason = "STOP_LOSS"
     elif bar.high >= trade.take_profit_price:
-        trade.exit_price = trade.take_profit_price
+        trade.exit_price = apply_slippage(trade.take_profit_price, -1, slippage_pct)
         trade.exit_reason = "TAKE_PROFIT"
 
     if trade.exit_price is not None:
         trade.exit_time = bar.timestamp
-        trade.pnl = (trade.exit_price - trade.entry_price) * trade.quantity
+        trade.commission_paid += commission_per_trade  # exit leg
+        trade.pnl = (
+            (trade.exit_price - trade.entry_price) * trade.quantity - trade.commission_paid
+        )
 
     return trade

@@ -47,7 +47,10 @@ async def broker() -> MockBroker:
 
 @pytest.fixture
 def manager(broker: MockBroker) -> OrderManager:
-    return OrderManager(broker, RiskManager())
+    # order_retry_attempts=1: existing tests assert on a single place_order
+    # call / a single failure outcome and aren't testing retry behavior —
+    # see TestOrderRetry below for dedicated retry tests.
+    return OrderManager(broker, RiskManager(), order_retry_attempts=1)
 
 
 # ---------------------------------------------------------------------------
@@ -299,3 +302,101 @@ async def test_broker_error_still_writes_post_confirmation_as_error(
         c for c in mock_audit.info.call_args_list if c.args[0] == "POST_CONFIRMATION"
     )
     assert post_call.kwargs["extra"]["status"] == "ERROR"
+
+
+# ---------------------------------------------------------------------------
+# Order retry on transient broker error
+# ---------------------------------------------------------------------------
+
+
+class TestOrderRetry:
+    """
+    place_order() retries on exceptions raised by the broker (transient
+    network/timeout) for both submit_order's entry leg and close_position's
+    close leg. backoff is set to 0 so these tests run instantly.
+    """
+
+    @pytest.fixture
+    def retrying_manager(self, broker: MockBroker) -> OrderManager:
+        return OrderManager(
+            broker,
+            RiskManager(),
+            order_retry_attempts=3,
+            order_retry_backoff_seconds=0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_submit_order_succeeds_after_transient_failures(
+        self, broker: MockBroker, retrying_manager: OrderManager
+    ) -> None:
+        calls = {"n": 0}
+        original = broker.place_order
+
+        async def flaky(order_request):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise ConnectionError("transient")
+            return await original(order_request)
+
+        broker.place_order = flaky
+        req = _request()
+
+        validation, result = await retrying_manager.submit_order(req)
+
+        assert calls["n"] == 3
+        assert result.status == "FILLED"
+        assert validation.trade_id == req.trade_id
+
+    @pytest.mark.asyncio
+    async def test_submit_order_raises_after_exhausting_retries(
+        self, broker: MockBroker, retrying_manager: OrderManager
+    ) -> None:
+        calls = {"n": 0}
+
+        async def always_fails(order_request):
+            calls["n"] += 1
+            raise ConnectionError("broker down")
+
+        broker.place_order = always_fails
+        req = _request()
+
+        with pytest.raises(ConnectionError):
+            await retrying_manager.submit_order(req)
+
+        assert calls["n"] == 3  # exhausted all attempts, no more
+
+    @pytest.mark.asyncio
+    async def test_no_retry_when_broker_returns_rejected_cleanly(
+        self, broker: MockBroker, retrying_manager: OrderManager
+    ) -> None:
+        """A clean REJECTED OrderResult is a decision, not a transient failure."""
+        from datetime import UTC, datetime
+
+        from app.brokers.base import OrderResult
+
+        calls = {"n": 0}
+
+        async def rejects(order_request):
+            calls["n"] += 1
+            return OrderResult(
+                trade_id=order_request.trade_id,
+                broker_order_id="",
+                status="REJECTED",
+                filled_quantity=Decimal("0"),
+                avg_fill_price=Decimal("0"),
+                error_message="insufficient buying power",
+                timestamp=datetime.now(UTC),
+            )
+
+        broker.place_order = rejects
+        req = _request()
+
+        _, result = await retrying_manager.submit_order(req)
+
+        assert calls["n"] == 1
+        assert result.status == "REJECTED"
+
+    # close_position() requires a real DB session_factory (it loads/updates
+    # the trade row directly), so its retry behavior is covered by the
+    # integration suite instead: see TestOrderRetry in
+    # tests/integration/test_layer17_e2e.py.

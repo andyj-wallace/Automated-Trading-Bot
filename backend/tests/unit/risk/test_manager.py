@@ -103,6 +103,135 @@ def test_missing_stop_loss_is_logged(manager: RiskManager) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Gate 0: circuit breaker (daily halt / per-strategy kill switch)
+# ---------------------------------------------------------------------------
+
+
+def test_no_circuit_breaker_configured_skips_gate_0() -> None:
+    """Default RiskManager() has no circuit breaker — Gate 0 is a no-op."""
+    manager = RiskManager()
+    result = manager.validate(_request())
+    assert result.trade_id is not None
+
+
+def test_daily_halt_rejects_new_trades() -> None:
+    from app.core.risk.circuit_breaker import CircuitBreaker
+
+    cb = CircuitBreaker(daily_loss_limit_pct=Decimal("0.01"))
+    cb.record_closed_trade(Decimal("-2000"), Decimal("100000"))  # 2% loss > 1% limit
+    assert cb.is_halted() is True
+
+    manager = RiskManager(circuit_breaker=cb)
+    with pytest.raises(RiskRejectionError) as exc_info:
+        manager.validate(_request())
+    assert "DAILY_CIRCUIT_BREAKER_TRIPPED" in str(exc_info.value)
+
+
+def test_killed_strategy_rejected_even_with_healthy_daily_pnl() -> None:
+    from app.core.risk.circuit_breaker import CircuitBreaker
+
+    cb = CircuitBreaker()
+    sid = uuid.uuid4()
+    cb.kill_strategy(sid)
+
+    manager = RiskManager(circuit_breaker=cb)
+    with pytest.raises(RiskRejectionError) as exc_info:
+        manager.validate(_request(strategy_id=sid))
+    assert "STRATEGY_KILL_SWITCH_ACTIVE" in str(exc_info.value)
+
+
+def test_other_strategies_unaffected_by_one_killed_strategy() -> None:
+    from app.core.risk.circuit_breaker import CircuitBreaker
+
+    cb = CircuitBreaker()
+    killed_sid = uuid.uuid4()
+    other_sid = uuid.uuid4()
+    cb.kill_strategy(killed_sid)
+
+    manager = RiskManager(circuit_breaker=cb)
+    result = manager.validate(_request(strategy_id=other_sid))
+    assert result.trade_id is not None
+
+
+def test_request_with_no_strategy_id_unaffected_by_kill_switch() -> None:
+    from app.core.risk.circuit_breaker import CircuitBreaker
+
+    cb = CircuitBreaker()
+    cb.kill_strategy(uuid.uuid4())
+
+    manager = RiskManager(circuit_breaker=cb)
+    result = manager.validate(_request(strategy_id=None))
+    assert result.trade_id is not None
+
+
+def test_daily_halt_takes_priority_over_strategy_kill_check() -> None:
+    """Both gates use _reject which raises immediately — daily halt is
+    checked first, so its reason wins when both conditions are true."""
+    from app.core.risk.circuit_breaker import CircuitBreaker
+
+    cb = CircuitBreaker(daily_loss_limit_pct=Decimal("0.01"))
+    sid = uuid.uuid4()
+    cb.kill_strategy(sid)
+    cb.record_closed_trade(Decimal("-2000"), Decimal("100000"))
+
+    manager = RiskManager(circuit_breaker=cb)
+    with pytest.raises(RiskRejectionError) as exc_info:
+        manager.validate(_request(strategy_id=sid))
+    assert "DAILY_CIRCUIT_BREAKER_TRIPPED" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Gate 0b: short selling (direction == SELL) — not implemented
+# ---------------------------------------------------------------------------
+
+
+def test_sell_request_rejected_when_short_selling_disabled(manager: RiskManager) -> None:
+    """Default ENABLE_SHORT_SELLING=false → clean, specific rejection."""
+    req = _request(direction="SELL", stop_loss_price=Decimal("210"))  # stop above entry
+    with pytest.raises(RiskRejectionError) as exc_info:
+        manager.validate(req)
+    assert "SHORT_SELLING_DISABLED" in str(exc_info.value)
+
+
+def test_sell_request_rejection_does_not_fall_through_to_invalid_stop_loss(
+    manager: RiskManager,
+) -> None:
+    """A correctly-placed short stop must not be misreported as INVALID_STOP_LOSS."""
+    req = _request(direction="SELL", stop_loss_price=Decimal("210"))
+    with pytest.raises(RiskRejectionError) as exc_info:
+        manager.validate(req)
+    assert "INVALID_STOP_LOSS" not in str(exc_info.value)
+
+
+def test_sell_request_raises_not_implemented_when_short_selling_enabled(
+    manager: RiskManager, monkeypatch
+) -> None:
+    """Flipping ENABLE_SHORT_SELLING=true doesn't enable real shorting — it
+    routes into an explicit NotImplementedError instead of mispricing risk."""
+    import app.config as config_module
+    from app.config import Settings
+
+    enabled_settings = Settings(
+        secret_key="test", database_url="sqlite:///test", enable_short_selling=True
+    )
+    monkeypatch.setattr(config_module, "get_settings", lambda: enabled_settings)
+
+    req = _request(direction="SELL", stop_loss_price=Decimal("210"))
+    with pytest.raises(NotImplementedError):
+        manager.validate(req)
+
+
+def test_buy_request_with_bad_stop_unaffected_by_short_gate(manager: RiskManager) -> None:
+    """Gate 0 only applies to direction=='SELL' — a BUY with an inverted
+    (degenerate) stop still falls through to Gate 2's INVALID_STOP_LOSS,
+    unchanged from before the short-selling gate was added."""
+    req = _request(direction="BUY", stop_loss_price=Decimal("210"))
+    with pytest.raises(RiskRejectionError) as exc_info:
+        manager.validate(req)
+    assert "INVALID_STOP_LOSS" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
 # Gate 2: 1% rule rejection cases
 # ---------------------------------------------------------------------------
 
@@ -374,3 +503,50 @@ def test_risk_monitor_config_default_is_valid() -> None:
     """Default 5% config is valid and well below the hard limit."""
     config = RiskMonitorConfig()
     assert config.max_aggregate_risk_pct == Decimal("0.05")
+
+
+# ---------------------------------------------------------------------------
+# RiskMonitor — alert hysteresis (edge-triggered notify, no per-cycle spam)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_monitor_does_not_renotify_on_unchanged_warning(monkeypatch) -> None:
+    """Same WARNING level on consecutive checks should not re-notify immediately."""
+    monitor = RiskMonitor()
+    _patch_repo(monkeypatch, [FakeTrade(Decimal("3750"))])  # WARNING
+
+    await monitor.check_exposure(FakeSession(), Decimal("100000"))
+    assert monitor._should_notify("WARNING") is False
+
+
+@pytest.mark.asyncio
+async def test_monitor_renotifies_on_escalation(monkeypatch) -> None:
+    """WARNING -> CRITICAL should always notify, even immediately."""
+    monitor = RiskMonitor()
+    _patch_repo(monkeypatch, [FakeTrade(Decimal("3750"))])  # WARNING
+    await monitor.check_exposure(FakeSession(), Decimal("100000"))
+
+    assert monitor._should_notify("CRITICAL") is True
+
+
+@pytest.mark.asyncio
+async def test_monitor_renotifies_after_cooldown_elapses(monkeypatch) -> None:
+    """An unchanged elevated level re-notifies once the cooldown has passed."""
+    config = RiskMonitorConfig(renotify_interval_seconds=0)
+    monitor = RiskMonitor(config=config)
+    _patch_repo(monkeypatch, [FakeTrade(Decimal("3750"))])  # WARNING
+
+    await monitor.check_exposure(FakeSession(), Decimal("100000"))
+    # cooldown is 0s, so the very next check should notify again
+    assert monitor._should_notify("WARNING") is True
+
+
+@pytest.mark.asyncio
+async def test_monitor_notifies_on_recovery_to_none(monkeypatch) -> None:
+    """Going from WARNING back to NONE is itself a level change worth recording."""
+    monitor = RiskMonitor()
+    _patch_repo(monkeypatch, [FakeTrade(Decimal("3750"))])  # WARNING
+    await monitor.check_exposure(FakeSession(), Decimal("100000"))
+
+    assert monitor._should_notify("NONE") is True

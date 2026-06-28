@@ -46,6 +46,7 @@ from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -112,6 +113,23 @@ async def session(engine) -> AsyncSession:
         await sess.rollback()
 
 
+@pytest_asyncio.fixture(autouse=True)
+async def _clean_trades_table(engine):
+    """
+    Truncate trades before every test in this file.
+
+    OrderManager now computes aggregate portfolio risk from real PENDING/
+    SUBMITTED/OPEN rows in the DB (the Gap 12 fix — see order_manager.py).
+    That makes the trades table genuinely shared state across tests: a row
+    left behind by an earlier test would otherwise skew the portfolio-risk
+    gate for every test that runs after it, since OrderManager has no way to
+    tell "my test's trades" apart from any other open exposure.
+    """
+    async with engine.begin() as conn:
+        await conn.execute(text("TRUNCATE TABLE trades RESTART IDENTITY CASCADE"))
+    yield
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -146,12 +164,22 @@ def _valid_request(**kwargs) -> TradeRequest:
     return TradeRequest(**defaults)
 
 
-def _make_order_manager(broker, session_factory, cache=None) -> OrderManager:
+def _make_order_manager(
+    broker,
+    session_factory,
+    cache=None,
+    order_retry_attempts: int = 1,
+    order_retry_backoff_seconds: float = 0,
+    circuit_breaker=None,
+) -> OrderManager:
     return OrderManager(
         broker=broker,
-        risk_manager=RiskManager(),
+        risk_manager=RiskManager(circuit_breaker=circuit_breaker),
         session_factory=session_factory,
         cache=cache,
+        order_retry_attempts=order_retry_attempts,
+        order_retry_backoff_seconds=order_retry_backoff_seconds,
+        circuit_breaker=circuit_breaker,
     )
 
 
@@ -411,6 +439,170 @@ class TestClosePositionFlow:
 
 
 # ---------------------------------------------------------------------------
+# Group 2A — Circuit breaker integration (close_position reports pnl; the
+# resulting halt/kill is enforced on the next submit_order via RiskManager)
+# ---------------------------------------------------------------------------
+
+
+class TestCircuitBreakerIntegration:
+    @pytest.mark.asyncio
+    async def test_close_position_reports_pnl_to_circuit_breaker(
+        self, broker, session_factory
+    ) -> None:
+        from app.core.risk.circuit_breaker import CircuitBreaker
+
+        cb = CircuitBreaker()
+        om = _make_order_manager(broker, session_factory, circuit_breaker=cb)
+        req = await _open_trade(om, entry_price=Decimal("200"), quantity=Decimal("10"))
+
+        await om.close_position(req.trade_id, "TAKE_PROFIT")
+
+        # MockBroker fills MKT close orders at 100.00 → pnl = (100-200)×10 = -1000
+        assert cb.daily_realized_pnl == Decimal("-1000")
+
+    @pytest.mark.asyncio
+    async def test_daily_halt_after_close_blocks_next_submit_order(
+        self, broker, session_factory
+    ) -> None:
+        """A losing close that trips the daily halt must block the very next
+        submit_order — both share the same RiskManager + CircuitBreaker."""
+        from app.core.risk.circuit_breaker import CircuitBreaker
+
+        cb = CircuitBreaker(daily_loss_limit_pct=Decimal("0.005"))  # 0.5% — trips on -1000/100000
+        om = _make_order_manager(broker, session_factory, circuit_breaker=cb)
+        req = await _open_trade(om, entry_price=Decimal("200"), quantity=Decimal("10"))
+
+        await om.close_position(req.trade_id, "TAKE_PROFIT")
+        assert cb.is_halted() is True
+
+        with pytest.raises(RiskRejectionError) as exc_info:
+            await om.submit_order(_valid_request())
+        assert "DAILY_CIRCUIT_BREAKER_TRIPPED" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_strategy_kill_switch_blocks_only_that_strategy(
+        self, broker, session_factory
+    ) -> None:
+        from app.core.risk.circuit_breaker import CircuitBreaker
+        from app.db.repositories.strategy_repo import StrategyRepo
+
+        cb = CircuitBreaker()
+
+        # other_sid's trade is expected to reach a real PENDING DB row, which
+        # is FK-constrained against trading_strategies — seed a real row.
+        # killed_sid is rejected before any DB write, so it needs no row.
+        async with session_factory() as session:
+            other_strategy = await StrategyRepo(session).create(
+                name="other", type="moving_average"
+            )
+            other_sid = other_strategy.id
+            await session.commit()
+        killed_sid = uuid.uuid4()
+        cb.kill_strategy(killed_sid)
+
+        om = _make_order_manager(broker, session_factory, circuit_breaker=cb)
+
+        with pytest.raises(RiskRejectionError) as exc_info:
+            await om.submit_order(_valid_request(strategy_id=killed_sid))
+        assert "STRATEGY_KILL_SWITCH_ACTIVE" in str(exc_info.value)
+
+        validation, result = await om.submit_order(_valid_request(strategy_id=other_sid))
+        assert result.status == "FILLED"
+
+
+# ---------------------------------------------------------------------------
+# Group 2B — Order retry on transient broker failures (entry + close legs)
+# ---------------------------------------------------------------------------
+
+
+class TestOrderRetry:
+    @pytest.mark.asyncio
+    async def test_submit_order_recovers_from_transient_broker_failure(
+        self, broker, session_factory, session
+    ) -> None:
+        """A broker call that raises twice then succeeds should still reach OPEN."""
+        om = _make_order_manager(
+            broker, session_factory, order_retry_attempts=3, order_retry_backoff_seconds=0
+        )
+        req = _valid_request()
+
+        calls = {"n": 0}
+        original = broker.place_order
+
+        async def flaky(order_req):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise ConnectionError("transient broker blip")
+            return await original(order_req)
+
+        broker.place_order = flaky
+        validation, result = await om.submit_order(req)
+        broker.place_order = original
+
+        assert calls["n"] == 3
+        assert result.status == "FILLED"
+        trade = await TradeRepo(session).get_by_id(req.trade_id)
+        assert trade is not None
+        assert trade.status == TradeStatus.OPEN
+
+    @pytest.mark.asyncio
+    async def test_close_position_recovers_from_transient_broker_failure(
+        self, broker, session_factory, session
+    ) -> None:
+        """close_position retries a transient broker failure instead of leaving
+        the trade stuck at CLOSING with its stop/target no longer enforced."""
+        om = _make_order_manager(
+            broker, session_factory, order_retry_attempts=3, order_retry_backoff_seconds=0
+        )
+        req = await _open_trade(om)
+
+        calls = {"n": 0}
+        original = broker.place_order
+
+        async def flaky_close(order_req):
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise TimeoutError("transient close failure")
+            return await original(order_req)
+
+        broker.place_order = flaky_close
+        await om.close_position(req.trade_id, "STOP_LOSS")
+        broker.place_order = original
+
+        assert calls["n"] == 2
+        trade = await TradeRepo(session).get_by_id(req.trade_id)
+        assert trade is not None
+        assert trade.status == TradeStatus.CLOSED
+
+    @pytest.mark.asyncio
+    async def test_close_position_exhausts_retries_and_logs_critical(
+        self, broker, session_factory, session
+    ) -> None:
+        """When every retry fails, the trade is left at CLOSING (not silently
+        lost) and a CRITICAL log records that it's unprotected at the broker."""
+        om = _make_order_manager(
+            broker, session_factory, order_retry_attempts=2, order_retry_backoff_seconds=0
+        )
+        req = await _open_trade(om)
+
+        async def always_fails(order_req):
+            raise TimeoutError("broker unreachable")
+
+        broker.place_order = always_fails
+
+        with patch("app.core.execution.order_manager.error_logger") as mock_err:
+            await om.close_position(req.trade_id, "STOP_LOSS")
+
+        mock_err.critical.assert_called_once()
+        extra = mock_err.critical.call_args.kwargs["extra"]
+        assert extra["attempts"] == 2
+
+        trade = await TradeRepo(session).get_by_id(req.trade_id)
+        assert trade is not None
+        assert trade.status == TradeStatus.CLOSING  # left mid-flight, not lost
+
+
+# ---------------------------------------------------------------------------
 # Group 3 — PositionMonitor integration
 # ---------------------------------------------------------------------------
 
@@ -643,6 +835,34 @@ class TestStrategyToExecution:
 # ---------------------------------------------------------------------------
 
 
+async def _seed_existing_risk(
+    session_factory, risk_amount: Decimal, symbol: str = "MSFT"
+) -> None:
+    """
+    Insert a PENDING trade row carrying `risk_amount`.
+
+    OrderManager now computes aggregate risk itself, from PENDING/SUBMITTED/
+    OPEN trades (see TradeRepo.get_active_trades) — so seeding a PENDING row
+    is enough to make it count, without needing a real broker fill.
+    """
+    from app.db.models.trade import TradeDirection
+
+    async with session_factory() as session:
+        repo = TradeRepo(session)
+        await repo.create(
+            symbol=symbol,
+            direction=TradeDirection.BUY,
+            quantity=Decimal("1"),
+            entry_price=Decimal("100"),
+            stop_loss_price=Decimal("100") - risk_amount,
+            take_profit_price=Decimal("110"),
+            reward_to_risk_ratio=Decimal("2.0"),
+            risk_amount=risk_amount,
+            account_balance_at_entry=Decimal("100000"),
+        )
+        await session.commit()
+
+
 class TestPortfolioRiskGate:
     @pytest.mark.asyncio
     async def test_new_trade_blocked_when_aggregate_risk_near_limit(
@@ -650,18 +870,18 @@ class TestPortfolioRiskGate:
     ) -> None:
         """
         Gate 4: a trade is rejected with PORTFOLIO_RISK_LIMIT_EXCEEDED when
-        current_aggregate_risk + new_risk_amount > max_portfolio_risk × balance.
+        aggregate_risk_of_active_trades + new_risk_amount > max_portfolio_risk × balance.
 
-        Setup: pass current_aggregate_risk = 4,960 (99.2% of the 5,000 cap).
-        New trade risk = qty × stop_distance = 10 × 5 = 50.
+        Setup: seed an existing PENDING trade with risk_amount = 4,960 (99.2%
+        of the 5,000 cap). New trade risk = qty × stop_distance = 10 × 5 = 50.
         4,960 + 50 = 5,010 > 5,000 → REJECTED.
         """
+        await _seed_existing_risk(session_factory, Decimal("4960"))
         om = _make_order_manager(broker, session_factory)
         req = _valid_request()
-        current_aggregate = Decimal("4960")  # leaves only $40 headroom
 
         with pytest.raises(RiskRejectionError) as exc_info:
-            await om.submit_order(req, current_aggregate_risk=current_aggregate)
+            await om.submit_order(req)
 
         assert "PORTFOLIO_RISK_LIMIT_EXCEEDED" in str(exc_info.value)
 
@@ -670,15 +890,63 @@ class TestPortfolioRiskGate:
         self, broker, session_factory, session
     ) -> None:
         """A trade is accepted when current aggregate risk leaves sufficient headroom."""
+        await _seed_existing_risk(session_factory, Decimal("4000"))  # $1,000 headroom
         om = _make_order_manager(broker, session_factory)
         req = _valid_request()
-        current_aggregate = Decimal("4000")  # $1,000 headroom; new risk = $50
 
-        validation, result = await om.submit_order(
-            req, current_aggregate_risk=current_aggregate
-        )
+        validation, result = await om.submit_order(req)
         assert result.status == "FILLED"
 
         trade = await TradeRepo(session).get_by_id(req.trade_id)
         assert trade is not None
         assert trade.status == TradeStatus.OPEN
+
+    @pytest.mark.asyncio
+    async def test_aggregate_risk_includes_pending_trades_not_just_open(
+        self, broker, session_factory
+    ) -> None:
+        """
+        Regression test for the portfolio risk-cap race: a trade still in
+        PENDING (e.g. mid broker round-trip) must count toward the cap for
+        any other concurrently-validated trade — not just trades that have
+        already reached OPEN.
+        """
+        await _seed_existing_risk(session_factory, Decimal("4980"))  # PENDING, never opened
+        om = _make_order_manager(broker, session_factory)
+        req = _valid_request()  # new risk = 50; 4980 + 50 = 5030 > 5000 cap
+
+        with pytest.raises(RiskRejectionError) as exc_info:
+            await om.submit_order(req)
+
+        assert "PORTFOLIO_RISK_LIMIT_EXCEEDED" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_submissions_do_not_both_pass_the_gate(
+        self, broker, session_factory
+    ) -> None:
+        """
+        Two concurrent submit_order() calls, each individually within the
+        1% per-trade rule, must not both be approved if their combined risk
+        would exceed the portfolio cap — the asyncio.Lock around read→
+        validate→insert-PENDING must serialize them.
+
+        Setup: cap = 5,000. Seed 4,920 of existing (PENDING) risk, leaving
+        only 80 of headroom. Two concurrent requests each add 50 of risk
+        (10 qty × 5 stop distance). Only one can fit; the other must be
+        rejected — never both accepted.
+        """
+        await _seed_existing_risk(session_factory, Decimal("4920"))
+        om = _make_order_manager(broker, session_factory)
+
+        results = await asyncio.gather(
+            om.submit_order(_valid_request(trade_id=uuid.uuid4())),
+            om.submit_order(_valid_request(trade_id=uuid.uuid4())),
+            return_exceptions=True,
+        )
+
+        successes = [r for r in results if not isinstance(r, Exception)]
+        failures = [r for r in results if isinstance(r, RiskRejectionError)]
+
+        assert len(successes) == 1, f"Expected exactly 1 success, got {len(successes)}"
+        assert len(failures) == 1, f"Expected exactly 1 rejection, got {len(failures)}"
+        assert "PORTFOLIO_RISK_LIMIT_EXCEEDED" in str(failures[0])

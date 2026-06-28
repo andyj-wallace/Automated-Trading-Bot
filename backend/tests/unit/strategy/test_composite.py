@@ -138,9 +138,16 @@ class TestInit:
     def test_invalid_mode_raises(self):
         with pytest.raises(ValueError, match="combination_mode"):
             CompositeStrategy(config={
-                "combination_mode": "majority",
+                "combination_mode": "consensus",
                 "strategies": [{"type": "stock_trend", "config": _ST_CONFIG}]
             })
+
+    def test_explicit_majority_mode(self):
+        c = CompositeStrategy(config={
+            "combination_mode": "majority",
+            "strategies": [{"type": "stock_trend", "config": _ST_CONFIG}]
+        })
+        assert c._mode == "majority"
 
     def test_empty_strategies_raises(self):
         with pytest.raises(ValueError, match="at least one sub-strategy"):
@@ -321,6 +328,87 @@ class TestAllMode:
         assert signal.timestamp is not None
         assert signal.timestamp.tzinfo is not None
 
+    @pytest.mark.asyncio
+    async def test_combines_to_tightest_stop_not_first_strategy(self):
+        """
+        When agreeing sub-strategies propose different stops, the combined
+        signal must use the tightest (safest) one, even if that isn't the
+        first-listed sub-strategy's stop — not an arbitrary "first wins".
+        """
+        wider_stop_config = {"ma_period": 2, "stop_loss_pct": "0.05"}  # stop = 10.5*0.95 ≈ 9.98
+        tighter_stop_config = _ST_CONFIG  # stop_loss_pct=0.03 → stop = 10.5*0.97 ≈ 10.19
+        c = CompositeStrategy(config={
+            "combination_mode": "all",
+            "strategies": [
+                {"type": "stock_trend", "config": wider_stop_config},  # primary, listed first
+                {"type": "stock_trend", "config": tighter_stop_config},
+            ],
+        })
+        signal = await c.generate_signal(_market(_both_buy_closes()))
+
+        assert signal.action == "BUY"
+        # Tighter stop (10.19, closer to entry) wins over the primary's own 9.975
+        assert signal.stop_loss_price == Decimal("10.19")
+        # Take-profit is dropped (None) since the stop was overridden from primary's
+        assert signal.take_profit_price is None
+
+    @pytest.mark.asyncio
+    async def test_keeps_take_profit_when_primary_already_has_tightest_stop(self):
+        """If the primary's own stop is already the tightest, its take_profit
+        suggestion is preserved rather than discarded."""
+        c = _all_composite()  # both sub-strategies use stop_loss_pct=0.03 — identical stops
+        signal = await c.generate_signal(_market(_both_buy_closes()))
+        assert signal.stop_loss_price == Decimal("10.19")
+        assert signal.take_profit_price is not None
+
+
+# ---------------------------------------------------------------------------
+# "majority" mode
+# ---------------------------------------------------------------------------
+
+
+class TestMajorityMode:
+    @pytest.mark.asyncio
+    async def test_buy_when_two_of_three_agree(self):
+        """2 BUY + 1 HOLD out of 3 sub-strategies → strict majority → BUY."""
+        c = CompositeStrategy(config={
+            "combination_mode": "majority",
+            "strategies": [
+                {"type": "stock_trend", "config": _ST_CONFIG},      # BUY
+                {"type": "stock_trend", "config": _ST2_CONFIG},     # BUY
+                {"type": "mean_reversion", "config": _MR_CONFIG},   # HOLD
+            ],
+        })
+        signal = await c.generate_signal(_market(_st_buy_closes()))
+        assert signal.action == "BUY"
+        assert signal.stop_loss_price == Decimal("10.19")
+
+    @pytest.mark.asyncio
+    async def test_hold_when_only_one_of_three_agrees(self):
+        """A single non-HOLD vote among 3 is not a strict majority → HOLD."""
+        c = CompositeStrategy(config={
+            "combination_mode": "majority",
+            "strategies": [
+                {"type": "stock_trend", "config": _ST_CONFIG},      # BUY
+                {"type": "mean_reversion", "config": _MR_CONFIG},   # HOLD
+                {"type": "mean_reversion", "config": _MR_CONFIG},   # HOLD
+            ],
+        })
+        signal = await c.generate_signal(_market(_st_buy_closes()))
+        assert signal.action == "HOLD"
+
+    @pytest.mark.asyncio
+    async def test_hold_when_all_hold(self):
+        c = CompositeStrategy(config={
+            "combination_mode": "majority",
+            "strategies": [
+                {"type": "stock_trend", "config": _ST_CONFIG},
+                {"type": "stock_trend", "config": _ST2_CONFIG},
+            ],
+        })
+        signal = await c.generate_signal(_market(_both_hold_closes()))
+        assert signal.action == "HOLD"
+
 
 # ---------------------------------------------------------------------------
 # Nested composites
@@ -422,7 +510,7 @@ class TestConfigSchema:
     def test_schema_combination_mode_enum(self):
         c = _any_composite()
         schema = c.get_config_schema()
-        assert schema["properties"]["combination_mode"]["enum"] == ["any", "all"]
+        assert schema["properties"]["combination_mode"]["enum"] == ["any", "all", "majority"]
 
     def test_schema_strategies_is_required(self):
         c = _any_composite()

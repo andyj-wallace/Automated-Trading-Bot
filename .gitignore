@@ -9,6 +9,7 @@
 credentials.txt
 secrets/
 IB Gateway*/
+*.html
 
 # Keep the example template committed
 !.env.example

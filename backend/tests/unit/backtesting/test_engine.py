@@ -263,3 +263,140 @@ async def test_max_drawdown_zero_with_no_trades(risk_manager: RiskManager) -> No
     result = await engine.run(bars, symbol="FLAT", account_balance=Decimal("10000"))
     assert result.metrics is not None
     assert result.metrics.max_drawdown_pct == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Friction modelling — slippage + commission
+# ---------------------------------------------------------------------------
+
+
+def _rally_bars() -> list[PriceBar]:
+    return [
+        _bar(0, 100, 100.5, 99.5, 100),
+        _bar(1, 100, 100.5, 99.5, 100),  # signal fires
+        _bar(2, 100, 100.5, 99.5, 100),  # fill at open=100
+        _bar(3, 100, 115, 99.5, 114),    # take-profit hit
+        _bar(4, 114, 115, 113, 114),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_default_friction_reduces_pnl_versus_frictionless(
+    risk_manager: RiskManager,
+) -> None:
+    """Default slippage+commission must leave the trade worse off than a
+    frictionless run of the identical bars/strategy."""
+    bars = _rally_bars()
+
+    frictionless = BacktestingEngine(
+        BuyOnBarNStrategy(fire_on_bar=2),
+        risk_manager,
+        slippage_pct=Decimal("0"),
+        commission_per_trade=Decimal("0"),
+    )
+    realistic = BacktestingEngine(BuyOnBarNStrategy(fire_on_bar=2), risk_manager)
+
+    frictionless_result = await frictionless.run(
+        bars, symbol="X", account_balance=Decimal("100000")
+    )
+    realistic_result = await realistic.run(bars, symbol="X", account_balance=Decimal("100000"))
+
+    assert realistic_result.trades[0].pnl < frictionless_result.trades[0].pnl
+
+
+@pytest.mark.asyncio
+async def test_commission_is_charged_on_entry_and_exit_legs(
+    risk_manager: RiskManager,
+) -> None:
+    engine = BacktestingEngine(
+        BuyOnBarNStrategy(fire_on_bar=2),
+        risk_manager,
+        slippage_pct=Decimal("0"),
+        commission_per_trade=Decimal("2.50"),
+    )
+    result = await engine.run(_rally_bars(), symbol="X", account_balance=Decimal("100000"))
+
+    trade = result.trades[0]
+    assert trade.commission_paid == Decimal("5.00")  # entry + exit leg
+    assert result.metrics is not None
+    assert result.metrics.total_commission_paid == Decimal("5.00")
+
+
+@pytest.mark.asyncio
+async def test_slippage_makes_entry_fill_worse_than_raw_open(
+    risk_manager: RiskManager,
+) -> None:
+    """A BUY entry fill must be slightly above the raw bar open (we pay more)."""
+    engine = BacktestingEngine(
+        BuyOnBarNStrategy(fire_on_bar=2),
+        risk_manager,
+        slippage_pct=Decimal("0.01"),  # 1% — exaggerated for a clear assertion
+        commission_per_trade=Decimal("0"),
+    )
+    result = await engine.run(_rally_bars(), symbol="X", account_balance=Decimal("100000"))
+
+    raw_open = Decimal("100")
+    assert result.trades[0].entry_price > raw_open
+    assert result.trades[0].entry_price == Decimal("101.00")  # 100 × 1.01
+
+
+@pytest.mark.asyncio
+async def test_zero_friction_matches_original_frictionless_behavior(
+    risk_manager: RiskManager,
+) -> None:
+    """slippage_pct=0, commission_per_trade=0 reproduces the exact original
+    (pre-friction) fill price and pnl — no behavior change for opt-outs."""
+    engine = BacktestingEngine(
+        BuyOnBarNStrategy(fire_on_bar=2),
+        risk_manager,
+        slippage_pct=Decimal("0"),
+        commission_per_trade=Decimal("0"),
+    )
+    result = await engine.run(_rally_bars(), symbol="X", account_balance=Decimal("100000"))
+
+    trade = result.trades[0]
+    assert trade.entry_price == Decimal("100")
+    assert trade.exit_price == trade.take_profit_price
+    assert trade.commission_paid == Decimal("0")
+    assert trade.pnl == (trade.exit_price - trade.entry_price) * trade.quantity
+
+
+@pytest.mark.asyncio
+async def test_risk_gate_decision_unaffected_by_slippage(risk_manager: RiskManager) -> None:
+    """
+    A trade sized to land exactly at the 1% risk limit on the raw (intended)
+    price must still be accepted even with slippage enabled — gate decisions
+    use the pre-slippage price, matching live OrderManager semantics.
+    """
+
+    class FixedQtyStrategy(BaseStrategy):
+        async def generate_signal(self, data: MarketData) -> Signal:
+            if data.current_price != Decimal("100"):
+                return Signal(symbol=data.symbol, action="HOLD", timestamp=data.timestamp)
+            return Signal(
+                symbol=data.symbol,
+                action="BUY",
+                entry_price=data.current_price,
+                stop_loss_price=Decimal("90"),   # risk = 10/share
+                take_profit_price=Decimal("125"),
+                timestamp=data.timestamp,
+            )
+
+        async def calculate_position_size(self, params: RiskParams) -> int:
+            return 100  # 100 × $10 = $1000 = exactly 1% of $100k
+
+        def get_config_schema(self) -> dict:
+            return {}
+
+    engine = BacktestingEngine(FixedQtyStrategy(), risk_manager)  # default friction
+    bars = [
+        _bar(0, 100, 100.5, 99.5, 100),
+        _bar(1, 100, 100.5, 99.5, 100),  # signal fires (current_price == 100)
+        _bar(2, 100, 100.5, 99.5, 100),  # fill at raw open=100
+        _bar(3, 100, 130, 99.5, 129),
+    ]
+
+    result = await engine.run(bars, symbol="X", account_balance=Decimal("100000"))
+    assert len(result.trades) == 1
+    assert result.metrics is not None
+    assert result.metrics.signals_rejected == 0

@@ -341,6 +341,7 @@ class TestConfigSchema:
         assert "properties" in schema
         assert "ma_period" in schema["properties"]
         assert "stop_loss_pct" in schema["properties"]
+        assert "min_separation_pct" in schema["properties"]
         assert "symbols" in schema["properties"]
 
     def test_schema_defaults_match_instance_defaults(self):
@@ -348,6 +349,48 @@ class TestConfigSchema:
         schema = s.get_config_schema()
         assert schema["properties"]["ma_period"]["default"] == 200
         assert schema["properties"]["stop_loss_pct"]["default"] == "0.03"
+
+
+# ---------------------------------------------------------------------------
+# Whipsaw/chop filter — min_separation_pct
+# ---------------------------------------------------------------------------
+
+
+class TestWhipsawFilter:
+    @pytest.mark.asyncio
+    async def test_default_filter_holds_on_marginal_crossover(self):
+        """
+        ma_period=4, closes=[9,9,9,9,9,9,9.005]:
+          ma_now = SMA([9,9,9,9.005]) = 9.00125
+          separation = (9.005-9.00125)/9.00125 ≈ 0.0004 (0.04%) — below the
+          default 0.1% threshold → filtered out as noise → HOLD.
+        """
+        s = _strategy()  # default min_separation_pct = "0.001"
+        target_closes = [9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.005]
+        data = _market(target_closes)
+        signal = await s.generate_signal(data)
+        assert signal.action == "HOLD"
+
+    @pytest.mark.asyncio
+    async def test_filter_disabled_allows_marginal_crossover(self):
+        """Same marginal crossover, min_separation_pct='0' restores bare behavior."""
+        s = _strategy(min_separation_pct="0")
+        target_closes = [9.0, 9.0, 9.0, 9.0, 9.0, 9.0, 9.005]
+        data = _market(target_closes)
+        signal = await s.generate_signal(data)
+        assert signal.action == "BUY"
+
+    @pytest.mark.asyncio
+    async def test_default_filter_still_allows_strong_crossover(self):
+        """The standard 12%-separation fixture must still fire BUY by default."""
+        s = _strategy()
+        data = _market(_buy_cross_closes())
+        signal = await s.generate_signal(data)
+        assert signal.action == "BUY"
+
+    def test_negative_min_separation_pct_raises(self):
+        with pytest.raises(ValueError, match="min_separation_pct"):
+            StockTrendStrategy(config={"min_separation_pct": "-0.01"})
 
 
 # ---------------------------------------------------------------------------

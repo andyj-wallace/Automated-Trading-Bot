@@ -367,3 +367,66 @@ async def test_combined_metrics_aggregate_all_slots(risk_manager: RiskManager) -
 
     total_from_per_strategy = sum(len(ps.trades) for ps in result.per_strategy)
     assert result.combined_metrics.trade_count == total_from_per_strategy
+
+
+# ---------------------------------------------------------------------------
+# Friction modelling — slippage + commission (mirrors BacktestingEngine)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_default_friction_reduces_pnl_versus_frictionless(
+    risk_manager: RiskManager,
+) -> None:
+    bars = [
+        _bar(0, 100, 100.5, 99.5, 100),
+        _bar(1, 100, 100.5, 99.5, 100),
+        _bar(2, 100, 100.5, 99.5, 100),
+        _bar(3, 100, 130, 99.5, 129),
+        _bar(4, 129, 130, 128, 129),
+    ]
+
+    frictionless = PortfolioBacktestEngine(
+        risk_manager, slippage_pct=Decimal("0"), commission_per_trade=Decimal("0")
+    )
+    realistic = PortfolioBacktestEngine(risk_manager)
+
+    def slot_factory() -> list[PortfolioSlot]:
+        return [
+            PortfolioSlot(
+                strategy=BuyOnCallN(fire_on=1, stop_pct=0.10, quantity=5),
+                symbol="X",
+                bars=list(bars),
+            )
+        ]
+
+    frictionless_result = await frictionless.run(slot_factory(), account_balance=Decimal("100000"))
+    realistic_result = await realistic.run(slot_factory(), account_balance=Decimal("100000"))
+
+    assert (
+        realistic_result.per_strategy[0].trades[0].pnl
+        < frictionless_result.per_strategy[0].trades[0].pnl
+    )
+
+
+@pytest.mark.asyncio
+async def test_zero_friction_matches_frictionless_behavior(risk_manager: RiskManager) -> None:
+    bars = [
+        _bar(0, 100, 100.5, 99.5, 100),
+        _bar(1, 100, 100.5, 99.5, 100),
+        _bar(2, 100, 100.5, 99.5, 100),
+        _bar(3, 100, 130, 99.5, 129),
+        _bar(4, 129, 130, 128, 129),
+    ]
+    engine = PortfolioBacktestEngine(
+        risk_manager, slippage_pct=Decimal("0"), commission_per_trade=Decimal("0")
+    )
+    slots = [
+        PortfolioSlot(strategy=BuyOnCallN(fire_on=1, stop_pct=0.10, quantity=5), symbol="X", bars=bars)
+    ]
+    result = await engine.run(slots, account_balance=Decimal("100000"))
+
+    trade = result.per_strategy[0].trades[0]
+    assert trade.entry_price == Decimal("100")
+    assert trade.commission_paid == Decimal("0")
+    assert trade.pnl == (trade.exit_price - trade.entry_price) * trade.quantity

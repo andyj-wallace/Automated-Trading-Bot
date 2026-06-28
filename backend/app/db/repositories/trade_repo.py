@@ -90,6 +90,27 @@ class TradeRepo:
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
+    async def get_active_trades(self) -> list[Trade]:
+        """
+        Return all trades not yet in a terminal state: PENDING, SUBMITTED, or
+        OPEN. Used by OrderManager to compute aggregate portfolio risk for
+        the Gate 4 cap — a trade's risk_amount must count immediately on
+        creation (PENDING), not only once the broker confirms a fill (OPEN),
+        otherwise two trades submitted back-to-back can both pass the cap
+        check before either one's risk is "reserved".
+        """
+        stmt = (
+            select(Trade)
+            .where(
+                Trade.status.in_(
+                    (TradeStatus.PENDING, TradeStatus.SUBMITTED, TradeStatus.OPEN)
+                )
+            )
+            .order_by(Trade.executed_at)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
     async def list(
         self,
         symbol: str | None = None,
