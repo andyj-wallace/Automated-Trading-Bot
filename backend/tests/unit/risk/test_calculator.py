@@ -202,3 +202,26 @@ def test_max_quantity_from_params(calc: RiskCalculator) -> None:
         stop_loss_price=Decimal("195"),
     )
     assert calc.max_quantity_from_params(params) == 200
+
+
+# ---------------------------------------------------------------------------
+# Short selling — explicit stubs, not implemented
+# ---------------------------------------------------------------------------
+
+
+def test_max_quantity_short_raises_not_implemented(calc: RiskCalculator) -> None:
+    with pytest.raises(NotImplementedError):
+        calc.max_quantity_short(
+            account_balance=Decimal("100000"),
+            entry_price=Decimal("200"),
+            stop_loss_price=Decimal("205"),  # stop above entry, as a short requires
+        )
+
+
+def test_risk_amount_short_raises_not_implemented(calc: RiskCalculator) -> None:
+    with pytest.raises(NotImplementedError):
+        calc.risk_amount_short(
+            quantity=Decimal("10"),
+            entry_price=Decimal("200"),
+            stop_loss_price=Decimal("205"),
+        )

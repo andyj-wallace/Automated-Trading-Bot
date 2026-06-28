@@ -316,7 +316,65 @@ def test_get_config_schema_has_required_fields() -> None:
     assert "fast_period" in props
     assert "slow_period" in props
     assert "stop_loss_pct" in props
+    assert "min_separation_pct" in props
     assert "symbols" in props
+
+
+# ---------------------------------------------------------------------------
+# Whipsaw/chop filter — min_separation_pct
+# ---------------------------------------------------------------------------
+
+
+def _closes_marginal_golden_cross() -> list[float]:
+    """
+    fast_period=3, slow_period=5, closes=[90,90,90,90,90,90.1]:
+      fast_cur = avg([90,90,90.1]) = 90.0333
+      slow_cur = avg([90,90,90,90,90.1]) = 90.02
+      separation = (90.0333-90.02)/90.02 ≈ 0.000148 (0.0148%) — below the
+      default 0.1% threshold, despite technically being a crossover.
+    """
+    return [90.0, 90.0, 90.0, 90.0, 90.0, 90.1]
+
+
+@pytest.mark.asyncio
+async def test_default_filter_holds_on_marginal_golden_cross() -> None:
+    s = _strategy()  # default min_separation_pct = "0.001"
+    bars = make_bars_from_closes(_closes_marginal_golden_cross())
+    signal = await s.generate_signal(make_market_data("TEST", bars))
+    assert signal.action == "HOLD"
+
+
+@pytest.mark.asyncio
+async def test_filter_disabled_allows_marginal_golden_cross() -> None:
+    s = MovingAverageStrategy(
+        config={"fast_period": 3, "slow_period": 5, "min_separation_pct": "0"}
+    )
+    bars = make_bars_from_closes(_closes_marginal_golden_cross())
+    signal = await s.generate_signal(make_market_data("TEST", bars))
+    assert signal.action == "BUY"
+
+
+@pytest.mark.asyncio
+async def test_default_filter_still_allows_strong_golden_cross() -> None:
+    s = _strategy()
+    bars = make_bars_from_closes(_closes_golden_cross())
+    signal = await s.generate_signal(make_market_data("TEST", bars))
+    assert signal.action == "BUY"
+
+
+@pytest.mark.asyncio
+async def test_default_filter_still_allows_strong_death_cross() -> None:
+    s = _strategy()
+    bars = make_bars_from_closes(_closes_death_cross())
+    signal = await s.generate_signal(make_market_data("TEST", bars))
+    assert signal.action == "SELL"
+
+
+def test_negative_min_separation_pct_raises() -> None:
+    with pytest.raises(ValueError, match="min_separation_pct"):
+        MovingAverageStrategy(
+            config={"fast_period": 3, "slow_period": 5, "min_separation_pct": "-0.01"}
+        )
 
 
 # ---------------------------------------------------------------------------

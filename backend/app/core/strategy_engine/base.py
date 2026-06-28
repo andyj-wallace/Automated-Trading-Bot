@@ -129,3 +129,14 @@ class BaseStrategy(ABC):
 
         Used by the frontend StrategyConfigForm to render editable fields.
         """
+
+    def required_extra_symbols(self) -> list[str]:
+        """
+        Tickers (besides the one being evaluated) this strategy needs bars
+        for, populated into MarketData.extra_bars by the scheduler before
+        generate_signal() is called. Default: none.
+
+        Example: a regime filter strategy that checks SPY's trend before
+        trading some other symbol returns ["SPY"] here.
+        """
+        return []

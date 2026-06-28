@@ -9,6 +9,7 @@ from app.api.middleware import ErrorHandlerMiddleware
 from app.api.v1.backtesting import router as backtesting_router
 from app.api.v1.metrics import router as metrics_router
 from app.api.v1.portfolio import router as portfolio_router
+from app.api.v1.risk import router as risk_router
 from app.api.v1.strategies import router as strategies_router
 from app.api.v1.symbols import router as symbols_router
 from app.api.v1.system import router as system_router
@@ -100,9 +101,10 @@ async def lifespan(app: FastAPI):
     from app.core.strategy_engine.scheduler import StrategyScheduler
     from app.data.cache import RedisCache
     from app.db.session import AsyncSessionFactory
-    from app.dependencies import _build_broker
+    from app.dependencies import _build_broker, _build_circuit_breaker
 
     broker = _build_broker()
+    circuit_breaker = _build_circuit_breaker()
     try:
         await broker.connect()
     except Exception as exc:
@@ -115,12 +117,13 @@ async def lifespan(app: FastAPI):
             },
         )
     cache = RedisCache(settings.redis_url)
-    risk_manager = RiskManager()
+    risk_manager = RiskManager(circuit_breaker=circuit_breaker)
     order_manager = OrderManager(
         broker=broker,
         risk_manager=risk_manager,
         session_factory=AsyncSessionFactory,
         cache=cache,
+        circuit_breaker=circuit_breaker,
     )
 
     # ------------------------------------------------------------------
@@ -251,6 +254,7 @@ app.include_router(portfolio_router, prefix=_API_PREFIX)
 app.include_router(system_router, prefix=_API_PREFIX)
 app.include_router(backtesting_router, prefix=_API_PREFIX)
 app.include_router(metrics_router, prefix=_API_PREFIX)
+app.include_router(risk_router, prefix=_API_PREFIX)
 
 # WebSocket — no version prefix, path is /ws/dashboard
 app.include_router(ws_router)

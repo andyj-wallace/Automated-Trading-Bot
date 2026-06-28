@@ -289,6 +289,45 @@ class TestEntryConditions:
 
 
 # ---------------------------------------------------------------------------
+# Whipsaw/chop filter — min_separation_pct (target entry leg only)
+# ---------------------------------------------------------------------------
+
+
+class TestWhipsawFilter:
+    @pytest.mark.asyncio
+    async def test_default_filter_holds_on_marginal_crossover(self):
+        """
+        entry_period=4, target closes=[9,9,9,9,9,9.005]:
+          ma_now = SMA([9,9,9,9.005]) = 9.00125
+          separation ≈ 0.042% — below the default 0.1% threshold → HOLD.
+        """
+        s = _strategy()  # default min_separation_pct = "0.001"
+        target_closes = [9.0, 9.0, 9.0, 9.0, 9.0, 9.005]
+        data = _market(target_closes, _bull_spy_closes())
+        signal = await s.generate_signal(data)
+        assert signal.action == "HOLD"
+
+    @pytest.mark.asyncio
+    async def test_filter_disabled_allows_marginal_crossover(self):
+        s = _strategy(min_separation_pct="0")
+        target_closes = [9.0, 9.0, 9.0, 9.0, 9.0, 9.005]
+        data = _market(target_closes, _bull_spy_closes())
+        signal = await s.generate_signal(data)
+        assert signal.action == "BUY"
+
+    @pytest.mark.asyncio
+    async def test_default_filter_still_allows_strong_crossover(self):
+        s = _strategy()
+        data = _market(_buy_cross_target_closes(), _bull_spy_closes())
+        signal = await s.generate_signal(data)
+        assert signal.action == "BUY"
+
+    def test_negative_min_separation_pct_raises(self):
+        with pytest.raises(ValueError, match="min_separation_pct"):
+            BullBearStrategy(config={"min_separation_pct": "-0.01"})
+
+
+# ---------------------------------------------------------------------------
 # BUY signal fields
 # ---------------------------------------------------------------------------
 
@@ -432,6 +471,8 @@ class TestConfigSchema:
         assert "entry_period" in props
         assert "atr_period" in props
         assert "atr_multiplier" in props
+        assert "min_separation_pct" in props
+        assert "inverse_etf_symbol" in props
         assert "symbols" in props
 
     def test_schema_defaults_match_instance_defaults(self):
@@ -464,6 +505,96 @@ class TestRegistration:
         from app.core.strategy_engine.registry import registry
         cls = registry._classes["bull_bear"]
         assert cls is BullBearStrategy
+
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+
+class TestRequiredExtraSymbols:
+    def test_returns_regime_symbol(self):
+        s = _strategy()
+        assert s.required_extra_symbols() == ["SPY"]
+
+    def test_returns_custom_regime_symbol(self):
+        s = _strategy(regime_symbol="QQQ")
+        assert s.required_extra_symbols() == ["QQQ"]
+
+
+# ---------------------------------------------------------------------------
+# Bear-market hedge — inverse ETF leg (interim stand-in for short selling)
+# ---------------------------------------------------------------------------
+
+
+class TestInverseEtfHedge:
+    @pytest.mark.asyncio
+    async def test_inverse_etf_not_set_returns_hold_in_bear_regime(self):
+        """Without inverse_etf_symbol configured, bear regime is just HOLD."""
+        s = _strategy()  # no inverse_etf_symbol
+        data = _market(_buy_cross_target_closes(), _bear_spy_closes(), symbol="SH")
+        signal = await s.generate_signal(data)
+        assert signal.action == "HOLD"
+
+    @pytest.mark.asyncio
+    async def test_buys_inverse_etf_in_bear_regime(self):
+        s = _strategy(inverse_etf_symbol="SH")
+        # SH's own bars just need to be long enough for the ATR calc; the
+        # entry trigger is the regime call, not a crossover on SH itself.
+        data = _market(_buy_cross_target_closes(), _bear_spy_closes(), symbol="SH")
+        signal = await s.generate_signal(data)
+        assert signal.action == "BUY"
+        assert signal.symbol == "SH"
+
+    @pytest.mark.asyncio
+    async def test_inverse_etf_holds_in_bull_regime(self):
+        """Bull regime: no hedge needed, even with inverse_etf_symbol configured."""
+        s = _strategy(inverse_etf_symbol="SH")
+        data = _market(_buy_cross_target_closes(), _bull_spy_closes(), symbol="SH")
+        signal = await s.generate_signal(data)
+        assert signal.action == "HOLD"
+
+    @pytest.mark.asyncio
+    async def test_inverse_etf_config_is_case_insensitive(self):
+        s = _strategy(inverse_etf_symbol="sh")
+        assert s.inverse_etf_symbol == "SH"
+        data = _market(_buy_cross_target_closes(), _bear_spy_closes(), symbol="sh")
+        signal = await s.generate_signal(data)
+        assert signal.action == "BUY"
+
+    @pytest.mark.asyncio
+    async def test_other_symbols_unaffected_by_inverse_etf_config(self):
+        """A regular target symbol still follows normal bull-only entry logic."""
+        s = _strategy(inverse_etf_symbol="SH")
+        data = _market(_buy_cross_target_closes(), _bull_spy_closes(), symbol="AAPL")
+        signal = await s.generate_signal(data)
+        assert signal.action == "BUY"
+        assert signal.symbol == "AAPL"
+
+    @pytest.mark.asyncio
+    async def test_inverse_etf_hold_when_insufficient_bars(self):
+        s = _strategy(inverse_etf_symbol="SH", atr_period=3)
+        target_bars = make_bars_from_closes([10.0] * 2)  # fewer than atr_period+1
+        spy_bars = make_bars_from_closes(_bear_spy_closes())
+        data = MarketData(
+            symbol="SH",
+            current_price=target_bars[-1].close,
+            bars=target_bars,
+            extra_bars={"SPY": spy_bars},
+            timestamp=datetime.now(UTC),
+        )
+        signal = await s.generate_signal(data)
+        assert signal.action == "HOLD"
+
+    @pytest.mark.asyncio
+    async def test_inverse_etf_stop_and_target_are_atr_based(self):
+        s = _strategy(inverse_etf_symbol="SH", atr_multiplier="1.5")
+        data = _market(
+            _buy_cross_target_closes(), _bear_spy_closes(), symbol="SH", current_price=10.5
+        )
+        signal = await s.generate_signal(data)
+        assert signal.stop_loss_price == Decimal("8.25")
+        assert signal.take_profit_price == Decimal("15.0")
 
 
 # ---------------------------------------------------------------------------

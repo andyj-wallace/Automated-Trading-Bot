@@ -32,6 +32,18 @@ class Settings(BaseSettings):
     # Broker selection
     broker: str = "mock"  # "mock" | "ibkr"
 
+    # Short selling — OFF by default. The risk/execution stack is currently
+    # long-only by design (RiskCalculator/RiskManager reject any trade where
+    # stop_loss_price >= entry_price). Flipping this on does NOT enable real
+    # shorting yet: it routes into explicit NotImplementedError stubs in
+    # risk/calculator.py and risk/manager.py so the gap stays visible rather
+    # than silently mis-pricing risk. Real support needs: inverted PnL math
+    # in OrderManager, inverted stop/target comparisons in PositionMonitor,
+    # and broker-side margin/short-availability checks. Interim bear-market
+    # response: BullBearStrategy's `inverse_etf_symbol` config (buys an
+    # inverse ETF instead of shorting — see strategy_engine/bull_bear.py).
+    enable_short_selling: bool = False
+
     # Notifications (Phase 3+)
     notification_email_smtp: str = ""
     # Twilio SMS: twilio://account_sid:auth_token@+from_number/+to_number

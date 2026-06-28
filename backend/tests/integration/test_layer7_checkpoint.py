@@ -25,6 +25,7 @@ from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -89,6 +90,21 @@ async def session(engine) -> AsyncSession:
     async with factory() as sess:
         yield sess
         await sess.rollback()
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _clean_trades_table(engine):
+    """
+    Truncate trades before every test in this file.
+
+    OrderManager computes aggregate portfolio risk from real PENDING/
+    SUBMITTED/OPEN rows in the DB (Gap 12 fix — see order_manager.py), so a
+    row left behind by an earlier test would otherwise skew the portfolio-
+    risk gate for every test that runs after it.
+    """
+    async with engine.begin() as conn:
+        await conn.execute(text("TRUNCATE TABLE trades RESTART IDENTITY CASCADE"))
+    yield
 
 
 def _valid_request(**kwargs) -> TradeRequest:

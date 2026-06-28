@@ -2,8 +2,16 @@
 OrderManager — the only permitted code path for order submission and position closing.
 
 submit_order() orchestrates the full execution pipeline:
-  1. Risk validation (RiskManager.validate)
+  1. Compute aggregate portfolio risk + risk validation (RiskManager.validate)
   2. Create trade row at PENDING in DB (if session_factory provided)
+     └─ Steps 1-2 run under an asyncio.Lock (see _submission_lock) so that
+        "read aggregate risk → validate → reserve via PENDING row" is
+        atomic across concurrent submit_order() calls — otherwise two
+        trades submitted close together could each pass the portfolio risk
+        cap independently, since neither would see the other's risk until
+        far later (previously: only once it reached OPEN, after the full
+        broker round-trip). Aggregate risk now also counts PENDING/SUBMITTED
+        trades, not just OPEN — see TradeRepo.get_active_trades.
   3. Pre-submission audit entry → audit.log (before any broker call)
   4. Transition trade to SUBMITTED
   5. Broker order submission (stop sent only when submit_stop_to_broker=True)
@@ -16,8 +24,9 @@ close_position() handles the full exit flow:
   1. Load trade from DB; validate it is OPEN
   2. Transition to CLOSING
   3. Submit market close order to broker
-  4. Transition to CLOSED; write exit_price, exit_reason, pnl
-  5. Publish trade_closed event to Redis
+  4. Report realized pnl to the circuit breaker (if configured)
+  5. Transition to CLOSED; write exit_price, exit_reason, pnl
+  6. Publish trade_closed event to Redis
 
 Audit entries are append-only. No path in this codebase may modify or delete
 them after writing. See design.md § Audit Trail.
@@ -28,6 +37,7 @@ Depends on: RiskManager (6.3), BaseBroker (Layer 4), TradeRepo (3.7),
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime
@@ -35,6 +45,7 @@ from decimal import Decimal
 
 from app.brokers.base import BaseBroker, OrderRequest, OrderResult
 from app.core.risk.calculator import RiskCalculator
+from app.core.risk.circuit_breaker import CircuitBreaker
 from app.core.risk.manager import RiskManager, TradeRequest, ValidationResult
 from app.monitoring.logger import audit_logger, error_logger, trading_logger
 
@@ -58,6 +69,20 @@ class OrderManager:
                          If None, DB operations are skipped (e.g. unit tests).
         cache:           Optional RedisCache for publishing trade events from
                          close_position(). If None, event publishing is skipped.
+        order_retry_attempts:        Max attempts for a broker.place_order() call
+                                     (entry or close) before giving up. Only
+                                     retries on exceptions raised by the broker
+                                     call (e.g. transient network/timeout) — a
+                                     returned OrderResult, even REJECTED, is a
+                                     deliberate broker decision and is not retried.
+        order_retry_backoff_seconds: Base delay between retries; doubles each
+                                     attempt (0.5s, 1s, 2s, ...).
+        circuit_breaker:             Optional shared CircuitBreaker. When provided,
+                                     close_position() reports realized pnl to it
+                                     so RiskManager's Gate 0 (daily halt / per-
+                                     strategy kill switch) stays current. Must be
+                                     the SAME instance passed into the RiskManager
+                                     used by this OrderManager — see app/main.py.
 
     Usage:
         order_manager = OrderManager(broker, risk_manager, session_factory, cache)
@@ -71,24 +96,31 @@ class OrderManager:
         risk_manager: RiskManager,
         session_factory=None,
         cache=None,
+        order_retry_attempts: int = 3,
+        order_retry_backoff_seconds: float = 0.5,
+        circuit_breaker: CircuitBreaker | None = None,
     ) -> None:
         self._broker = broker
         self._risk_manager = risk_manager
         self._session_factory = session_factory
         self._cache = cache
+        self._order_retry_attempts = max(1, order_retry_attempts)
+        self._order_retry_backoff_seconds = order_retry_backoff_seconds
+        self._circuit_breaker = circuit_breaker
+        # Serializes "compute aggregate risk → validate → insert PENDING row"
+        # across concurrent submit_order() calls in this process — see the
+        # portfolio-risk-cap race note in the module docstring.
+        self._submission_lock = asyncio.Lock()
 
     async def submit_order(
         self,
         request: TradeRequest,
-        current_aggregate_risk: Decimal = Decimal("0"),
     ) -> tuple[ValidationResult, OrderResult]:
         """
         Submit a trade through the full validation → audit → broker pipeline.
 
         Args:
-            request:                Trade parameters including current account balance.
-            current_aggregate_risk: Sum of open trade risk_amounts for the portfolio
-                                    gate (Gate 4). Defaults to 0.
+            request: Trade parameters including current account balance.
 
         Returns:
             (ValidationResult, OrderResult) — pass both to TradeHandler.on_fill()
@@ -101,15 +133,18 @@ class OrderManager:
                 (system fault — escalated to error.log before re-raising).
         """
         # ------------------------------------------------------------------
-        # Step 1 — Risk validation (raises RiskRejectionError on failure)
+        # Steps 1-2 — Aggregate risk → validate → create PENDING row, all
+        # under one lock. This is the only section that must be atomic: once
+        # the PENDING row is committed, its risk_amount is immediately visible
+        # to the next call's aggregate-risk read (see TradeRepo.get_active_trades),
+        # so the broker round-trip below does NOT need to hold the lock.
         # ------------------------------------------------------------------
-        validation = self._risk_manager.validate(request, current_aggregate_risk)
+        async with self._submission_lock:
+            current_aggregate_risk = await self._compute_aggregate_risk()
+            validation = self._risk_manager.validate(request, current_aggregate_risk)
 
-        # ------------------------------------------------------------------
-        # Step 2 — Create trade row at PENDING (before any broker call)
-        # ------------------------------------------------------------------
-        if self._session_factory:
-            await self._create_pending(request, validation)
+            if self._session_factory:
+                await self._create_pending(request, validation)
 
         # ------------------------------------------------------------------
         # Step 3 — Pre-submission audit entry (must be written before broker)
@@ -139,20 +174,17 @@ class OrderManager:
             strategy_id=request.strategy_id,
         )
 
-        broker_error: BaseException | None = None
-        order_result: OrderResult
-
-        try:
-            order_result = await self._broker.place_order(broker_request)
-        except Exception as exc:
-            broker_error = exc
+        order_result, broker_error = await self._place_order_with_retry(
+            broker_request, context="entry order"
+        )
+        if order_result is None:
             order_result = OrderResult(
                 trade_id=request.trade_id,
                 broker_order_id="",
                 status="ERROR",
                 filled_quantity=Decimal("0"),
                 avg_fill_price=Decimal("0"),
-                error_message=str(exc),
+                error_message=str(broker_error),
                 timestamp=datetime.now(UTC),
             )
 
@@ -202,6 +234,65 @@ class OrderManager:
                 )
 
         return validation, order_result
+
+    async def _compute_aggregate_risk(self) -> Decimal:
+        """
+        Sum risk_amount across all non-terminal trades (PENDING, SUBMITTED,
+        OPEN). Always called from inside self._submission_lock so the read
+        and the subsequent PENDING-row insert are atomic with respect to any
+        other concurrent submit_order() call in this process.
+
+        Returns 0 if no session_factory is configured (e.g. unit tests).
+        """
+        if not self._session_factory:
+            return Decimal("0")
+
+        from app.db.repositories.trade_repo import TradeRepo
+
+        async with self._session_factory() as session:
+            repo = TradeRepo(session)
+            active = await repo.get_active_trades()
+            return sum((t.risk_amount for t in active), Decimal("0"))
+
+    async def _place_order_with_retry(
+        self,
+        broker_request: OrderRequest,
+        *,
+        context: str,
+    ) -> tuple[OrderResult | None, BaseException | None]:
+        """
+        Call broker.place_order() with retry on transient failures.
+
+        Retries only when the broker call *raises* (network blip, timeout,
+        transient disconnect) — up to `_order_retry_attempts` times with
+        doubling backoff. A clean returned OrderResult (including a broker
+        REJECTED status) is not a transient failure and is returned as-is
+        on the first attempt.
+
+        Returns (order_result, None) on success, or (None, last_exception)
+        if every attempt raised.
+        """
+        last_exc: BaseException | None = None
+        for attempt in range(1, self._order_retry_attempts + 1):
+            try:
+                result = await self._broker.place_order(broker_request)
+                return result, None
+            except Exception as exc:
+                last_exc = exc
+                if attempt < self._order_retry_attempts:
+                    delay = self._order_retry_backoff_seconds * (2 ** (attempt - 1))
+                    trading_logger.warning(
+                        f"OrderManager: {context} place_order failed — retrying",
+                        extra={
+                            "trade_id": str(broker_request.trade_id),
+                            "attempt": attempt,
+                            "max_attempts": self._order_retry_attempts,
+                            "retry_in_seconds": delay,
+                            "error": str(exc),
+                        },
+                    )
+                    await asyncio.sleep(delay)
+        return None, last_exc
 
     async def close_position(
         self,
@@ -254,6 +345,8 @@ class OrderManager:
             close_direction = "SELL" if trade.direction == TradeDirection.BUY else "BUY"
             quantity = trade.quantity
             entry_price = trade.entry_price
+            strategy_id = trade.strategy_id
+            account_balance_at_entry = trade.account_balance_at_entry
 
             # Transition to CLOSING
             await repo.update_status(trade_id, TradeStatus.CLOSING)
@@ -271,12 +364,20 @@ class OrderManager:
             stop_loss_price=None,
         )
 
-        try:
-            order_result = await self._broker.place_order(close_request)
-        except Exception as exc:
-            error_logger.error(
-                "close_position: broker close order failed",
-                extra={"trade_id": str(trade_id), "reason": reason, "error": str(exc)},
+        order_result, broker_error = await self._place_order_with_retry(
+            close_request, context="close order"
+        )
+        if order_result is None:
+            error_logger.critical(
+                "close_position: broker close order failed after all retries — "
+                "position remains OPEN at the broker, stop/target is no longer "
+                "being enforced for this trade",
+                extra={
+                    "trade_id": str(trade_id),
+                    "reason": reason,
+                    "attempts": self._order_retry_attempts,
+                    "error": str(broker_error),
+                },
             )
             return
 
@@ -296,6 +397,17 @@ class OrderManager:
                 exit_reason = ExitReason(reason)
             except ValueError:
                 exit_reason = ExitReason.MANUAL
+
+            # Feed realized pnl to the circuit breaker before anything else
+            # can short-circuit this method (DB write, event publish, etc.)
+            # so a halt/kill triggered by this trade applies to the very
+            # next validate() call, not just the one after that.
+            if self._circuit_breaker is not None:
+                self._circuit_breaker.record_closed_trade(
+                    pnl=pnl,
+                    account_balance=account_balance_at_entry,
+                    strategy_id=strategy_id,
+                )
 
             async with self._session_factory() as session:
                 repo = TradeRepo(session)

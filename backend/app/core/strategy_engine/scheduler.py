@@ -3,16 +3,23 @@ StrategyScheduler — runs enabled strategies on a fixed interval.
 
 Each cycle:
   1. Fetch account balance from the broker (needed for risk sizing).
-  2. Fetch aggregate risk from RiskMonitor (needed for portfolio gate).
-  3. Load enabled strategies from the DB (fresh each cycle → enable/disable
+  2. Load enabled strategies from the DB (fresh each cycle → enable/disable
      takes effect without restart).
-  4. For each enabled strategy:
+  3. For each enabled strategy:
        a. Read config.symbols list.
        b. For each symbol:
             - Get current price (Redis price:{symbol}, fallback: latest DB bar close).
             - Get historical bars (TimescaleDB via OHLCVRepo, fallback: broker).
             - Call strategy.generate_signal(market_data).
             - If BUY/SELL: size the position and call order_manager.submit_order().
+
+Aggregate portfolio risk (Gate 4) is no longer precomputed here — OrderManager
+now computes it itself, atomically, immediately before validating each trade
+(see order_manager.py module docstring). A scheduler-level snapshot taken once
+per cycle and reused across every strategy/symbol pair in that cycle would be
+stale the moment the first trade in the cycle is submitted. Aggregate exposure
+alerting/visibility is handled independently by the RiskMonitor background
+loop started in app/main.py's lifespan.
 
 Runs as a background asyncio task, started on app startup (alongside PositionMonitor).
 
@@ -21,7 +28,7 @@ bad strategy cannot abort the entire cycle.
 
 Depends on:
   StrategyRegistry (11.1), StrategyRepo (3.8), OHLCVRepo (5.3),
-  RedisCache (5.1), RiskMonitor (6.4), OrderManager (7.1)
+  RedisCache (5.1), OrderManager (7.1)
 """
 
 from __future__ import annotations
@@ -42,6 +49,11 @@ from app.monitoring.logger import system_logger, trading_logger
 
 _DEFAULT_INTERVAL = 60  # seconds between cycles
 _HISTORY_LOOKBACK_DAYS = 365  # 1 year of daily bars
+
+# After this many consecutive cycles with no price for a symbol, escalate
+# from WARNING to ERROR so a stuck/misconfigured feed doesn't go unnoticed
+# under routine per-cycle warnings.
+_CONSECUTIVE_MISS_ESCALATION_THRESHOLD = 5
 
 
 class StrategyScheduler:
@@ -76,6 +88,7 @@ class StrategyScheduler:
         self._interval = interval_seconds
         self._task: asyncio.Task | None = None
         self._running = False
+        self._consecutive_price_misses: dict[str, int] = {}
 
     async def start(self) -> None:
         """Start the background scheduler loop."""
@@ -127,10 +140,7 @@ class StrategyScheduler:
                     extra={"error": str(exc)},
                 )
 
-        # 2. Aggregate risk (needed for portfolio gate)
-        current_aggregate_risk = await self._get_aggregate_risk(account_balance)
-
-        # 3. Load enabled strategies from DB
+        # 2. Load enabled strategies from DB
         enabled_strategies = await self._load_enabled_strategies()
         if not enabled_strategies:
             return
@@ -140,11 +150,10 @@ class StrategyScheduler:
             extra={
                 "strategy_count": len(enabled_strategies),
                 "account_balance": str(account_balance),
-                "aggregate_risk": str(current_aggregate_risk),
             },
         )
 
-        # 4. Run each (strategy, symbol) pair
+        # 3. Run each (strategy, symbol) pair
         for db_strategy in enabled_strategies:
             type_name = db_strategy.type
             if not self._registry.is_registered(type_name):
@@ -178,7 +187,6 @@ class StrategyScheduler:
                         strategy_id=db_strategy.id,
                         symbol=symbol.upper(),
                         account_balance=account_balance,
-                        current_aggregate_risk=current_aggregate_risk,
                     )
                 except Exception as exc:
                     system_logger.error(
@@ -196,17 +204,25 @@ class StrategyScheduler:
         strategy_id: uuid.UUID,
         symbol: str,
         account_balance: Decimal,
-        current_aggregate_risk: Decimal,
     ) -> None:
         """Run one strategy against one symbol and submit if a signal fires."""
         # Get current price
         current_price = await self._get_current_price(symbol)
         if current_price is None:
-            system_logger.warning(
-                "StrategyScheduler: no price data for symbol — skipping",
-                extra={"symbol": symbol},
+            miss_count = self._consecutive_price_misses.get(symbol, 0) + 1
+            self._consecutive_price_misses[symbol] = miss_count
+            log = (
+                system_logger.error
+                if miss_count >= _CONSECUTIVE_MISS_ESCALATION_THRESHOLD
+                else system_logger.warning
+            )
+            log(
+                "StrategyScheduler: no price data for symbol (cache miss and "
+                "broker fallback failed) — strategy evaluation skipped for this cycle",
+                extra={"symbol": symbol, "consecutive_misses": miss_count},
             )
             return
+        self._consecutive_price_misses.pop(symbol, None)
 
         # Get historical bars
         bars = await self._get_historical_bars(symbol)
@@ -217,11 +233,29 @@ class StrategyScheduler:
             )
             return
 
+        # Some strategies (e.g. BullBearStrategy's regime filter) need bars
+        # for an additional ticker beyond the one being evaluated.
+        extra_bars: dict[str, list[PriceBar]] = {}
+        for extra_symbol in strategy.required_extra_symbols():
+            extra_symbol = extra_symbol.upper()
+            if extra_symbol == symbol:
+                continue
+            fetched = await self._get_historical_bars(extra_symbol)
+            if fetched:
+                extra_bars[extra_symbol] = fetched
+            else:
+                system_logger.warning(
+                    "StrategyScheduler: no historical bars for required extra "
+                    "symbol — strategy will see it as missing",
+                    extra={"symbol": symbol, "extra_symbol": extra_symbol},
+                )
+
         market_data = MarketData(
             symbol=symbol,
             current_price=current_price,
             bars=bars,
             timestamp=datetime.now(UTC),
+            extra_bars=extra_bars,
         )
 
         signal: Signal = await strategy.generate_signal(market_data)
@@ -272,10 +306,7 @@ class StrategyScheduler:
         )
 
         try:
-            await self._order_manager.submit_order(
-                request,
-                current_aggregate_risk=current_aggregate_risk,
-            )
+            await self._order_manager.submit_order(request)
         except Exception as exc:
             trading_logger.warning(
                 "StrategyScheduler: order submission failed",
@@ -289,24 +320,6 @@ class StrategyScheduler:
     # ------------------------------------------------------------------
     # Internal: helpers
     # ------------------------------------------------------------------
-
-    async def _get_aggregate_risk(self, account_balance: Decimal) -> Decimal:
-        """Query current aggregate risk via RiskMonitor."""
-        if account_balance == Decimal("0"):
-            return Decimal("0")
-        try:
-            from app.core.risk.monitor import RiskMonitor
-
-            async with self._session_factory() as session:
-                monitor = RiskMonitor()
-                status = await monitor.check_exposure(session, account_balance)
-                return status.aggregate_risk_amount
-        except Exception as exc:
-            system_logger.warning(
-                "StrategyScheduler: could not fetch aggregate risk",
-                extra={"error": str(exc)},
-            )
-            return Decimal("0")
 
     async def _load_enabled_strategies(self):
         """Return enabled TradingStrategy rows from the DB."""
@@ -325,7 +338,8 @@ class StrategyScheduler:
     async def _get_current_price(self, symbol: str) -> Decimal | None:
         """
         Try Redis price:{symbol} first.
-        Falls back to broker historical data's most recent close.
+        Falls back to the broker's most recent historical close if the cache
+        has no price (feed hasn't published yet, or Redis is briefly down).
         """
         try:
             raw = await self._cache.get(f"price:{symbol}")
@@ -333,8 +347,24 @@ class StrategyScheduler:
                 payload = json.loads(raw)
                 price_val = payload.get("price", payload) if isinstance(payload, dict) else payload
                 return Decimal(str(price_val))
-        except Exception:
-            pass
+        except Exception as exc:
+            system_logger.warning(
+                "StrategyScheduler: Redis price lookup failed — trying broker fallback",
+                extra={"symbol": symbol, "error": str(exc)},
+            )
+
+        try:
+            bars = await self._broker.get_historical_data(
+                symbol, duration="5 D", bar_size="1 day"
+            )
+            if bars:
+                return Decimal(str(bars[-1].close))
+        except Exception as exc:
+            system_logger.warning(
+                "StrategyScheduler: broker price fallback also failed",
+                extra={"symbol": symbol, "error": str(exc)},
+            )
+
         return None
 
     async def _get_historical_bars(self, symbol: str) -> list[PriceBar]:

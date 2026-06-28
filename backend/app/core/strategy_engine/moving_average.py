@@ -14,10 +14,20 @@ assumption). SELL signals will therefore be rejected until short-selling
 support is added to the risk layer. The strategy is correct; the gate will
 open once the risk layer is extended.
 
+Whipsaw/chop filter:
+  A bare MA crossover fires on any margin, including a fraction of a cent
+  in a sideways market — the classic failure mode for crossover systems.
+  `min_separation_pct` (default "0.001" = 0.1%) requires the fast MA to
+  clear the slow MA by at least that fraction of the slow MA's value before
+  a cross counts as tradeable. Set to "0" to restore the original bare
+  crossover behavior.
+
 Config keys:
-    fast_period      int   Moving average period for the fast line (default 50)
-    slow_period      int   Moving average period for the slow line (default 200)
-    stop_loss_pct    str   Stop-loss distance as a decimal fraction (default "0.03" = 3%)
+    fast_period         int   Moving average period for the fast line (default 50)
+    slow_period         int   Moving average period for the slow line (default 200)
+    stop_loss_pct       str   Stop-loss distance as a decimal fraction (default "0.03" = 3%)
+    min_separation_pct  str   Minimum fast/slow MA separation to count a cross
+                              as tradeable (default "0.001" = 0.1%)
 
 Registration:
     This module self-registers with the process-level StrategyRegistry when
@@ -32,6 +42,7 @@ from decimal import ROUND_HALF_UP, Decimal
 
 from app.core.risk.calculator import RiskCalculator
 from app.core.strategy_engine.base import BaseStrategy, MarketData, RiskParams, Signal
+from app.core.strategy_engine.filters import min_separation_ok
 
 _TWO_DP = Decimal("0.01")
 
@@ -50,6 +61,9 @@ class MovingAverageStrategy(BaseStrategy):
         self.fast_period: int = int(config.get("fast_period", 50))
         self.slow_period: int = int(config.get("slow_period", 200))
         self.stop_loss_pct: Decimal = Decimal(str(config.get("stop_loss_pct", "0.03")))
+        self.min_separation_pct: Decimal = Decimal(
+            str(config.get("min_separation_pct", "0.001"))
+        )
         self._calculator = RiskCalculator()
 
         if self.fast_period >= self.slow_period:
@@ -60,6 +74,10 @@ class MovingAverageStrategy(BaseStrategy):
         if self.stop_loss_pct <= Decimal("0") or self.stop_loss_pct >= Decimal("1"):
             raise ValueError(
                 f"stop_loss_pct must be between 0 and 1, got {self.stop_loss_pct}"
+            )
+        if self.min_separation_pct < Decimal("0"):
+            raise ValueError(
+                f"min_separation_pct must be >= 0, got {self.min_separation_pct}"
             )
 
     # ------------------------------------------------------------------
@@ -92,7 +110,11 @@ class MovingAverageStrategy(BaseStrategy):
 
         entry = market_data.current_price
 
-        if fast_prev <= slow_prev and fast_current > slow_current:
+        if (
+            fast_prev <= slow_prev
+            and fast_current > slow_current
+            and min_separation_ok(fast_current, slow_current, self.min_separation_pct)
+        ):
             # Golden cross — BUY
             stop = (entry * (1 - self.stop_loss_pct)).quantize(_TWO_DP, rounding=ROUND_HALF_UP)
             stop_distance = entry - stop
@@ -106,7 +128,11 @@ class MovingAverageStrategy(BaseStrategy):
                 timestamp=market_data.timestamp,
             )
 
-        if fast_prev >= slow_prev and fast_current < slow_current:
+        if (
+            fast_prev >= slow_prev
+            and fast_current < slow_current
+            and min_separation_ok(slow_current, fast_current, self.min_separation_pct)
+        ):
             # Death cross — SELL (short)
             # stop_loss is ABOVE entry for a short position
             stop = (entry * (1 + self.stop_loss_pct)).quantize(_TWO_DP, rounding=ROUND_HALF_UP)
@@ -161,6 +187,15 @@ class MovingAverageStrategy(BaseStrategy):
                     "type": "string",
                     "default": "0.03",
                     "description": "Stop-loss distance as a decimal fraction (e.g. 0.03 = 3%)",
+                },
+                "min_separation_pct": {
+                    "type": "string",
+                    "default": "0.001",
+                    "description": (
+                        "Minimum fast/slow MA separation (as a fraction of the slow MA) "
+                        "required for a crossover to count as tradeable — filters out "
+                        "noise-level crosses in choppy markets. '0' disables the filter."
+                    ),
                 },
                 "symbols": {
                     "type": "array",

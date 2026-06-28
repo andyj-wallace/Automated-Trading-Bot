@@ -23,10 +23,19 @@ NOTE on SELL/short: shorting below the MA is the natural complement, but
 short-selling requires stop_loss_price > entry_price, which the risk engine
 does not yet validate. The SELL direction is omitted pending that gate opening.
 
+Whipsaw/chop filter:
+  A bare price-vs-MA crossover fires on any margin, including a fraction of
+  a cent in a sideways market. `min_separation_pct` (default "0.001" = 0.1%)
+  requires price to clear the MA by at least that fraction of the MA's
+  value before a cross counts as tradeable. Set to "0" to restore the
+  original bare crossover behavior.
+
 Config keys:
-    ma_period      int   Rolling window in bars for the moving average (default 200)
-    stop_loss_pct  str   Stop-loss distance below entry as a fraction (default "0.03")
-    symbols        list  Ticker symbols this strategy trades (default [])
+    ma_period           int   Rolling window in bars for the moving average (default 200)
+    stop_loss_pct       str   Stop-loss distance below entry as a fraction (default "0.03")
+    min_separation_pct  str   Minimum price/MA separation to count a cross as
+                              tradeable (default "0.001" = 0.1%)
+    symbols             list  Ticker symbols this strategy trades (default [])
 
 Registration:
     Self-registers as "stock_trend" when this module is imported.
@@ -41,6 +50,7 @@ from decimal import ROUND_HALF_UP, Decimal
 
 from app.core.risk.calculator import RiskCalculator
 from app.core.strategy_engine.base import BaseStrategy, MarketData, RiskParams, Signal
+from app.core.strategy_engine.filters import min_separation_ok
 
 _TWO_DP = Decimal("0.01")
 
@@ -62,6 +72,9 @@ class StockTrendStrategy(BaseStrategy):
     def __init__(self, config: dict) -> None:
         self.ma_period: int = int(config.get("ma_period", 200))
         self.stop_loss_pct: Decimal = Decimal(str(config.get("stop_loss_pct", "0.03")))
+        self.min_separation_pct: Decimal = Decimal(
+            str(config.get("min_separation_pct", "0.001"))
+        )
         self._calculator = RiskCalculator()
 
         if self.ma_period < 1:
@@ -71,6 +84,10 @@ class StockTrendStrategy(BaseStrategy):
         if self.stop_loss_pct <= Decimal("0") or self.stop_loss_pct >= Decimal("1"):
             raise ValueError(
                 f"stop_loss_pct must be between 0 and 1, got {self.stop_loss_pct}"
+            )
+        if self.min_separation_pct < Decimal("0"):
+            raise ValueError(
+                f"min_separation_pct must be >= 0, got {self.min_separation_pct}"
             )
 
     # ------------------------------------------------------------------
@@ -105,7 +122,11 @@ class StockTrendStrategy(BaseStrategy):
 
         # BUY: price JUST crossed above the MA (first bar of confirmed uptrend)
         # prev_close was at or below the MA; current_close is strictly above it.
-        if prev_close <= ma_prev and current_close > ma_now:
+        if (
+            prev_close <= ma_prev
+            and current_close > ma_now
+            and min_separation_ok(current_close, ma_now, self.min_separation_pct)
+        ):
             entry = market_data.current_price
             stop = (entry * (1 - self.stop_loss_pct)).quantize(
                 _TWO_DP, rounding=ROUND_HALF_UP
@@ -153,6 +174,15 @@ class StockTrendStrategy(BaseStrategy):
                     "description": (
                         "Stop-loss distance below entry as a decimal fraction "
                         "(e.g. '0.03' = 3%)"
+                    ),
+                },
+                "min_separation_pct": {
+                    "type": "string",
+                    "default": "0.001",
+                    "description": (
+                        "Minimum price/MA separation (as a fraction of the MA) required "
+                        "for a crossover to count as tradeable — filters out noise-level "
+                        "crosses in choppy markets. '0' disables the filter."
                     ),
                 },
                 "symbols": {
