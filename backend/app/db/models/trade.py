@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import TIMESTAMP, ForeignKey, Index, Numeric, String, func
+from sqlalchemy import TIMESTAMP, ForeignKey, Index, Integer, Numeric, String, func
 from sqlalchemy.dialects.postgresql import ENUM as PGENUM
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -25,10 +25,22 @@ class TradeStatus(str, enum.Enum):
     CANCELLED = "CANCELLED"  # rejected or cancelled before reaching OPEN
 
 
+# Statuses that still carry risk: the single definition used by the portfolio cap,
+# the risk monitor and the metrics snapshot.
+ACTIVE_RISK_STATUSES = (
+    TradeStatus.PENDING,
+    TradeStatus.SUBMITTED,
+    TradeStatus.OPEN,
+    TradeStatus.CLOSING,
+)
+
+
 class ExitReason(str, enum.Enum):
     STOP_LOSS = "STOP_LOSS"
     TAKE_PROFIT = "TAKE_PROFIT"
     MANUAL = "MANUAL"
+    STALE_TIMEOUT = "STALE_TIMEOUT"
+    EXTERNAL = "EXTERNAL"  # closed outside the app, found by the reconciler
 
 
 class Trade(Base):
@@ -97,6 +109,22 @@ class Trade(Base):
         Numeric(precision=18, scale=8), nullable=False
     )
     pnl: Mapped[Decimal | None] = mapped_column(Numeric(precision=18, scale=8), nullable=True)
+    # Execution facts (task C1): recorded separately so the audit columns stay untouched.
+    entry_order_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    entry_fill_price: Mapped[Decimal | None] = mapped_column(
+        Numeric(precision=18, scale=8), nullable=True
+    )
+    filled_quantity: Mapped[Decimal | None] = mapped_column(
+        Numeric(precision=18, scale=8), nullable=True
+    )
+    exit_order_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    stop_order_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    current_stop_price: Mapped[Decimal | None] = mapped_column(
+        Numeric(precision=18, scale=8), nullable=True
+    )
+    close_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     executed_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )

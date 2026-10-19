@@ -406,7 +406,7 @@ class FakeTradeRepo:
     def __init__(self, trades: list[FakeTrade]) -> None:
         self._trades = trades
 
-    async def get_open_trades(self):
+    async def get_active_trades(self):
         return self._trades
 
 

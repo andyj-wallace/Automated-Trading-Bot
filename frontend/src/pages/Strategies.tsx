@@ -16,12 +16,14 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { useState } from "react";
+import { NewStrategyDialog } from "../components/strategies/NewStrategyDialog";
 import { StrategyConfigForm } from "../components/strategies/StrategyConfigForm";
 import { StrategyPerformanceChart } from "../components/strategies/StrategyPerformanceChart";
 import { api } from "../api/client";
 import type { Strategy, StrategyPatch, WatchedSymbol } from "../types/api";
 
 export function Strategies() {
+  const [creating, setCreating] = useState(false);
   const { data: strategies = [], isLoading } = useQuery({
     queryKey: ["strategies"],
     queryFn: async () => {
@@ -40,10 +42,21 @@ export function Strategies() {
 
   return (
     <div className="p-8 max-w-4xl">
-      <h1 className="text-2xl font-bold text-white mb-1">Strategies</h1>
-      <p className="text-gray-500 text-sm mb-8">
-        Enable / disable · configure parameters · assign symbols
-      </p>
+      <div className="flex items-start justify-between mb-8">
+        <div>
+          <h1 className="text-2xl font-bold text-white mb-1">Strategies</h1>
+          <p className="text-gray-500 text-sm">
+            Enable / disable · configure parameters · assign symbols
+          </p>
+        </div>
+        <button
+          onClick={() => setCreating(true)}
+          className="px-3 py-1.5 text-sm font-medium bg-blue-600 hover:bg-blue-700 text-white rounded"
+        >
+          New strategy
+        </button>
+      </div>
+      {creating && <NewStrategyDialog symbols={symbols} onClose={() => setCreating(false)} />}
 
       {isLoading && (
         <p className="text-xs text-gray-600">Loading strategies…</p>
@@ -53,7 +66,7 @@ export function Strategies() {
         <div className="rounded-lg border border-dashed border-gray-700 bg-gray-900/50 p-12 text-center">
           <p className="text-gray-500 text-sm">No strategies registered</p>
           <p className="text-gray-600 text-xs mt-1">
-            Strategies appear here once registered with the backend registry.
+            Use "New strategy" to create one.
           </p>
         </div>
       )}

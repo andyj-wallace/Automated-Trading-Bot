@@ -97,18 +97,10 @@ def map_position(ib_position: IBPosition) -> Position:
 # OrderResult
 # ---------------------------------------------------------------------------
 
-# Maps IBKR order status strings to our internal status literals.
 # Full IBKR status reference:
 # https://ibkrcampus.com/ibkr-api-page/trader-workstation-api/#order-status
-_STATUS_MAP: dict[str, str] = {
-    "Filled": "FILLED",
-    "PartiallyFilled": "PARTIAL",
-    "Cancelled": "REJECTED",
-    "ApiCancelled": "REJECTED",
-    "Inactive": "REJECTED",
-    "Submitted": "PARTIAL",  # acknowledged but not yet filled
-    "PreSubmitted": "PARTIAL",
-}
+_WORKING = {"PendingSubmit", "PreSubmitted", "Submitted", "ApiPending", "PendingCancel"}
+_CANCELLED = {"Cancelled", "ApiCancelled", "Inactive"}
 
 
 def map_price_bar(bar: BarData, bar_size: str) -> PriceBar:
@@ -146,19 +138,21 @@ def map_price_bar(bar: BarData, bar_size: str) -> PriceBar:
 
 
 def map_order_result(trade_id: UUID, trade: Trade) -> OrderResult:
-    """
-    Map an ib_async Trade object to the internal OrderResult model.
-
-    Called after the order is done (filled, cancelled, or errored).
-    """
-    order_status = trade.orderStatus.status
-    status = _STATUS_MAP.get(order_status, "ERROR")
-
+    """Map an ib_async Trade to OrderResult at whatever state the order is in right now."""
+    status = trade.orderStatus.status
     fill = trade.orderStatus
     avg_price = _to_decimal(str(fill.avgFillPrice) if fill.avgFillPrice else None)
     filled_qty = _to_decimal(str(fill.filled) if fill.filled else None)
 
-    # Collect any error messages from the trade log
+    if status == "Filled":
+        mapped = "FILLED"
+    elif status in _CANCELLED:
+        mapped = "PARTIAL" if filled_qty > 0 else "REJECTED"
+    elif status in _WORKING:
+        mapped = "PARTIAL" if filled_qty > 0 else "WORKING"
+    else:
+        mapped = "ERROR"
+
     error_message: str | None = None
     if trade.log:
         errors = [
@@ -172,9 +166,38 @@ def map_order_result(trade_id: UUID, trade: Trade) -> OrderResult:
     return OrderResult(
         trade_id=trade_id,
         broker_order_id=str(trade.order.orderId),
-        status=status,  # type: ignore[arg-type]
+        status=mapped,  # type: ignore[arg-type]
         filled_quantity=filled_qty,
         avg_fill_price=avg_price,
+        order_ref=trade.order.orderRef or "",
         error_message=error_message,
+        timestamp=datetime.now(dt.UTC),
+    )
+
+
+def trade_id_from_ref(order_ref: str) -> UUID:
+    """Order refs look like "<trade uuid>:<entry|exit|stop>"."""
+    return UUID(order_ref.split(":")[0])
+
+
+def summarize_fills(order_ref: str, fills: list) -> OrderResult | None:
+    """Aggregate ib_async Fill objects with this orderRef into one FILLED OrderResult."""
+    matching = [f for f in fills if f.execution.orderRef == order_ref]
+    if not matching:
+        return None
+    total = sum((_to_decimal(str(f.execution.shares)) for f in matching), Decimal("0"))
+    if total <= 0:
+        return None
+    notional = sum(
+        (_to_decimal(str(f.execution.shares)) * _to_decimal(str(f.execution.price)) for f in matching),
+        Decimal("0"),
+    )
+    return OrderResult(
+        trade_id=trade_id_from_ref(order_ref),
+        broker_order_id=str(matching[-1].execution.orderId),
+        status="FILLED",
+        filled_quantity=total,
+        avg_fill_price=notional / total,
+        order_ref=order_ref,
         timestamp=datetime.now(dt.UTC),
     )

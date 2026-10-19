@@ -16,7 +16,7 @@ The original `ib_insync` library is **no longer maintained**. Its author, Ewald 
 - Import path changes from `from ib_insync import IB` → `from ib_async import IB`
 - API surface is intentionally compatible — method names and behavior are preserved
 - TWS/Gateway version requirement: 1023 or higher (unchanged)
-- Default ports: 7497 (TWS), 4001 (Gateway)
+- Default ports: 7497 (TWS), 4002 paper / 4001 live (Gateway)
 
 All task references to `ib_insync` below mean `ib_async`.
 
@@ -578,3 +578,9 @@ Extends the existing `BacktestingEngine` to run multiple strategies across multi
 | 18 | Expansion | 6 |
 | — | Backlog | 7 |
 | **Total** | | **107** |
+
+---
+
+## Phase 7 - Production readiness
+
+See `production-readiness-plan.md` (the active work: make the live loop work, make it safe, ship it). Deployment runbook: `DEPLOYMENT.md`.

@@ -305,3 +305,54 @@ Solution: Robust error handling and recovery procedures
 ### 7.5 API Integration
 Challenge: Managing multiple broker APIs
 Solution: Abstract broker interface design
+
+
+### 8. Hardening
+Review complete — sweep found nothing new beyond the verified list. Here are the findings, most severe first:
+
+Correctness bugs (real, fix these):
+
+backend/app/core/risk/circuit_breaker.py — record_closed_trade() mutates _daily_realized_pnl, _halted_today, and per-strategy consecutive_losses with no lock. Two trades closing concurrently (e.g. price-hit close + stale-sweep close firing near-simultaneously) can lose a PnL update or skip a halt. Ironic since this commit's whole point was closing a race condition — it introduced a new one in the safety mechanism that replaced it.
+backend/app/core/execution/order_manager.py close_position() — every failure path (trade not found, wrong status, broker close fails after retries, broker rejects the close) returns without calling CircuitBreaker.record_closed_trade(). A losing trade that fails to close cleanly never reaches the halt logic, and is left stuck at CLOSING with no further attempts.
+backend/app/core/execution/position_monitor.py — asyncio.create_task(self._close(...)) (price-hit path and stale-sweep path) is fire-and-forget; stop() cancels the sweep loop but never tracks/awaits/cancels these spawned tasks, so they can touch torn-down DB resources during shutdown.
+position_monitor.py trade_executed handler — requires entry_price/stop/take-profit all present or it silently skips tracking (no monitoring, no alert escalation, no reconciliation sweep to catch an open-but-untracked trade later). Plausible gap on partial fills or payload issues, not confirmed to trigger in normal operation.
+Cleanup / efficiency (lower priority):
+
+order_manager.py — DB query (get_active_trades) runs inside _submission_lock on every order, serializing all submissions through one DB round-trip. Fine at current scale; a hung DB connection would freeze all order flow.
+min_separation_pct config/validation/schema is copy-pasted near-identically across moving_average.py, stock_trend.py, bull_bear.py instead of centralized.
+order_manager.py retry/backoff re-implements a pattern the IBKR client already has for reconnects — two independent retry layers against different failure modes.
+scheduler.py fetches required_extra_symbols bars sequentially per symbol instead of asyncio.gather.
+circuit_breaker.py — a break-even close (pnl == 0) resets consecutive_losses to 0, treating break-even as a win (debatable, not necessarily wrong).
+filters.py::min_separation_ok returns True (passes the filter) when the slower MA is <= 0 — silently accepts a degenerate value instead of flagging it.
+composite.py — combined signal can inherit None stop_loss_price if all agreeing sub-signals lack one, wasting a validate-and-reject round trip at RiskManager Gate 1.
+risk/monitor.py check_exposure() counts only OPEN trades while OrderManager's actual cap counts PENDING+SUBMITTED+OPEN — dashboard can under-report real exposure vs. the enforced cap.
+composite.py majority-vote counts actions then re-filters in a second pass instead of building the result in one loop.
+Now let me set up the todo list to track the hardening work.
+
+Update Todos
+
+Fix CircuitBreaker.record_closed_trade() race condition (no lock on _daily_realized_pnl/_halted_today/consecutive_losses)
+
+Make close_position() notify CircuitBreaker on every failure path (not-found, wrong status, broker close failure/rejection), and resolve stuck CLOSING trades
+
+Track and cancel/await PositionMonitor's fire-and-forget _close() tasks during stop() shutdown
+
+Add reconciliation/alerting for trade_executed events that are silently skipped (missing entry_price/stop/take-profit)
+
+Review DB query inside OrderManager._submission_lock for timeout/contention risk under load
+
+Centralize min_separation_pct config/validation/schema shared by moving_average/stock_trend/bull_bear strategies
+
+Reconcile OrderManager's duplicate retry/backoff with IBKR client's existing reconnect backoff
+
+Parallelize scheduler's sequential required_extra_symbols bar fetches with asyncio.gather
+
+Decide whether break-even (pnl==0) closes should reset CircuitBreaker consecutive_losses streak
+
+Fix filters.min_separation_ok to not silently pass when the slower MA is <= 0
+
+Prevent composite.py from combining signals into a None stop_loss_price
+
+Align RiskMonitor.check_exposure() to count PENDING+SUBMITTED+OPEN like OrderManager's actual cap
+
+Simplify composite.py majority-vote to single-pass count+filter

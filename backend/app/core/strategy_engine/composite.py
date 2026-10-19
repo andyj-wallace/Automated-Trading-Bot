@@ -147,7 +147,8 @@ class CompositeStrategy(BaseStrategy):
         """Delegates to the first (primary) sub-strategy."""
         return await self._strategies[0].calculate_position_size(risk_params)
 
-    def get_config_schema(self) -> dict:
+    @classmethod
+    def get_config_schema(cls) -> dict:
         """JSON Schema for the composite strategy configuration."""
         return {
             "type": "object",

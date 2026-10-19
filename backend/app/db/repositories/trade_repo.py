@@ -11,13 +11,14 @@ backward movement allowed is to CANCELLED (from PENDING or SUBMITTED).
 """
 
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models.trade import ExitReason, Trade, TradeDirection, TradeStatus
+from app.db.models.trade import ACTIVE_RISK_STATUSES, ExitReason, Trade, TradeDirection, TradeStatus
 
 
 class TradeRepo:
@@ -92,8 +93,8 @@ class TradeRepo:
 
     async def get_active_trades(self) -> list[Trade]:
         """
-        Return all trades not yet in a terminal state: PENDING, SUBMITTED, or
-        OPEN. Used by OrderManager to compute aggregate portfolio risk for
+        Return all trades not yet in a terminal state: PENDING, SUBMITTED,
+        OPEN, or CLOSING. Used by OrderManager to compute aggregate portfolio risk for
         the Gate 4 cap — a trade's risk_amount must count immediately on
         creation (PENDING), not only once the broker confirms a fill (OPEN),
         otherwise two trades submitted back-to-back can both pass the cap
@@ -102,14 +103,24 @@ class TradeRepo:
         stmt = (
             select(Trade)
             .where(
-                Trade.status.in_(
-                    (TradeStatus.PENDING, TradeStatus.SUBMITTED, TradeStatus.OPEN)
-                )
+                Trade.status.in_(ACTIVE_RISK_STATUSES)
             )
             .order_by(Trade.executed_at)
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
+
+    async def has_active_trade(self, symbol: str) -> bool:
+        """True if the symbol has a PENDING, SUBMITTED, OPEN or CLOSING trade."""
+        stmt = (
+            select(Trade.id)
+            .where(
+                Trade.symbol == symbol.upper(),
+                Trade.status.in_(ACTIVE_RISK_STATUSES),
+            )
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).first() is not None
 
     async def list(
         self,
@@ -200,3 +211,185 @@ class TradeRepo:
         await self.session.flush()
         await self.session.refresh(trade)
         return trade
+
+    async def set_entry_order(self, trade_id: uuid.UUID, order_id: str) -> None:
+        """Record the broker order id of the entry order."""
+        await self.session.execute(
+            update(Trade).where(Trade.id == trade_id).values(entry_order_id=order_id)
+        )
+
+    async def set_stop_order(
+        self,
+        trade_id: uuid.UUID,
+        order_id: str | None,
+        stop_price: Decimal | None = None,
+    ) -> None:
+        """Record (or clear, with None) the protective stop order id and its price."""
+        values: dict = {"stop_order_id": order_id}
+        if stop_price is not None:
+            values["current_stop_price"] = stop_price
+        await self.session.execute(update(Trade).where(Trade.id == trade_id).values(**values))
+
+    async def set_exit_order(self, trade_id: uuid.UUID, order_id: str) -> None:
+        """Record the broker order id of the exit order."""
+        await self.session.execute(
+            update(Trade).where(Trade.id == trade_id).values(exit_order_id=order_id)
+        )
+
+    async def record_entry_fill(
+        self,
+        trade_id: uuid.UUID,
+        order_id: str,
+        fill_price: Decimal,
+        filled_qty: Decimal,
+    ) -> Trade | None:
+        """Persist the entry fill separately from the audit-immutable columns."""
+        stmt = (
+            update(Trade)
+            .where(Trade.id == trade_id)
+            .values(
+                entry_order_id=order_id,
+                entry_fill_price=fill_price,
+                filled_quantity=filled_qty,
+            )
+            .returning(Trade)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def begin_close(
+        self,
+        trade_id: uuid.UUID,
+        exit_reason: ExitReason,
+        *,
+        allow_from_closing: bool = False,
+    ) -> Trade | None:
+        """Atomically move OPEN (or CLOSING when allowed) to CLOSING; None if not eligible."""
+        allowed = (
+            (TradeStatus.OPEN, TradeStatus.CLOSING)
+            if allow_from_closing
+            else (TradeStatus.OPEN,)
+        )
+        stmt = (
+            update(Trade)
+            .where(Trade.id == trade_id, Trade.status.in_(allowed))
+            .values(
+                status=TradeStatus.CLOSING,
+                exit_reason=exit_reason,
+                close_attempts=Trade.close_attempts + 1,
+            )
+            .returning(Trade)
+            .execution_options(populate_existing=True)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def finish_close(
+        self,
+        trade_id: uuid.UUID,
+        exit_price: Decimal,
+        pnl: Decimal,
+        exit_order_id: str | None,
+        closed_at: datetime | None = None,
+        exit_reason: ExitReason | None = None,
+    ) -> Trade | None:
+        """Atomically move CLOSING to CLOSED; None if the trade was not CLOSING."""
+        values: dict = {
+            "status": TradeStatus.CLOSED,
+            "exit_price": exit_price,
+            "pnl": pnl,
+            "closed_at": closed_at or datetime.now(UTC),
+        }
+        if exit_order_id is not None:
+            values["exit_order_id"] = exit_order_id
+        if exit_reason is not None:
+            values["exit_reason"] = exit_reason
+        stmt = (
+            update(Trade)
+            .where(Trade.id == trade_id, Trade.status == TradeStatus.CLOSING)
+            .values(**values)
+            .returning(Trade)
+            .execution_options(populate_existing=True)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def open_from_fill(
+        self,
+        trade_id: uuid.UUID,
+        order_id: str,
+        fill_price: Decimal,
+        filled_qty: Decimal,
+    ) -> Trade | None:
+        """Atomically move PENDING/SUBMITTED to OPEN with the fill; None if already moved on."""
+        stmt = (
+            update(Trade)
+            .where(
+                Trade.id == trade_id,
+                Trade.status.in_((TradeStatus.PENDING, TradeStatus.SUBMITTED)),
+            )
+            .values(
+                status=TradeStatus.OPEN,
+                entry_order_id=order_id,
+                entry_fill_price=fill_price,
+                filled_quantity=filled_qty,
+            )
+            .returning(Trade)
+            .execution_options(populate_existing=True)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def cancel_if_unfilled(self, trade_id: uuid.UUID) -> Trade | None:
+        """Atomically move PENDING/SUBMITTED to CANCELLED; None if the trade moved on."""
+        stmt = (
+            update(Trade)
+            .where(
+                Trade.id == trade_id,
+                Trade.status.in_((TradeStatus.PENDING, TradeStatus.SUBMITTED)),
+            )
+            .values(status=TradeStatus.CANCELLED)
+            .returning(Trade)
+            .execution_options(populate_existing=True)
+        )
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def closed_since(self, start: datetime) -> Sequence[Trade]:
+        """CLOSED trades with closed_at >= start (used to rebuild the circuit breaker)."""
+        stmt = (
+            select(Trade)
+            .where(Trade.status == TradeStatus.CLOSED, Trade.closed_at >= start)
+            .order_by(Trade.closed_at)
+        )
+        return tuple((await self.session.execute(stmt)).scalars().all())
+
+    async def opened_since(self, start: datetime) -> Sequence[Trade]:
+        """Trades created at or after `start` that reached the broker (not CANCELLED)."""
+        stmt = (
+            select(Trade)
+            .where(Trade.executed_at >= start, Trade.status != TradeStatus.CANCELLED)
+            .order_by(Trade.executed_at)
+        )
+        return tuple((await self.session.execute(stmt)).scalars().all())
+
+    async def recent_pnls_by_strategy(self, limit: int) -> dict[uuid.UUID, Sequence[Decimal]]:
+        """Each strategy's last `limit` closed-trade PnLs, newest first."""
+        ids = (
+            await self.session.execute(
+                select(Trade.strategy_id)
+                .where(Trade.status == TradeStatus.CLOSED, Trade.strategy_id.is_not(None))
+                .distinct()
+            )
+        ).scalars().all()
+        result: dict[uuid.UUID, Sequence[Decimal]] = {}
+        for strategy_id in ids:
+            rows = (
+                await self.session.execute(
+                    select(Trade.pnl)
+                    .where(
+                        Trade.status == TradeStatus.CLOSED,
+                        Trade.strategy_id == strategy_id,
+                        Trade.pnl.is_not(None),
+                    )
+                    .order_by(Trade.closed_at.desc())
+                    .limit(limit)
+                )
+            ).scalars().all()
+            result[strategy_id] = tuple(rows)
+        return result

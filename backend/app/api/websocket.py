@@ -3,19 +3,20 @@ WebSocket endpoint for real-time dashboard updates.
 
 WS /ws/dashboard
 
-Multiplexes three Redis pub/sub channels over a single WebSocket connection:
+Multiplexes four Redis pub/sub channels over a single WebSocket connection:
 
   Channel            Publisher              Consumer
   -----------------  ---------------------  --------------------
   trade_events       TradeHandler           ActiveTradesTable
   risk_updates       RiskMonitor (Layer 14) RiskGauge
   watchlist_prices   MarketDataFeed         WatchlistPanel
+  system_alerts      publish_system_alert   alerts feed
 
 Each forwarded message is already a JSON string — publishers are responsible
 for serialisation before calling redis.publish(). The WebSocket handler is a
 thin forwarder only; no transformation is applied here.
 
-When the client disconnects, all three subscription tasks are cancelled.
+When the client disconnects, all subscription tasks are cancelled.
 The RedisCache.subscribe() generator's finally-block unsubscribes and closes
 the pubsub connection automatically on cancellation.
 """
@@ -29,7 +30,7 @@ from app.dependencies import get_cache
 
 router = APIRouter()
 
-_DASHBOARD_CHANNELS = ("trade_events", "risk_updates", "watchlist_prices")
+_DASHBOARD_CHANNELS = ("trade_events", "risk_updates", "watchlist_prices", "system_alerts")
 
 
 @router.websocket("/ws/dashboard")

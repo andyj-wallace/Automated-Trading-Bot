@@ -1,73 +1,79 @@
 """
 MarketDataFeed — manages live price subscriptions for all active watched symbols.
 
-On startup, loads all active symbols from the database and subscribes to the
-broker's price feed. Each tick is:
-  1. Written to Redis as  price:{ticker}  (latest price cache, no TTL)
-  2. Published to Redis channel  watchlist_prices  (for the WebSocket handler)
-
-Symbols can be added or removed dynamically without restarting the feed.
-
-Depends on: BaseBroker (Layer 4), RedisCache (Layer 5.1), SymbolRepo (Layer 3).
+sync() subscribes the broker's price feed to every symbol the bot needs. Each tick:
+  1. Goes to in-process listeners first (PositionMonitor)
+  2. Is written to Redis as  price:{ticker}  (latest price cache, no TTL)
+  3. Is published as a price_update envelope on  watchlist_prices  (WebSocket)
 """
 
 from __future__ import annotations
 
-from sqlalchemy.ext.asyncio import AsyncSession
+import json
+from collections.abc import Awaitable, Callable
+from datetime import datetime
 
 from app.brokers.base import BaseBroker, PriceUpdate
+from app.core.events import WATCHLIST_PRICES, envelope
 from app.data.cache import RedisCache
+from app.db.repositories.strategy_repo import StrategyRepo
 from app.db.repositories.symbol_repo import SymbolRepo
+from app.db.repositories.trade_repo import TradeRepo
 from app.monitoring.logger import system_logger
 
 # Redis key format for the latest price of a ticker
 _PRICE_KEY = "price:{ticker}"
 
 # Redis pub/sub channel for live price updates (consumed by WebSocket handler)
-WATCHLIST_PRICES_CHANNEL = "watchlist_prices"
+WATCHLIST_PRICES_CHANNEL = WATCHLIST_PRICES
+
+PriceListener = Callable[[PriceUpdate], Awaitable[None]]
 
 
 class MarketDataFeed:
     """
-    Subscribes to live price ticks for all active watched symbols and
-    forwards them to Redis.
+    Subscribes to live price ticks for every symbol the bot needs and forwards
+    them to in-process listeners and Redis.
 
-    Lifecycle:
-        feed = MarketDataFeed(broker, cache)
-        await feed.start(session)          # subscribe to initial symbols
-        await feed.add_symbol("TSLA")      # dynamic add (no restart needed)
-        await feed.remove_symbol("TSLA")   # dynamic remove
+    Desired symbols = active watchlist + symbols of enabled strategies +
+    symbols with an active trade. sync() reconciles subscriptions to that set.
     """
 
-    def __init__(self, broker: BaseBroker, cache: RedisCache) -> None:
+    def __init__(self, broker: BaseBroker, cache: RedisCache, session_factory) -> None:
         self._broker = broker
         self._cache = cache
+        self._session_factory = session_factory
         self._subscribed: set[str] = set()
+        self._listeners: list[PriceListener] = []
+        self._last_tick_at: dict[str, datetime] = {}
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    def add_listener(self, fn: PriceListener) -> None:
+        """Register an in-process price listener; called before any Redis write."""
+        self._listeners.append(fn)
 
-    async def start(self, session: AsyncSession) -> None:
-        """
-        Load all active symbols from the DB and subscribe to the price feed.
+    def last_tick_at(self, symbol: str) -> datetime | None:
+        return self._last_tick_at.get(symbol.upper())
 
-        Call once at application startup (after broker is connected).
-        Idempotent: already-subscribed tickers are skipped.
-        """
-        repo = SymbolRepo(session)
-        symbols = await repo.get_all(active_only=True)
-        tickers = [s.ticker for s in symbols if s.ticker not in self._subscribed]
+    async def desired_symbols(self) -> set[str]:
+        async with self._session_factory() as session:
+            watchlist = await SymbolRepo(session).get_all(active_only=True)
+            strategies = await StrategyRepo(session).get_enabled()
+            active = await TradeRepo(session).get_active_trades()
+        symbols = {s.ticker.upper() for s in watchlist}
+        for strategy in strategies:
+            symbols.update(str(sym).upper() for sym in (strategy.config or {}).get("symbols", []))
+        symbols.update(t.symbol.upper() for t in active)
+        return symbols
 
-        if tickers:
-            await self._broker.subscribe_price_feed(tickers, self._on_price_update)
-            self._subscribed.update(tickers)
-            system_logger.info(
-                "MarketDataFeed started",
-                extra={"tickers": tickers, "count": len(tickers)},
-            )
-        else:
-            system_logger.info("MarketDataFeed started with no active symbols")
+    async def sync(self) -> None:
+        """Subscribe new desired symbols and unsubscribe ones no longer needed."""
+        if not self._broker.is_connected():
+            return
+        desired = await self.desired_symbols()
+        for ticker in sorted(desired - self._subscribed):
+            await self.add_symbol(ticker)
+        for ticker in sorted(self._subscribed - desired):
+            await self.remove_symbol(ticker)
 
     # ------------------------------------------------------------------
     # Dynamic symbol management
@@ -112,18 +118,33 @@ class MarketDataFeed:
 
     async def _on_price_update(self, update: PriceUpdate) -> None:
         """
-        Called for every incoming price tick.
-
-        Writes to Redis key-value store and publishes to pub/sub channel.
-        Errors are logged but never propagated — a single bad tick must not
-        crash the feed.
+        Handle one tick: in-process listeners first, then the Redis key and
+        the price_update envelope. Failures are logged, never propagated.
         """
+        symbol = update.ticker.upper()
+        self._last_tick_at[symbol] = update.timestamp
+        for listener in self._listeners:
+            try:
+                await listener(update)
+            except Exception:
+                system_logger.exception("MarketDataFeed: listener failed", extra={"ticker": symbol})
         try:
-            message = update.model_dump_json()
-            await self._cache.set(_PRICE_KEY.format(ticker=update.ticker), message)
-            await self._cache.publish(WATCHLIST_PRICES_CHANNEL, message)
+            await self._cache.set(
+                _PRICE_KEY.format(ticker=symbol),
+                json.dumps(
+                    {"price": str(update.price), "timestamp": update.timestamp.isoformat()}
+                ),
+            )
+            change = str(update.day_change_pct) if update.day_change_pct is not None else None
+            await self._cache.publish(
+                WATCHLIST_PRICES,
+                envelope(
+                    "price_update",
+                    {"symbol": symbol, "price": str(update.price), "change_pct": change},
+                ),
+            )
         except Exception as exc:
             system_logger.error(
                 "MarketDataFeed: failed to forward price update",
-                extra={"ticker": update.ticker, "error": str(exc)},
+                extra={"ticker": symbol, "error": str(exc)},
             )

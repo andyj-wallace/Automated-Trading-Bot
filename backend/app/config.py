@@ -1,5 +1,8 @@
+from datetime import time
+from decimal import Decimal
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,7 +26,7 @@ class Settings(BaseSettings):
 
     # IBKR
     ibkr_host: str = "127.0.0.1"
-    ibkr_port: int = 4001
+    ibkr_port: int = 4002
     ibkr_client_id: int = 1
     ibkr_username: str = ""
     ibkr_password: str = ""
@@ -55,6 +58,37 @@ class Settings(BaseSettings):
 
     # VNC (cloud deployment only)
     vnc_password: str = ""
+
+    # Trading engine
+    engine_enabled: bool = True
+    log_dir: str = "logs"
+    cors_origins: list[str] = ["http://localhost:5173"]  # env value is JSON: '["https://x"]'
+    scheduler_interval_seconds: int = 60
+    strategy_eval_start_et: time = time(9, 45)
+    strategy_eval_end_et: time = time(15, 45)
+    bar_refresh_time_et: time = time(16, 30)
+    daily_summary_time_et: time = time(16, 45)
+    price_stale_seconds: int = 120
+
+    # Risk. The 1% per-trade rule is deliberately NOT a setting.
+    max_portfolio_risk_pct: Decimal = Decimal("0.05")
+    min_reward_to_risk: Decimal = Decimal("2.0")
+    daily_loss_limit_pct: Decimal = Decimal("0.03")
+    max_consecutive_losses: int = 5
+    stale_trade_max_days: int = 14
+
+    # Execution / broker
+    order_fill_timeout_seconds: int = 30
+    broker_protective_stops: bool = True
+    reconcile_interval_seconds: float = 120
+    ibkr_market_data_type: int = 1  # 1 live, 3 delayed (paper only)
+
+    @field_validator("max_portfolio_risk_pct")
+    @classmethod
+    def _cap_portfolio_risk(cls, value: Decimal) -> Decimal:
+        if value <= 0 or value > Decimal("0.10"):
+            raise ValueError("max_portfolio_risk_pct must be > 0 and <= 0.10")
+        return value
 
     @property
     def is_development(self) -> bool:

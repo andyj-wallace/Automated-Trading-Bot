@@ -45,18 +45,21 @@ class OrderRequest(BaseModel):
     symbol: str
     direction: Literal["BUY", "SELL"]
     quantity: Decimal
-    order_type: Literal["MKT", "LMT"] = "MKT"
+    order_type: Literal["MKT", "LMT", "STP"] = "MKT"
     limit_price: Decimal | None = None
-    stop_loss_price: Decimal | None = None  # set when submit_stop_to_broker=True; None for close orders
+    stop_price: Decimal | None = None
+    tif: Literal["DAY", "GTC"] = "DAY"
+    order_ref: str = ""
     strategy_id: UUID | None = None
 
 
 class OrderResult(BaseModel):
     trade_id: UUID
     broker_order_id: str
-    status: Literal["FILLED", "PARTIAL", "REJECTED", "ERROR"]
+    status: Literal["FILLED", "PARTIAL", "WORKING", "REJECTED", "ERROR"]
     filled_quantity: Decimal
     avg_fill_price: Decimal
+    order_ref: str = ""
     error_message: str | None = None
     timestamp: datetime
 
@@ -142,6 +145,17 @@ class BaseBroker(ABC):
         """
         Cancel a pending order by broker order ID.
         Returns True if the cancellation was accepted.
+        """
+
+    @abstractmethod
+    async def find_order_by_ref(self, order_ref: str) -> OrderResult | None:
+        """State of the latest order carrying this order_ref, or None if the broker has none."""
+
+    @abstractmethod
+    async def get_execution_summary(self, order_ref: str) -> OrderResult | None:
+        """
+        All fills carrying this order_ref aggregated into one FILLED result
+        (total shares, volume-weighted price), or None if there are no fills.
         """
 
     @abstractmethod

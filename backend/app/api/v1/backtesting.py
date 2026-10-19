@@ -317,7 +317,15 @@ async def get_backtest_result(job_id: uuid.UUID) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+_backtest_slot = asyncio.Semaphore(1)
+
+
 async def _run_job(job: _Job, bars) -> None:
+    async with _backtest_slot:
+        await _run_job_locked(job, bars)
+
+
+async def _run_job_locked(job: _Job, bars) -> None:
     job.status = "running"
     job.started_at = datetime.now(UTC)
 
@@ -328,12 +336,15 @@ async def _run_job(job: _Job, bars) -> None:
         risk_manager = RiskManager()
         engine = BacktestingEngine(strategy, risk_manager)
 
-        result = await engine.run(
-            bars=bars,
-            symbol=job.request.symbol.upper(),
-            account_balance=Decimal(job.request.account_balance),
-            strategy_type=job.request.strategy_type,
-            strategy_config=job.request.strategy_config,
+        result = await asyncio.to_thread(
+            asyncio.run,
+            engine.run(
+                bars=bars,
+                symbol=job.request.symbol.upper(),
+                account_balance=Decimal(job.request.account_balance),
+                strategy_type=job.request.strategy_type,
+                strategy_config=job.request.strategy_config,
+            ),
         )
         job.result = result
         job.status = "done"
@@ -345,6 +356,16 @@ async def _run_job(job: _Job, bars) -> None:
 
 
 async def _run_portfolio_job(
+    job: _Job,
+    slot_requests: list[PortfolioSlotRequest],
+    bars_by_slot: list[list[PriceBar]],
+    account_balance_str: str,
+) -> None:
+    async with _backtest_slot:
+        await _run_portfolio_job_locked(job, slot_requests, bars_by_slot, account_balance_str)
+
+
+async def _run_portfolio_job_locked(
     job: _Job,
     slot_requests: list[PortfolioSlotRequest],
     bars_by_slot: list[list[PriceBar]],
@@ -365,7 +386,10 @@ async def _run_portfolio_job(
             for sr, bars in zip(slot_requests, bars_by_slot, strict=False)
         ]
         engine = PortfolioBacktestEngine(RiskManager())
-        result = await engine.run(slots, account_balance=Decimal(account_balance_str))
+        result = await asyncio.to_thread(
+            asyncio.run,
+            engine.run(slots, account_balance=Decimal(account_balance_str)),
+        )
         job.portfolio_result = result
         job.status = "done"
     except Exception as exc:

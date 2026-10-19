@@ -251,3 +251,37 @@ async def test_trade_closed_negative_pnl_sign() -> None:
 
     await d.notify_trade_closed(symbol="AAPL", reason="STOP_LOSS", exit_price="145", pnl="-25.00")
     assert subjects and "$-25.00" in subjects[0]
+
+
+@pytest.mark.asyncio
+async def test_system_alert_throttled_per_type_and_symbol() -> None:
+    clock = [0.0]
+    d = NotificationDispatcher(_Settings(), monotonic=lambda: clock[0])
+    sent: list[dict] = []
+
+    async def _fake(*args, **kwargs):
+        sent.append(kwargs)
+
+    d.notify_system_alert = _fake  # type: ignore[method-assign]
+    event = {"event": "system_alert", "payload": {"alert_type": "X", "message": "m", "symbol": "AAPL"}}
+    other = {"event": "system_alert", "payload": {"alert_type": "X", "message": "m", "symbol": "MSFT"}}
+    await d.dispatch(event)
+    clock[0] = 600
+    await d.dispatch(event)
+    await d.dispatch(other)
+    assert len(sent) == 2
+    clock[0] = 901
+    await d.dispatch(event)
+    assert len(sent) == 3
+
+
+@pytest.mark.asyncio
+async def test_info_system_alert_is_email_only() -> None:
+    d = NotificationDispatcher(_Settings())
+    d._send = AsyncMock()  # type: ignore[method-assign]
+    d._send_sms = AsyncMock()  # type: ignore[method-assign]
+    await d.notify_system_alert("BROKER_RECONNECTED", "back", severity="INFO")
+    d._send.assert_awaited_once()
+    d._send_sms.assert_not_awaited()
+    await d.notify_system_alert("BROKER_DISCONNECTED", "down", severity="CRITICAL")
+    d._send_sms.assert_awaited_once()

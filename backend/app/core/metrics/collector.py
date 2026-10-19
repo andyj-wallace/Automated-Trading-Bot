@@ -61,7 +61,7 @@ class MetricsCollector:
 
         # Compute aggregate risk from open trades
         trade_repo = TradeRepo(session)
-        open_trades = await trade_repo.get_open_trades()
+        open_trades = await trade_repo.get_active_trades()
 
         aggregate_risk = sum(
             (t.risk_amount for t in open_trades), Decimal("0")

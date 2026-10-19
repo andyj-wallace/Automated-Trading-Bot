@@ -17,11 +17,11 @@ Error response shape:
 """
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 # ---------------------------------------------------------------------------
 # Envelope helpers
@@ -82,10 +82,17 @@ class TradeOut(BaseModel):
     quantity: Decimal
     entry_price: Decimal
     stop_loss_price: Decimal
+    take_profit_price: Decimal
+    reward_to_risk_ratio: Decimal
     exit_price: Decimal | None
+    exit_reason: str | None
     status: str
     risk_amount: Decimal
     account_balance_at_entry: Decimal
+    entry_fill_price: Decimal | None
+    filled_quantity: Decimal | None
+    current_stop_price: Decimal | None
+    close_attempts: int
     pnl: Decimal | None
     executed_at: datetime
     closed_at: datetime | None
@@ -106,6 +113,13 @@ class StrategyOut(BaseModel):
     config: dict
     created_at: datetime
     updated_at: datetime
+
+
+class StrategyCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    type: str
+    config: dict = {}
+    is_enabled: bool = False
 
 
 class StrategyPatchIn(BaseModel):
@@ -134,6 +148,7 @@ class RiskStatusOut(BaseModel):
 class ComponentStatus(BaseModel):
     status: str  # "ok" | "error" | "disconnected"
     detail: str | None = None
+    info: dict | None = None
 
 
 class SystemHealthOut(BaseModel):
@@ -141,3 +156,51 @@ class SystemHealthOut(BaseModel):
     broker: ComponentStatus
     database: ComponentStatus
     redis: ComponentStatus
+    engine: ComponentStatus
+
+
+# ---------------------------------------------------------------------------
+# Trading control schemas
+# ---------------------------------------------------------------------------
+
+class PauseIn(BaseModel):
+    reason: str = Field(default="", max_length=500)
+
+
+class FlattenIn(BaseModel):
+    confirm: str
+
+
+class ManualTradeIn(BaseModel):
+    symbol: str = Field(min_length=1, max_length=10)
+    stop_loss_price: Decimal
+    take_profit_price: Decimal | None = None
+    quantity: int | None = Field(default=None, ge=1)
+
+
+class SignalOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    strategy_id: uuid.UUID
+    symbol: str
+    bar_date: date
+    action: str
+    entry_price: Decimal | None
+    stop_loss_price: Decimal | None
+    take_profit_price: Decimal | None
+    outcome: str
+    detail: str | None
+    trade_id: uuid.UUID | None
+    created_at: datetime
+
+
+class BarOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    time: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: int

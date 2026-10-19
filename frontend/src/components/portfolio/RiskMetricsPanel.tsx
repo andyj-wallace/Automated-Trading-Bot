@@ -13,18 +13,16 @@
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { api } from "../../api/client";
-import type { DashboardEvent, RiskStatus } from "../../types/api";
-
-interface Props {
-  lastEvent: DashboardEvent | null;
-}
+import { useLiveStore } from "../../store/liveStore";
+import type { RiskStatus } from "../../types/api";
 
 interface HistorySample {
   time: number; // epoch ms
   pct: number;  // 0–100
 }
 
-export function RiskMetricsPanel({ lastEvent }: Props) {
+export function RiskMetricsPanel() {
+  const lastRiskAlert = useLiveStore((s) => s.alerts.find((a) => a.event === "risk_alert"));
   const [history, setHistory] = useState<HistorySample[]>([]);
   const [alert, setAlert] = useState<{ level: string; message: string } | null>(null);
 
@@ -49,8 +47,8 @@ export function RiskMetricsPanel({ lastEvent }: Props) {
 
   // React to WebSocket risk_alert events
   useEffect(() => {
-    if (lastEvent?.event !== "risk_alert") return;
-    const p = lastEvent.payload as {
+    if (!lastRiskAlert) return;
+    const p = lastRiskAlert.payload as {
       alert_level?: string;
       aggregate_risk_pct?: string;
     };
@@ -65,7 +63,7 @@ export function RiskMetricsPanel({ lastEvent }: Props) {
       message: `Portfolio risk at ${pct}% — ${p.alert_level} threshold crossed`,
     });
     refetch();
-  }, [lastEvent, refetch]);
+  }, [lastRiskAlert, refetch]);
 
   const alertColours = {
     WARNING: "bg-amber-900/50 border-amber-700 text-amber-300",

@@ -10,13 +10,10 @@ import { RiskMetricsPanel } from "../components/portfolio/RiskMetricsPanel";
 import { AdvancedAnalyticsPanel } from "../components/portfolio/AdvancedAnalyticsPanel";
 import { RiskGauge } from "../components/dashboard/RiskGauge";
 import { ActiveTradesTable } from "../components/dashboard/ActiveTradesTable";
-import { useWebSocket } from "../hooks/useWebSocket";
 import { api } from "../api/client";
 import type { Trade } from "../types/api";
 
 export function Portfolio() {
-  const { lastEvent } = useWebSocket();
-
   const { data: closedTrades = [], isLoading } = useQuery({
     queryKey: ["trades", "CLOSED"],
     queryFn: async () => {
@@ -37,12 +34,12 @@ export function Portfolio() {
 
       {/* Risk snapshot + gauage side by side */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <RiskGauge lastEvent={lastEvent} />
-        <RiskMetricsPanel lastEvent={lastEvent} />
+        <RiskGauge />
+        <RiskMetricsPanel />
       </div>
 
       {/* Open positions */}
-      <ActiveTradesTable lastEvent={lastEvent} />
+      <ActiveTradesTable />
 
       {/* Advanced analytics */}
       <AdvancedAnalyticsPanel />

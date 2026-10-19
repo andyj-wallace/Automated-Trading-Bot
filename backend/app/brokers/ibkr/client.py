@@ -8,12 +8,14 @@ See .claude/specs/ibkr-gateway.md for setup and daily startup procedure.
 """
 
 import asyncio
-import json
+import math
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from ib_async import IB, LimitOrder, MarketOrder, Stock
+from ib_async import IB, LimitOrder, MarketOrder, Stock, StopOrder
 
 from app.brokers.base import (
     AccountSummary,
@@ -27,7 +29,9 @@ from app.brokers.base import (
 )
 from app.brokers.ibkr import mapper
 from app.config import Settings
-from app.monitoring.logger import error_logger, system_logger
+from app.core.events import publish_system_alert
+from app.core.tasks import spawn
+from app.monitoring.logger import system_logger
 
 if TYPE_CHECKING:
     from app.data.cache import RedisCache
@@ -35,7 +39,24 @@ if TYPE_CHECKING:
 # How long (seconds) to wait for an order fill before returning with
 # whatever status we have.  Market orders on paper typically fill in <1s;
 # this guard prevents an infinite wait on edge cases.
-_ORDER_FILL_TIMEOUT = 30
+_CANCEL_WAIT_SECONDS = 10
+_STOP_ACK_SECONDS = 10
+
+# Re-emit an unchanged price after this many seconds so the Redis price key stays fresh.
+_REEMIT_SECONDS = 5
+
+_DEFAULT_BACKOFF = (5, 10, 20, 40, 60)
+
+
+class LiveTradingGuardError(RuntimeError):
+    """Raised when the configured or actual account mode conflicts with the environment."""
+
+
+def _positive_decimal(value: float | None) -> Decimal | None:
+    """Convert a tick value to Decimal; None for missing, NaN, infinite or non-positive."""
+    if value is None or math.isnan(value) or math.isinf(value) or value <= 0:
+        return None
+    return Decimal(str(value))
 
 
 class IBKRClient(BaseBroker):
@@ -50,18 +71,30 @@ class IBKRClient(BaseBroker):
     submission during development.
     """
 
-    # Exponential backoff delays in seconds — 5 attempts: 5, 10, 20, 40, 80
-    _RECONNECT_DELAYS = [5, 10, 20, 40, 80]
-
-    def __init__(self, settings: Settings, cache: "RedisCache | None" = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        cache: "RedisCache | None" = None,
+        *,
+        backoff_seconds: tuple[float, ...] = _DEFAULT_BACKOFF,
+        alert_after_seconds: float = 300,
+        check_seconds: float = 5,
+    ) -> None:
         self._settings = settings
         self._cache = cache
+        self._backoff = backoff_seconds
+        self._alert_after = alert_after_seconds
+        self._check_seconds = check_seconds
         self._ib = IB()
-        # symbol → Stock Contract (needed to cancel subscriptions)
+        # symbol -> Stock Contract (needed to cancel subscriptions and re-request after reconnect)
         self._subscribed_contracts: dict[str, Stock] = {}
         self._price_callbacks: list[PriceFeedCallback] = []
         self._pending_tickers_handler_registered = False
-        self._reconnecting = False
+        self._last_emitted: dict[str, tuple[Decimal, datetime]] = {}
+        self._tasks: set[asyncio.Task] = set()
+        self._stopping = False
+        self._supervisor_task: asyncio.Task | None = None
+        self._reconnect_listeners: list[Callable[[], Awaitable[None]]] = []
         self._ib.disconnectedEvent += self._on_disconnected
         self._ib.errorEvent += self._on_error
 
@@ -71,18 +104,38 @@ class IBKRClient(BaseBroker):
 
     async def connect(self) -> None:
         """
-        Connect to IB Gateway.
+        Connect to IB Gateway and start the reconnect supervisor.
 
-        Raises RuntimeError if the live trading guard is triggered or if
-        Gateway is not reachable.
+        A connectivity failure is logged and left to the supervisor to retry.
+        Raises LiveTradingGuardError if the env guard or account-mode check fails.
         """
         self._enforce_live_trading_guard()
+        self._stopping = False
+        try:
+            await self._connect_once()
+        except LiveTradingGuardError:
+            raise
+        except Exception as exc:
+            system_logger.warning(
+                "IBKRClient: initial connect failed, supervisor will keep retrying",
+                extra={"error": str(exc), "exception_type": type(exc).__name__},
+            )
+        if self._supervisor_task is None or self._supervisor_task.done():
+            self._supervisor_task = asyncio.get_running_loop().create_task(
+                self._supervise(), name="ibkr_supervisor"
+            )
 
+    async def _connect_once(self) -> None:
         await self._ib.connectAsync(
             self._settings.ibkr_host,
             self._settings.ibkr_port,
             clientId=self._settings.ibkr_client_id,
+            timeout=10,
         )
+        self._verify_account_mode()
+        self._ib.reqMarketDataType(self._settings.ibkr_market_data_type)
+        for contract in self._subscribed_contracts.values():
+            self._ib.reqMktData(contract)
         system_logger.info(
             "IBKRClient connected",
             extra={
@@ -90,36 +143,100 @@ class IBKRClient(BaseBroker):
                 "port": self._settings.ibkr_port,
                 "client_id": self._settings.ibkr_client_id,
                 "trading_mode": self._settings.ibkr_trading_mode,
+                "resubscribed": len(self._subscribed_contracts),
             },
         )
 
+    def _verify_account_mode(self) -> None:
+        """Paper accounts have IDs starting with 'D'; refuse anything else in paper mode."""
+        if self._settings.ibkr_trading_mode != "paper":
+            return
+        accounts = list(self._ib.managedAccounts() or [])
+        bad = [a for a in accounts if not str(a).startswith("D")]
+        if bad:
+            self._ib.disconnect()
+            raise LiveTradingGuardError(
+                "IBKR_TRADING_MODE=paper but the Gateway is logged into a non-paper account "
+                f"(account prefix {str(bad[0])[:2]}). Refusing to trade."
+            )
+
+    def add_reconnect_listener(self, fn: Callable[[], Awaitable[None]]) -> None:
+        """Register a coroutine function awaited after every successful reconnect."""
+        self._reconnect_listeners.append(fn)
+
+    async def _supervise(self) -> None:
+        loop = asyncio.get_running_loop()
+        down_since: float | None = None
+        attempt = 0
+        alerted = False
+        while not self._stopping:
+            if self._ib.isConnected():
+                if alerted:
+                    await publish_system_alert(
+                        self._cache,
+                        "BROKER_RECONNECTED",
+                        "IB Gateway connection restored",
+                        severity="INFO",
+                    )
+                down_since, attempt, alerted = None, 0, False
+                await asyncio.sleep(self._check_seconds)
+                continue
+            down_since = down_since or loop.time()
+            await asyncio.sleep(self._backoff[min(attempt, len(self._backoff) - 1)])
+            if self._stopping:
+                return
+            attempt += 1
+            try:
+                await self._connect_once()
+            except LiveTradingGuardError as exc:
+                await publish_system_alert(self._cache, "BROKER_ACCOUNT_MODE_MISMATCH", str(exc))
+                self._stopping = True
+                return
+            except Exception as exc:
+                system_logger.warning(
+                    "IBKRClient: reconnect attempt failed",
+                    extra={"attempt": attempt, "error": str(exc)},
+                )
+                if not alerted and loop.time() - down_since >= self._alert_after:
+                    await publish_system_alert(
+                        self._cache,
+                        "BROKER_DISCONNECTED",
+                        f"IB Gateway unreachable for {int(loop.time() - down_since)}s; "
+                        "still retrying",
+                        host=self._settings.ibkr_host,
+                        port=self._settings.ibkr_port,
+                    )
+                    alerted = True
+                continue
+            for listener in self._reconnect_listeners:
+                try:
+                    await listener()
+                except Exception:
+                    system_logger.exception("IBKRClient: reconnect listener failed")
+
     async def disconnect(self) -> None:
-        self._reconnecting = False  # prevent reconnect loop from firing after intentional disconnect
+        self._stopping = True
+        task, self._supervisor_task = self._supervisor_task, None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
         if self._ib.isConnected():
             self._ib.disconnect()
             system_logger.info("IBKRClient disconnected")
+        if self._pending_tickers_handler_registered:
+            self._ib.pendingTickersEvent -= self._on_pending_tickers
         self._subscribed_contracts.clear()
         self._price_callbacks.clear()
+        self._last_emitted.clear()
         self._pending_tickers_handler_registered = False
 
     def _on_disconnected(self) -> None:
-        """
-        Fired by ib_async when IB Gateway drops the connection unexpectedly.
-        Schedules an async reconnect loop on the running event loop.
-        """
+        """Fired by ib_async when the Gateway drops the connection; the supervisor reconnects."""
         system_logger.warning(
-            "IBKRClient lost connection to IB Gateway — scheduling reconnect",
-            extra={
-                "host": self._settings.ibkr_host,
-                "port": self._settings.ibkr_port,
-            },
+            "IBKRClient lost connection to IB Gateway",
+            extra={"host": self._settings.ibkr_host, "port": self._settings.ibkr_port},
         )
-        if not self._reconnecting:
-            try:
-                loop = asyncio.get_event_loop()
-                loop.create_task(self._reconnect_loop())
-            except RuntimeError:
-                pass  # no running loop (e.g. during shutdown) — ignore
 
     def _on_error(self, req_id: int, error_code: int, error_string: str, contract) -> None:
         """
@@ -149,96 +266,9 @@ class IBKRClient(BaseBroker):
                 extra={
                     "req_id": req_id,
                     "error_code": error_code,
-                    "message": error_string,
+                    "ib_message": error_string,
                 },
             )
-
-    async def _reconnect_loop(self) -> None:
-        """
-        Attempt to reconnect to IB Gateway with exponential backoff.
-
-        Makes up to 5 attempts with delays of 5, 10, 20, 40, and 80 seconds.
-        Each attempt is logged at WARNING. On exhaustion, logs CRITICAL and
-        publishes a system_alert event to Redis (if cache is available).
-        Stops early if disconnect() is called intentionally.
-        """
-        self._reconnecting = True
-        total = len(self._RECONNECT_DELAYS)
-        for attempt, delay in enumerate(self._RECONNECT_DELAYS, start=1):
-            if not self._reconnecting:
-                return
-            system_logger.warning(
-                "IBKRClient: reconnect attempt %d/%d in %ds",
-                attempt,
-                total,
-                delay,
-                extra={
-                    "host": self._settings.ibkr_host,
-                    "port": self._settings.ibkr_port,
-                    "attempt": attempt,
-                    "total_attempts": total,
-                    "delay_seconds": delay,
-                },
-            )
-            await asyncio.sleep(delay)
-            if not self._reconnecting:
-                return
-            try:
-                await self._ib.connectAsync(
-                    self._settings.ibkr_host,
-                    self._settings.ibkr_port,
-                    clientId=self._settings.ibkr_client_id,
-                )
-                system_logger.info(
-                    "IBKRClient: reconnected successfully on attempt %d/%d",
-                    attempt,
-                    total,
-                    extra={"attempt": attempt},
-                )
-                self._reconnecting = False
-                return
-            except Exception as exc:
-                system_logger.warning(
-                    "IBKRClient: reconnect attempt %d/%d failed",
-                    attempt,
-                    total,
-                    extra={"attempt": attempt, "error": str(exc)},
-                )
-
-        # All attempts exhausted — fire system alert
-        self._reconnecting = False
-        error_logger.critical(
-            "IBKRClient: broker reconnection exhausted — all %d attempts failed",
-            total,
-            extra={
-                "host": self._settings.ibkr_host,
-                "port": self._settings.ibkr_port,
-                "attempts": total,
-            },
-        )
-        if self._cache is not None:
-            try:
-                await self._cache.publish(
-                    "system_alerts",
-                    json.dumps({
-                        "event": "system_alert",
-                        "payload": {
-                            "alert_type": "BROKER_RECONNECT_EXHAUSTED",
-                            "message": (
-                                f"Broker reconnection failed after {total} attempts. "
-                                "Manual intervention required."
-                            ),
-                            "host": self._settings.ibkr_host,
-                            "port": self._settings.ibkr_port,
-                            "attempts": total,
-                        },
-                    }),
-                )
-            except Exception as pub_exc:
-                system_logger.warning(
-                    "IBKRClient: failed to publish system_alert to Redis",
-                    extra={"error": str(pub_exc)},
-                )
 
     def is_connected(self) -> bool:
         return self._ib.isConnected()
@@ -254,7 +284,7 @@ class IBKRClient(BaseBroker):
 
     async def get_positions(self) -> list[Position]:
         self._require_connected()
-        ib_positions = await self._ib.positionsAsync()
+        ib_positions = await self._ib.reqPositionsAsync()
         return [mapper.map_position(p) for p in ib_positions]
 
     # ------------------------------------------------------------------
@@ -275,7 +305,8 @@ class IBKRClient(BaseBroker):
         """
         self._require_connected()
 
-        self._price_callbacks.append(callback)
+        if callback not in self._price_callbacks:
+            self._price_callbacks.append(callback)
 
         for symbol in tickers:
             if symbol not in self._subscribed_contracts:
@@ -291,26 +322,30 @@ class IBKRClient(BaseBroker):
         """
         Synchronous callback fired by ib_async when ticker data updates.
 
-        Wraps each tick in a PriceUpdate and schedules async callbacks on
-        the running event loop.
+        Only valid last-trade prices are forwarded; callbacks run as referenced tasks.
         """
+        now = datetime.now(UTC)
         for ticker in tickers:
-            if ticker.last is None and ticker.close is None:
+            price = _positive_decimal(ticker.last)
+            if price is None:
                 continue
-
-            price = ticker.last if ticker.last is not None else ticker.close
             symbol = ticker.contract.symbol
-
+            last = self._last_emitted.get(symbol)
+            if last and last[0] == price and (now - last[1]).total_seconds() < _REEMIT_SECONDS:
+                continue
+            self._last_emitted[symbol] = (price, now)
+            prev_close = _positive_decimal(ticker.close)
             update = PriceUpdate(
                 ticker=symbol,
-                price=Decimal(str(price)),
-                bid=Decimal(str(ticker.bid)) if ticker.bid is not None else None,
-                ask=Decimal(str(ticker.ask)) if ticker.ask is not None else None,
-                timestamp=datetime.now(UTC),
+                price=price,
+                bid=_positive_decimal(ticker.bid),
+                ask=_positive_decimal(ticker.ask),
+                day_change=(price - prev_close) if prev_close else None,
+                day_change_pct=((price - prev_close) / prev_close) if prev_close else None,
+                timestamp=now,
             )
-            loop = asyncio.get_event_loop()
-            for cb in self._price_callbacks:
-                loop.create_task(cb(update))
+            for cb in list(self._price_callbacks):
+                spawn(cb(update), name=f"tick-{symbol}", registry=self._tasks)
 
     # ------------------------------------------------------------------
     # Order management
@@ -318,28 +353,65 @@ class IBKRClient(BaseBroker):
 
     async def place_order(self, order: OrderRequest) -> OrderResult:
         """
-        Submit an order to IBKR and wait for fill or timeout.
+        Submit an order to IBKR (SMART routing) and wait for it to settle.
 
-        Uses SMART routing for US equities. Returns the result with
-        whatever status was reached within _ORDER_FILL_TIMEOUT seconds.
+        MKT/LMT: wait up to order_fill_timeout_seconds, then cancel a still-working
+        order and wait briefly for the cancel. STP: wait only for acknowledgement.
         """
         self._require_connected()
 
         contract = Stock(order.symbol, "SMART", "USD")
-
-        if order.order_type == "LMT" and order.limit_price is not None:
-            ib_order = LimitOrder(order.direction, float(order.quantity), float(order.limit_price))
+        qty = float(order.quantity)
+        if order.order_type == "STP":
+            if order.stop_price is None:
+                raise ValueError("STP order requires stop_price")
+            ib_order = StopOrder(order.direction, qty, float(order.stop_price))
+        elif order.order_type == "LMT" and order.limit_price is not None:
+            ib_order = LimitOrder(order.direction, qty, float(order.limit_price))
         else:
-            ib_order = MarketOrder(order.direction, float(order.quantity))
+            ib_order = MarketOrder(order.direction, qty)
+        ib_order.orderRef = order.order_ref
+        ib_order.tif = order.tif
 
         trade = self._ib.placeOrder(contract, ib_order)
+        loop = asyncio.get_running_loop()
 
-        # Wait for the order to reach a terminal state within the timeout.
-        deadline = asyncio.get_event_loop().time() + _ORDER_FILL_TIMEOUT
-        while not trade.isDone() and asyncio.get_event_loop().time() < deadline:
-            await asyncio.sleep(0.1)
+        if order.order_type == "STP":
+            deadline = loop.time() + _STOP_ACK_SECONDS
+            while (
+                not trade.isDone()
+                and trade.orderStatus.status not in ("PreSubmitted", "Submitted")
+                and loop.time() < deadline
+            ):
+                await asyncio.sleep(0.1)
+        else:
+            deadline = loop.time() + self._settings.order_fill_timeout_seconds
+            while not trade.isDone() and loop.time() < deadline:
+                await asyncio.sleep(0.1)
+            if not trade.isDone():
+                self._ib.cancelOrder(ib_order)
+                deadline = loop.time() + _CANCEL_WAIT_SECONDS
+                while not trade.isDone() and loop.time() < deadline:
+                    await asyncio.sleep(0.1)
 
         return mapper.map_order_result(order.trade_id, trade)
+
+    async def find_order_by_ref(self, order_ref: str) -> OrderResult | None:
+        """State of the latest order with this orderRef (session trades, then open orders)."""
+        self._require_connected()
+        matches = [t for t in self._ib.trades() if t.order.orderRef == order_ref]
+        if not matches:
+            await self._ib.reqAllOpenOrdersAsync()
+            matches = [t for t in self._ib.trades() if t.order.orderRef == order_ref]
+        if matches:
+            return mapper.map_order_result(mapper.trade_id_from_ref(order_ref), matches[-1])
+        return await self.get_execution_summary(order_ref)
+
+    async def get_execution_summary(self, order_ref: str) -> OrderResult | None:
+        """Aggregate today's executions for this orderRef (IBKR returns the current day only)."""
+        self._require_connected()
+        fills = await self._ib.reqExecutionsAsync()
+        return mapper.summarize_fills(order_ref, list(fills))
 
     async def unsubscribe_price_feed(self, ticker: str) -> None:
         """Cancel a real-time market data subscription for one ticker."""
@@ -393,10 +465,13 @@ class IBKRClient(BaseBroker):
         """
         self._require_connected()
 
-        for trade in self._ib.trades():
-            if str(trade.order.orderId) == broker_order_id:
-                self._ib.cancelOrder(trade.order)
-                return True
+        for attempt in range(2):
+            for trade in self._ib.trades():
+                if str(trade.order.orderId) == broker_order_id:
+                    self._ib.cancelOrder(trade.order)
+                    return True
+            if attempt == 0:
+                await self._ib.reqAllOpenOrdersAsync()
         return False
 
     # ------------------------------------------------------------------
@@ -422,7 +497,7 @@ class IBKRClient(BaseBroker):
             self._settings.environment == "development"
             and self._settings.ibkr_trading_mode == "live"
         ):
-            raise RuntimeError(
+            raise LiveTradingGuardError(
                 "Live trading guard triggered: ENVIRONMENT=development and "
                 "IBKR_TRADING_MODE=live cannot be set simultaneously. "
                 "Set IBKR_TRADING_MODE=paper or change ENVIRONMENT to proceed."

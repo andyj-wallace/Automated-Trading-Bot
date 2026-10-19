@@ -30,7 +30,14 @@ cp .env.example .env
 ### 2. Start services
 
 ```bash
-docker-compose up -d
+docker compose up -d db redis
+```
+
+This is the dev stack (`docker-compose.yml`; Postgres and Redis bound to 127.0.0.1). To run everything in containers against a paper IB Gateway, use the production stack instead: see [DEPLOYMENT.md](DEPLOYMENT.md).
+
+```bash
+cp .env.prod.example .env.prod   # fill in; never commit
+docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
 ```
 
 ### 3. Run migrations
@@ -84,10 +91,10 @@ Frontend available at http://localhost:5173
 
 ## IB Gateway Setup
 
-The backend connects to a locally running IB Gateway via TCP. When running inside Docker the backend reaches the host Mac via `host.docker.internal`.
+The backend connects to IB Gateway via TCP. Native Gateway: `4002` paper / `4001` live. The `ib-gateway` container in `docker-compose.prod.yml`: backend reaches it at `ib-gateway:4004` (paper). Never point the bot at a live port. When the backend runs in Docker against a native Gateway on the Mac, it uses `host.docker.internal`.
 
 **Required Gateway API settings** (*Configure → Settings → API → Settings*):
-- Socket port: `4002` (paper) / `4001` (live)
+- Socket port: `4002` (paper). `4001` is live and must never be used
 - **Uncheck** "Allow connections from localhost only" — Docker containers connect from the bridge network IP, not `127.0.0.1`, so this option blocks them even when the host is in Trusted IPs
 - Trusted IPs: `host.docker.internal`, `127.0.0.1`
 

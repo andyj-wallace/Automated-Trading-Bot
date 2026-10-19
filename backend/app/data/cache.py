@@ -23,6 +23,15 @@ from collections.abc import AsyncGenerator
 
 import redis.asyncio as aioredis
 
+_COMPARE_AND_EXPIRE = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] "
+    "then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end"
+)
+_COMPARE_AND_DELETE = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] "
+    "then return redis.call('del', KEYS[1]) else return 0 end"
+)
+
 
 class RedisCache:
     """
@@ -58,6 +67,18 @@ class RedisCache:
     async def delete(self, key: str) -> None:
         """Delete key. No-op if the key does not exist."""
         await self._client.delete(key)
+
+    async def set_if_absent(self, key: str, value: str, ttl: int) -> bool:
+        """SET key value NX EX ttl; True if this call created the key."""
+        return bool(await self._client.set(key, value, ex=ttl, nx=True))
+
+    async def compare_and_expire(self, key: str, value: str, ttl: int) -> bool:
+        """Reset the TTL only if key still holds value; True if it did."""
+        return bool(await self._client.eval(_COMPARE_AND_EXPIRE, 1, key, value, ttl))
+
+    async def compare_and_delete(self, key: str, value: str) -> bool:
+        """Delete key only if it still holds value; True if it did."""
+        return bool(await self._client.eval(_COMPARE_AND_DELETE, 1, key, value))
 
     # ------------------------------------------------------------------
     # Pub/sub operations

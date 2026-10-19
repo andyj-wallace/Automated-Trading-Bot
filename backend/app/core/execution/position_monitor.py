@@ -1,10 +1,11 @@
 """
 PositionMonitor — watches live prices against open trade stop/target levels.
 
-Subscribes to the Redis `price:*` pattern for all active tickers and to
-`trade_events` for real-time updates to the open-trade set. When a price
-crosses a stop-loss or take-profit level it calls OrderManager.close_position()
-to trigger the exit flow.
+Receives live prices in-process (MarketDataFeed calls on_price_update) and
+keeps its tracked set in sync by re-reading OPEN trades from the database
+every few seconds. When a price crosses a stop-loss or take-profit level while
+the market is open it calls OrderManager.close_position() to start the exit
+flow. Nothing safety-critical depends on Redis.
 
 Trailing / breakeven stop (long trades only):
   Once a BUY trade has moved at least `trailing_activation_r` risk-units (R)
@@ -28,32 +29,30 @@ Stale-trade timeout:
   quietly occupying part of the portfolio's risk budget for no return. A
   separate background sweep (interval: `stale_trade_check_interval_seconds`)
   force-closes any tracked trade open longer than `stale_trade_max_days`
-  (reason "STALE_TIMEOUT" — OrderManager records it as exit_reason=MANUAL
-  since ExitReason has no dedicated value, but the original "STALE_TIMEOUT"
-  string is preserved in logs and the published trade_closed event). Set
+  (reason "STALE_TIMEOUT", stored as exit_reason=STALE_TIMEOUT). Set
   stale_trade_max_days=None to disable.
 
-Runs as a background asyncio task, started on app startup (Layer 6B.9).
+Price-feed watchdog: while the market is open, a tracked symbol with no recent
+tick raises a PRICE_FEED_STALE system alert (once per symbol per day).
 
-Depends on: RedisCache (Layer 5.1), TradeRepo (Layer 3.7), OrderManager (6B.8)
+Depends on: TradeRepo (Layer 3.7), OrderManager (6B.8)
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
-from contextlib import suppress
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
-from app.data.cache import RedisCache
+from app.brokers.base import PriceUpdate
+from app.core import market_calendar
+from app.core.events import publish_system_alert
+from app.core.tasks import PeriodicTask, spawn
 from app.db.models.trade import Trade
 from app.monitoring.logger import system_logger, trading_logger
-
-TRADE_EVENTS_CHANNEL = "trade_events"
-PRICE_PATTERN = "price:*"
 
 
 @dataclass
@@ -79,90 +78,132 @@ class _TrackedTrade:
 
 class PositionMonitor:
     """
-    Monitors open trade levels against live Redis price updates.
+    Monitors open trade levels against live in-process price updates.
 
     Usage:
         monitor = PositionMonitor(cache, session_factory, order_manager)
-        await monitor.start()           # begins background task
+        feed.add_listener(monitor.on_price_update)
+        await monitor.start()
         ...
-        await monitor.stop()            # graceful shutdown
+        await monitor.stop()            # waits for in-flight closes
     """
 
     def __init__(
         self,
-        cache: RedisCache,
+        cache,
         session_factory,
         order_manager,  # OrderManager — imported lazily to avoid circular imports
         trailing_stop_enabled: bool = True,
         trailing_activation_r: Decimal = Decimal("1"),
         trailing_distance_r: Decimal = Decimal("1"),
         stale_trade_max_days: int | None = 14,
-        stale_trade_check_interval_seconds: int = 3600,
+        stale_trade_check_interval_seconds: float = 3600,
+        *,
+        is_market_open: Callable[[], bool] = market_calendar.is_market_open,
+        clock: Callable[[], datetime] = market_calendar.now_et,
+        last_tick_at: Callable[[str], datetime | None] | None = None,
+        resync_interval_seconds: float = 5.0,
+        watchdog_interval_seconds: float = 30.0,
+        price_stale_seconds: int = 120,
     ) -> None:
         self._cache = cache
         self._session_factory = session_factory
         self._order_manager = order_manager
         self._tracked: dict[uuid.UUID, _TrackedTrade] = {}
         self._closing: set[uuid.UUID] = set()  # prevent double-close
-        self._task: asyncio.Task | None = None
-        self._stale_sweep_task: asyncio.Task | None = None
+        self._tasks: set[asyncio.Task] = set()
+        self._periodic: list[PeriodicTask] = []
         self._running = False
         self._trailing_stop_enabled = trailing_stop_enabled
         self._trailing_activation_r = trailing_activation_r
         self._trailing_distance_r = trailing_distance_r
         self._stale_trade_max_days = stale_trade_max_days
         self._stale_trade_check_interval_seconds = stale_trade_check_interval_seconds
+        self._is_market_open = is_market_open
+        self._clock = clock
+        self._last_tick_at = last_tick_at or (lambda symbol: None)
+        self._resync_interval_seconds = resync_interval_seconds
+        self._watchdog_interval_seconds = watchdog_interval_seconds
+        self._price_stale_seconds = price_stale_seconds
+        self._started_at: datetime | None = None
+        self._stale_alerted: set[tuple[str, date]] = set()
+
+    @property
+    def tracked_count(self) -> int:
+        return len(self._tracked)
+
+    def tracked_symbols(self) -> set[str]:
+        return {t.symbol.upper() for t in self._tracked.values()}
 
     async def start(self) -> None:
-        """Load open trades from DB and start the background monitoring loop."""
+        """Load open trades from DB and start the periodic resync, sweep and watchdog."""
+        self._started_at = self._clock()
         try:
-            await self._load_open_trades()
+            await self._resync()
         except Exception as exc:
-            # DB may be temporarily unavailable at startup (e.g. migration pending).
-            # Start with an empty watchlist — PositionMonitor picks up new trades
-            # via trade_events as they are opened.
             system_logger.warning(
                 "PositionMonitor: could not pre-load open trades from DB",
                 extra={"error": str(exc)},
             )
         self._running = True
-        self._task = asyncio.create_task(self._run(), name="position_monitor")
+        self._periodic = [
+            PeriodicTask(
+                "monitor_resync",
+                self._resync_interval_seconds,
+                self._resync,
+                initial_delay=self._resync_interval_seconds,
+            ),
+            PeriodicTask(
+                "monitor_watchdog",
+                self._watchdog_interval_seconds,
+                self._check_price_feed,
+                initial_delay=self._watchdog_interval_seconds,
+            ),
+        ]
         if self._stale_trade_max_days is not None:
-            self._stale_sweep_task = asyncio.create_task(
-                self._stale_trade_sweep_loop(), name="position_monitor_stale_sweep"
+            self._periodic.append(
+                PeriodicTask(
+                    "monitor_stale_sweep",
+                    self._stale_trade_check_interval_seconds,
+                    self._sweep_stale_trades,
+                    initial_delay=self._stale_trade_check_interval_seconds,
+                )
             )
+        for task in self._periodic:
+            task.start()
         system_logger.info(
             "PositionMonitor started",
             extra={"tracked_trades": len(self._tracked)},
         )
 
     async def stop(self) -> None:
-        """Signal the background loop to stop and wait for it to exit."""
+        """Stop periodic tasks, then wait for in-flight closes to finish."""
         self._running = False
-        if self._task and not self._task.done():
-            self._task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._task
-        if self._stale_sweep_task and not self._stale_sweep_task.done():
-            self._stale_sweep_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._stale_sweep_task
+        for task in self._periodic:
+            await task.stop()
+        self._periodic = []
+        if self._tasks:
+            await asyncio.wait(set(self._tasks), timeout=20)
+        self._tracked.clear()  # a stopped monitor must not act on late ticks
         system_logger.info("PositionMonitor stopped")
 
     # ------------------------------------------------------------------
-    # Internal: initial load
+    # Internal: DB resync
     # ------------------------------------------------------------------
 
-    async def _load_open_trades(self) -> None:
-        """Populate _tracked from the DB on startup."""
+    async def _resync(self) -> None:
+        """Merge DB OPEN trades into _tracked, keeping trailing state of known trades."""
         from app.db.repositories.trade_repo import TradeRepo
 
         async with self._session_factory() as session:
-            repo = TradeRepo(session)
-            open_trades: list[Trade] = await repo.get_open_trades()
-
+            open_trades: list[Trade] = await TradeRepo(session).get_open_trades()
+        open_ids = {t.id for t in open_trades}
         for trade in open_trades:
-            self._track(trade)
+            if trade.id not in self._tracked and trade.id not in self._closing:
+                self._track(trade)
+        for trade_id in list(self._tracked):
+            if trade_id not in open_ids:
+                self._tracked.pop(trade_id, None)
 
     def _track(self, trade: Trade) -> None:
         self._tracked[trade.id] = _TrackedTrade(
@@ -177,70 +218,15 @@ class PositionMonitor:
         )
 
     # ------------------------------------------------------------------
-    # Internal: background run loop
+    # Price handler
     # ------------------------------------------------------------------
 
-    async def _run(self) -> None:
-        """Subscribe to price updates and trade events; process until stopped."""
-        try:
-            async for msg in self._cache.subscribe_many(
-                channels=[TRADE_EVENTS_CHANNEL],
-                patterns=[PRICE_PATTERN],
-            ):
-                if not self._running:
-                    break
-                try:
-                    if msg["type"] == "pmessage":
-                        await self._handle_price(msg)
-                    elif msg["type"] == "message":
-                        await self._handle_trade_event(msg)
-                except Exception as exc:
-                    system_logger.error(
-                        "PositionMonitor: error processing message",
-                        extra={"error": str(exc), "msg_type": msg.get("type")},
-                    )
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            system_logger.error(
-                "PositionMonitor: unexpected loop error",
-                extra={"error": str(exc)},
-            )
-
-    # ------------------------------------------------------------------
-    # Internal: price message handler
-    # ------------------------------------------------------------------
-
-    async def _handle_price(self, msg: dict) -> None:
-        """
-        Check a price update against all open trades for that ticker.
-
-        msg["channel"] looks like b"price:AAPL" or "price:AAPL".
-        """
-        channel = msg["channel"]
-        if isinstance(channel, bytes):
-            channel = channel.decode()
-
-        # channel format: "price:TICKER"
-        parts = channel.split(":", 1)
-        if len(parts) != 2:
+    async def on_price_update(self, update: PriceUpdate) -> None:
+        """Check a live price against all open trades for that ticker (market hours only)."""
+        if not self._is_market_open():
             return
-        ticker = parts[1].upper()
-
-        try:
-            payload = json.loads(msg["data"])
-            price = Decimal(str(payload.get("price", payload)))
-        except Exception:
-            # Price data might be a plain decimal string or JSON object
-            try:
-                price = Decimal(str(msg["data"]))
-            except Exception:
-                system_logger.warning(
-                    "PositionMonitor: unparseable price update — tick skipped, "
-                    "stop/target check did not run for this update",
-                    extra={"ticker": ticker, "raw_data": str(msg.get("data"))[:200]},
-                )
-                return
+        ticker = update.ticker.upper()
+        price = update.price
 
         # Check all tracked trades for this ticker
         hits: list[tuple[uuid.UUID, str, _TrackedTrade]] = []
@@ -274,7 +260,7 @@ class PositionMonitor:
                     "trailed": tracked.stop_loss_price != tracked.initial_stop_loss_price,
                 },
             )
-            asyncio.create_task(self._close(trade_id, reason))
+            spawn(self._close(trade_id, reason), name=f"close-{trade_id}", registry=self._tasks)
 
     def _update_trailing_stop(self, tracked: _TrackedTrade, price: Decimal) -> None:
         """
@@ -305,23 +291,8 @@ class PositionMonitor:
     # Internal: stale-trade timeout sweep
     # ------------------------------------------------------------------
 
-    async def _stale_trade_sweep_loop(self) -> None:
-        """Periodically force-close trades open longer than the configured max."""
-        while self._running:
-            try:
-                await asyncio.sleep(self._stale_trade_check_interval_seconds)
-                if self._running:
-                    self._sweep_stale_trades()
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                system_logger.error(
-                    "PositionMonitor: stale-trade sweep error",
-                    extra={"error": str(exc)},
-                )
-
-    def _sweep_stale_trades(self) -> None:
-        if self._stale_trade_max_days is None:
+    async def _sweep_stale_trades(self) -> None:
+        if self._stale_trade_max_days is None or not self._is_market_open():
             return
         max_age = timedelta(days=self._stale_trade_max_days)
         now = datetime.now(UTC)
@@ -345,7 +316,11 @@ class PositionMonitor:
                     "max_days": self._stale_trade_max_days,
                 },
             )
-            asyncio.create_task(self._close(tracked.trade_id, "STALE_TIMEOUT"))
+            spawn(
+                self._close(tracked.trade_id, "STALE_TIMEOUT"),
+                name=f"close-{tracked.trade_id}",
+                registry=self._tasks,
+            )
 
     async def _close(self, trade_id: uuid.UUID, reason: str) -> None:
         """Fire close_position and clean up the in-flight set."""
@@ -360,71 +335,34 @@ class PositionMonitor:
             self._closing.discard(trade_id)
 
     # ------------------------------------------------------------------
-    # Internal: trade event handler
+    # Internal: price-feed watchdog
     # ------------------------------------------------------------------
 
-    async def _handle_trade_event(self, msg: dict) -> None:
-        """
-        Update the tracked set when trades open or close.
-
-        Expected events published on trade_events channel:
-            trade_executed — add to tracked set
-            trade_closed   — remove from tracked set (if not already)
-        """
-        try:
-            event = json.loads(msg["data"])
-        except Exception:
-            system_logger.warning(
-                "PositionMonitor: unparseable trade_events message — ignored",
-                extra={"raw_data": str(msg.get("data"))[:200]},
-            )
+    async def _check_price_feed(self) -> None:
+        """Alert once per symbol per day when a tracked symbol has no recent tick."""
+        if not self._is_market_open():
             return
-
-        event_type = event.get("event")
-        payload = event.get("payload", {})
-
-        if event_type == "trade_executed":
-            trade_id_str = payload.get("trade_id")
-            symbol = payload.get("symbol", "")
-            direction = payload.get("direction", "BUY")
-            entry_str = payload.get("entry_price")
-            stop_str = payload.get("stop_loss_price")
-            tp_str = payload.get("take_profit_price")
-            if trade_id_str and entry_str and stop_str and tp_str:
-                try:
-                    opened_at = datetime.now(UTC)
-                    with suppress(Exception):
-                        opened_at = datetime.fromisoformat(event.get("timestamp", ""))
-                    self._tracked[uuid.UUID(trade_id_str)] = _TrackedTrade(
-                        trade_id=uuid.UUID(trade_id_str),
-                        symbol=symbol,
-                        direction=direction,
-                        entry_price=Decimal(entry_str),
-                        stop_loss_price=Decimal(stop_str),
-                        initial_stop_loss_price=Decimal(stop_str),
-                        take_profit_price=Decimal(tp_str),
-                        opened_at=opened_at,
-                    )
-                except Exception as exc:
-                    system_logger.error(
-                        "PositionMonitor: trade_executed event had unparseable "
-                        "fields — position will NOT be monitored for stop/target",
-                        extra={"trade_id": trade_id_str, "error": str(exc)},
-                    )
-            else:
-                system_logger.error(
-                    "PositionMonitor: trade_executed event missing required "
-                    "fields — position will NOT be monitored for stop/target",
-                    extra={
-                        "trade_id": trade_id_str,
-                        "has_entry_price": bool(entry_str),
-                        "has_stop": bool(stop_str),
-                        "has_take_profit": bool(tp_str),
-                    },
-                )
-
-        elif event_type == "trade_closed":
-            trade_id_str = payload.get("trade_id")
-            if trade_id_str:
-                with suppress(Exception):
-                    self._tracked.pop(uuid.UUID(trade_id_str), None)
+        now = self._clock()
+        today = market_calendar.trading_date(now)
+        bounds = market_calendar.session_bounds(today)
+        grace = timedelta(seconds=self._price_stale_seconds)
+        if bounds is not None and now - bounds[0] < grace:
+            return
+        if self._started_at is not None and now - self._started_at < grace:
+            return
+        self._stale_alerted = {k for k in self._stale_alerted if k[1] == today}
+        for symbol in sorted({t.symbol.upper() for t in self._tracked.values()}):
+            if (symbol, today) in self._stale_alerted:
+                continue
+            last = self._last_tick_at(symbol)
+            if last is not None and (now - last).total_seconds() <= self._price_stale_seconds:
+                continue
+            self._stale_alerted.add((symbol, today))
+            await publish_system_alert(
+                self._cache,
+                "PRICE_FEED_STALE",
+                f"No price tick for {symbol} in over {self._price_stale_seconds}s "
+                "while the market is open; stop/target checks are blind",
+                symbol=symbol,
+                last_tick_at=last.isoformat() if last else None,
+            )

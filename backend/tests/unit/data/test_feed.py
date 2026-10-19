@@ -4,8 +4,9 @@ Unit tests for MarketDataFeed (Layer 5.2).
 Uses MockBroker and an in-memory fake cache — no Redis or DB required.
 """
 
+import json
 from decimal import Decimal
-from unittest.mock import MagicMock
+from types import SimpleNamespace
 
 import pytest
 
@@ -49,16 +50,55 @@ class FakeSymbol:
 
 
 class FakeSymbolRepo:
-    def __init__(self, tickers: list[str]) -> None:
-        self._tickers = tickers
+    tickers: list[str] = []
+
+    def __init__(self, session) -> None:
+        pass
 
     async def get_all(self, active_only: bool = False) -> list[FakeSymbol]:
-        return [FakeSymbol(t) for t in self._tickers]
+        return [FakeSymbol(t) for t in self.tickers]
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+class _Session:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _session_factory():
+    return _Session()
+
+
+class FakeStrategy:
+    def __init__(self, symbols: list[str]) -> None:
+        self.config = {"symbols": symbols}
+
+
+class FakeStrategyRepo:
+    symbols: list[list[str]] = []
+
+    def __init__(self, session) -> None:
+        pass
+
+    async def get_enabled(self):
+        return [FakeStrategy(s) for s in self.symbols]
+
+
+class FakeTradeRepo:
+    symbols: list[str] = []
+
+    def __init__(self, session) -> None:
+        pass
+
+    async def get_active_trades(self):
+        return [SimpleNamespace(symbol=s) for s in self.symbols]
 
 
 @pytest.fixture
@@ -74,58 +114,58 @@ def cache() -> FakeCache:
 
 
 @pytest.fixture
-def feed(broker: MockBroker, cache: FakeCache) -> MarketDataFeed:
-    return MarketDataFeed(broker, cache)
+def repos(monkeypatch):
+    import app.data.feed as feed_module
+
+    FakeSymbolRepo.tickers = []
+    FakeStrategyRepo.symbols = []
+    FakeTradeRepo.symbols = []
+    monkeypatch.setattr(feed_module, "SymbolRepo", FakeSymbolRepo)
+    monkeypatch.setattr(feed_module, "StrategyRepo", FakeStrategyRepo)
+    monkeypatch.setattr(feed_module, "TradeRepo", FakeTradeRepo)
+    return SimpleNamespace(watchlist=FakeSymbolRepo, strategies=FakeStrategyRepo, trades=FakeTradeRepo)
+
+
+@pytest.fixture
+def feed(broker: MockBroker, cache: FakeCache, repos) -> MarketDataFeed:
+    return MarketDataFeed(broker, cache, _session_factory)
 
 
 # ---------------------------------------------------------------------------
-# start()
+# desired_symbols() / sync()
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_start_subscribes_active_symbols(
-    feed: MarketDataFeed, broker: MockBroker
+async def test_desired_symbols_is_union(feed: MarketDataFeed, repos) -> None:
+    repos.watchlist.tickers = ["aapl", "MSFT"]
+    repos.strategies.symbols = [["msft", "NVDA"], ["amd"]]
+    repos.trades.symbols = ["TSLA", "AAPL"]
+    assert await feed.desired_symbols() == {"AAPL", "MSFT", "NVDA", "AMD", "TSLA"}
+
+
+@pytest.mark.asyncio
+async def test_sync_subscribes_new_and_unsubscribes_removed(feed: MarketDataFeed, repos) -> None:
+    repos.watchlist.tickers = ["AAPL", "MSFT"]
+    await feed.sync()
+    assert feed.subscribed_tickers == {"AAPL", "MSFT"}
+    repos.watchlist.tickers = ["AAPL", "NVDA"]
+    await feed.sync()
+    assert feed.subscribed_tickers == {"AAPL", "NVDA"}
+
+
+@pytest.mark.asyncio
+async def test_sync_is_idempotent_and_skips_when_disconnected(
+    feed: MarketDataFeed, broker: MockBroker, repos
 ) -> None:
-    fake_session = MagicMock()
-
-    # Patch SymbolRepo inside feed.start by monkeypatching the import
-    import app.data.feed as feed_module
-    original = feed_module.SymbolRepo
-
-    class PatchedRepo(FakeSymbolRepo):
-        def __init__(self, session):
-            super().__init__(["AAPL", "MSFT"])
-
-    feed_module.SymbolRepo = PatchedRepo
-    try:
-        await feed.start(fake_session)
-    finally:
-        feed_module.SymbolRepo = original
-
-    assert "AAPL" in feed.subscribed_tickers
-    assert "MSFT" in feed.subscribed_tickers
-
-
-@pytest.mark.asyncio
-async def test_start_is_idempotent(feed: MarketDataFeed) -> None:
-    """Calling start twice should not double-subscribe."""
-    fake_session = MagicMock()
-    import app.data.feed as feed_module
-    original = feed_module.SymbolRepo
-
-    class PatchedRepo(FakeSymbolRepo):
-        def __init__(self, session):
-            super().__init__(["AAPL"])
-
-    feed_module.SymbolRepo = PatchedRepo
-    try:
-        await feed.start(fake_session)
-        await feed.start(fake_session)  # second call should be no-op
-    finally:
-        feed_module.SymbolRepo = original
-
-    assert len(feed.subscribed_tickers) == 1
+    repos.watchlist.tickers = ["AAPL"]
+    await broker.disconnect()
+    await feed.sync()
+    assert feed.subscribed_tickers == frozenset()
+    await broker.connect()
+    await feed.sync()
+    await feed.sync()
+    assert feed.subscribed_tickers == {"AAPL"}
 
 
 # ---------------------------------------------------------------------------
@@ -171,19 +211,20 @@ async def test_remove_nonexistent_symbol_is_noop(feed: MarketDataFeed) -> None:
 
 
 @pytest.mark.asyncio
-async def test_price_tick_writes_to_cache(
+async def test_price_tick_writes_key_with_price_and_timestamp(
     feed: MarketDataFeed, broker: MockBroker, cache: FakeCache
 ) -> None:
     await feed.add_symbol("AAPL")
     await broker.simulate_price_tick("AAPL", Decimal("185.00"))
 
-    stored = await cache.get("price:AAPL")
-    assert stored is not None
-    assert "185.00" in stored
+    data = json.loads(await cache.get("price:AAPL"))
+    assert data["price"] == "185.00"
+    assert "timestamp" in data
+    assert feed.last_tick_at("aapl") is not None
 
 
 @pytest.mark.asyncio
-async def test_price_tick_publishes_to_channel(
+async def test_price_tick_publishes_price_update_envelope(
     feed: MarketDataFeed, broker: MockBroker, cache: FakeCache
 ) -> None:
     await feed.add_symbol("AAPL")
@@ -192,7 +233,37 @@ async def test_price_tick_publishes_to_channel(
     assert len(cache.published) == 1
     channel, message = cache.published[0]
     assert channel == WATCHLIST_PRICES_CHANNEL
-    assert "185.00" in message
+    msg = json.loads(message)
+    assert msg["event"] == "price_update"
+    assert msg["payload"] == {"symbol": "AAPL", "price": "185.00", "change_pct": None}
+
+
+@pytest.mark.asyncio
+async def test_listener_called_before_redis_write_and_failure_is_isolated(
+    feed: MarketDataFeed, broker: MockBroker, cache: FakeCache
+) -> None:
+    order: list[str] = []
+    orig_set = cache.set
+
+    async def recording_set(*a, **kw):
+        order.append("set")
+        await orig_set(*a, **kw)
+
+    cache.set = recording_set
+
+    async def bad(update) -> None:
+        order.append("bad")
+        raise RuntimeError("boom")
+
+    async def good(update) -> None:
+        order.append("good")
+
+    feed.add_listener(bad)
+    feed.add_listener(good)
+    await feed.add_symbol("AAPL")
+    await broker.simulate_price_tick("AAPL", Decimal("10"))
+    assert order == ["bad", "good", "set"]
+    assert cache.published
 
 
 @pytest.mark.asyncio
@@ -203,8 +274,7 @@ async def test_multiple_ticks_each_update_cache(
     await broker.simulate_price_tick("NVDA", Decimal("500.00"))
     await broker.simulate_price_tick("NVDA", Decimal("505.50"))
 
-    stored = await cache.get("price:NVDA")
-    assert "505.50" in stored  # latest price wins
+    assert json.loads(await cache.get("price:NVDA"))["price"] == "505.50"
 
 
 # ---------------------------------------------------------------------------

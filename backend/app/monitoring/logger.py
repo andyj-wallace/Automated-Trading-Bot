@@ -157,11 +157,29 @@ class MaskingFilter(logging.Filter):
 # ---------------------------------------------------------------------------
 
 
+def _make_file_handler(log_path: str, level: int, rotating: bool = True) -> logging.Handler:
+    """Build a JSON, masking file handler (rotating at 10 MB x 5, or append-only)."""
+    if rotating:
+        handler: logging.Handler = logging.handlers.RotatingFileHandler(
+            log_path,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+    else:
+        handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    handler.setLevel(level)
+    handler.setFormatter(JsonFormatter())
+    handler.addFilter(MaskingFilter())
+    return handler
+
+
 def _make_logger(
     name: str,
     log_path: str,
     level: int,
     rotating: bool = True,
+    extra_handlers: tuple[logging.Handler, ...] = (),
 ) -> logging.Logger:
     """
     Build and return a configured logger.
@@ -171,6 +189,7 @@ def _make_logger(
         log_path: Absolute path to the log file.
         level: Logging level integer.
         rotating: If True, use RotatingFileHandler; if False, use plain FileHandler.
+        extra_handlers: Already-built handlers shared with other loggers (error.log).
     """
     logger = logging.getLogger(name)
     logger.setLevel(level)
@@ -180,22 +199,9 @@ def _make_logger(
     formatter = JsonFormatter()
     masking_filter = MaskingFilter()
 
-    # File handler
-    if rotating:
-        file_handler: logging.Handler = logging.handlers.RotatingFileHandler(
-            log_path,
-            maxBytes=10 * 1024 * 1024,  # 10 MB
-            backupCount=5,
-            encoding="utf-8",
-        )
-    else:
-        # Append-only, no rotation — for audit log
-        file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
-
-    file_handler.setLevel(level)
-    file_handler.setFormatter(formatter)
-    file_handler.addFilter(masking_filter)
-    logger.addHandler(file_handler)
+    logger.addHandler(_make_file_handler(log_path, level, rotating))
+    for handler in extra_handlers:
+        logger.addHandler(handler)
 
     # Console handler (always on — useful in development and in Docker logs)
     stream_handler = logging.StreamHandler()
@@ -242,30 +248,40 @@ def setup_logging(log_level: str = "INFO", log_dir: str = "logs") -> None:
 
     level = getattr(logging, log_level.upper(), logging.INFO)
 
+    # One handler instance so error.log has exactly one writer; it collects ERROR+
+    # from every application logger.
+    error_handler = _make_file_handler(os.path.join(log_dir, "error.log"), logging.ERROR)
+
     trading_logger = _make_logger(
         "trading",
         os.path.join(log_dir, "trading.log"),
         level,
         rotating=True,
+        extra_handlers=(error_handler,),
     )
     risk_logger = _make_logger(
         "risk",
         os.path.join(log_dir, "risk.log"),
         level,
         rotating=True,
+        extra_handlers=(error_handler,),
     )
     system_logger = _make_logger(
         "system",
         os.path.join(log_dir, "system.log"),
         level,
         rotating=True,
+        extra_handlers=(error_handler,),
     )
-    error_logger = _make_logger(
-        "error",
-        os.path.join(log_dir, "error.log"),
-        logging.ERROR,  # error log always captures ERROR and above
-        rotating=True,
-    )
+    error_logger = logging.getLogger("error")
+    error_logger.setLevel(logging.ERROR)
+    error_logger.propagate = False
+    error_logger.addHandler(error_handler)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.ERROR)
+    stream_handler.setFormatter(JsonFormatter())
+    stream_handler.addFilter(MaskingFilter())
+    error_logger.addHandler(stream_handler)
     audit_logger = _make_logger(
         "audit",
         os.path.join(log_dir, "audit.log"),

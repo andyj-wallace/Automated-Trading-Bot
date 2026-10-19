@@ -45,7 +45,19 @@ export interface WatchedSymbol {
 // ---------------------------------------------------------------------------
 
 export type TradeDirection = "BUY" | "SELL";
-export type TradeStatus = "OPEN" | "CLOSED" | "CANCELLED";
+export type TradeStatus =
+  | "PENDING"
+  | "SUBMITTED"
+  | "OPEN"
+  | "CLOSING"
+  | "CLOSED"
+  | "CANCELLED";
+export type ExitReason =
+  | "STOP_LOSS"
+  | "TAKE_PROFIT"
+  | "MANUAL"
+  | "STALE_TIMEOUT"
+  | "EXTERNAL";
 
 export interface Trade {
   id: string;
@@ -53,17 +65,26 @@ export interface Trade {
   symbol: string;
   direction: TradeDirection;
   quantity: string;
+  status: TradeStatus;
   entry_price: string;
   stop_loss_price: string;
-  exit_price: string | null;
-  status: TradeStatus;
+  take_profit_price: string;
+  reward_to_risk_ratio: string;
   risk_amount: string;
   account_balance_at_entry: string;
+  exit_price: string | null;
+  exit_reason: ExitReason | null;
+  entry_fill_price: string | null;
+  filled_quantity: string | null;
+  current_stop_price: string | null;
+  close_attempts: number;
   pnl: string | null;
   executed_at: string;
   closed_at: string | null;
   created_at: string;
 }
+
+export type CloseOutcome = "CLOSED" | "PENDING_EXIT" | "NOT_OPEN" | "MARKET_CLOSED" | "FAILED";
 
 // ---------------------------------------------------------------------------
 // Strategy
@@ -77,6 +98,59 @@ export interface Strategy {
   config: Record<string, unknown>;
   created_at: string;
   updated_at: string;
+}
+
+export interface StrategyType {
+  type: string;
+  config_schema: JsonSchema;
+}
+
+export interface JsonSchemaProperty {
+  type?: string | string[];
+  enum?: string[];
+  default?: unknown;
+  minimum?: number;
+  maximum?: number;
+  description?: string;
+  items?: JsonSchemaProperty;
+  properties?: Record<string, JsonSchemaProperty>;
+}
+
+export interface JsonSchema {
+  type?: string;
+  properties?: Record<string, JsonSchemaProperty>;
+  required?: string[];
+}
+
+export interface StrategyCreate {
+  name: string;
+  type: string;
+  config: Record<string, unknown>;
+  is_enabled: boolean;
+}
+
+export interface StrategySignal {
+  id: string;
+  strategy_id: string;
+  symbol: string;
+  bar_date: string;
+  action: string;
+  entry_price: string | null;
+  stop_loss_price: string | null;
+  take_profit_price: string | null;
+  outcome: string;
+  detail: string | null;
+  trade_id: string | null;
+  created_at: string;
+}
+
+export interface PriceBar {
+  time: string;
+  open: string;
+  high: string;
+  low: string;
+  close: string;
+  volume: number | string;
 }
 
 export interface StrategyPatch {
@@ -96,6 +170,33 @@ export interface RiskStatus {
   alert_level: "NONE" | "WARNING" | "CRITICAL";
   warning_threshold_pct: string;
   critical_threshold_pct: string;
+}
+
+export interface TradingStatus {
+  paused: boolean;
+  market_open: boolean;
+  in_eval_window: boolean;
+  broker_connected: boolean;
+  engine_lock_held: boolean;
+  scheduler_last_cycle_at: string | null;
+  open_trade_count: number;
+  circuit_breaker_halted: boolean;
+}
+
+export interface FlattenResult {
+  paused: boolean;
+  results: { trade_id: string; symbol: string; outcome: string }[];
+}
+
+export interface CircuitBreakerStatus {
+  daily_halted: boolean;
+  daily_realized_pnl: string;
+  day_starting_balance: string;
+  killed_strategy_ids: string[];
+  trading_date: string;
+  daily_loss_limit_pct: string;
+  halt_threshold_amount: string;
+  consecutive_losses: Record<string, number>;
 }
 
 // ---------------------------------------------------------------------------
@@ -121,8 +222,9 @@ export interface SystemHealth {
 export type DashboardEventType =
   | "price_update"
   | "trade_executed"
+  | "trade_closed"
   | "risk_alert"
-  | "position_update";
+  | "system_alert";
 
 export interface DashboardEvent {
   event: DashboardEventType | string;

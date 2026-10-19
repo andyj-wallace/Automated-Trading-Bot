@@ -169,7 +169,8 @@ class IntraWeekMeanReversionStrategy(BaseStrategy):
         except Exception:
             return 0
 
-    def get_config_schema(self) -> dict:
+    @classmethod
+    def get_config_schema(cls) -> dict:
         """JSON Schema for the intra-week mean reversion strategy configuration."""
         return {
             "type": "object",

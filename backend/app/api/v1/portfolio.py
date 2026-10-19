@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.schemas import ok
 from app.brokers.base import BaseBroker
+from app.config import get_settings
 from app.core.risk.monitor import RiskMonitor, RiskMonitorConfig
 from app.dependencies import get_broker, get_db
 from app.monitoring.logger import system_logger
@@ -42,7 +43,9 @@ async def get_portfolio_risk(
                 extra={"error": str(exc)},
             )
 
-    config = RiskMonitorConfig()
+    config = RiskMonitorConfig(
+        max_aggregate_risk_pct=get_settings().max_portfolio_risk_pct
+    )
     monitor = RiskMonitor(config=config)
     status = await monitor.check_exposure(db, balance)
 

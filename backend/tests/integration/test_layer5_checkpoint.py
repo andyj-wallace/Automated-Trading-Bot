@@ -2,7 +2,7 @@
 Layer 5 integration checkpoint — requires live Docker services.
 
 Verifies:
-  1. MarketDataFeed.start() subscribes to active symbols with MockBroker
+  1. MarketDataFeed subscribes to symbols with MockBroker
   2. broker.simulate_price_tick() causes Redis to hold price:{ticker}
   3. HistoricalDataFetcher.fetch_and_store() writes rows to ohlcv_bars hypertable
 
@@ -30,12 +30,8 @@ from app.data.feed import MarketDataFeed
 from app.data.historical import HistoricalDataFetcher
 from app.db.repositories.ohlcv_repo import OHLCVRepo
 
-# Use env vars when running inside the container; fall back to localhost for host-side runs.
-_DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql+asyncpg://trading:trading@localhost:5432/trading_bot",
-)
-_REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+_DB_URL = os.environ["DATABASE_URL"]
+_REDIS_URL = os.environ["REDIS_URL"]
 
 # Unique symbol that won't conflict with any real watched_symbols rows.
 _TEST_SYMBOL = "TSTTICK"
@@ -86,7 +82,7 @@ async def test_price_tick_reaches_redis(broker: MockBroker, cache: RedisCache) -
       feed.add_symbol("AAPL") + broker.simulate_price_tick()
       → price:AAPL key is written to Redis.
     """
-    feed = MarketDataFeed(broker, cache)
+    feed = MarketDataFeed(broker, cache, None)
     await feed.add_symbol("AAPL")
 
     await broker.simulate_price_tick("AAPL", Decimal("190.50"))
@@ -95,10 +91,8 @@ async def test_price_tick_reaches_redis(broker: MockBroker, cache: RedisCache) -
     assert raw is not None, "Expected 'price:AAPL' in Redis but got None"
 
     data = json.loads(raw)
-    assert data["ticker"] == "AAPL"
-    # Decimal may serialize as string or number depending on Pydantic version;
-    # convert to Decimal for a precise comparison.
-    assert Decimal(str(data["price"])) == Decimal("190.50")
+    assert Decimal(data["price"]) == Decimal("190.50")
+    assert "timestamp" in data
 
 
 @pytest.mark.asyncio
@@ -109,7 +103,7 @@ async def test_price_tick_publishes_to_watchlist_channel(
     simulate_price_tick() also publishes to the watchlist_prices pub/sub channel.
     Verified by subscribing before the tick fires and reading one message.
     """
-    feed = MarketDataFeed(broker, cache)
+    feed = MarketDataFeed(broker, cache, None)
     await feed.add_symbol("AAPL")
 
     # Collect publish calls via a thin wrapper around the real cache.
@@ -130,7 +124,8 @@ async def test_price_tick_publishes_to_watchlist_channel(
     channel, message = published[0]
     assert channel == "watchlist_prices"
     data = json.loads(message)
-    assert data["ticker"] == "AAPL"
+    assert data["event"] == "price_update"
+    assert data["payload"]["symbol"] == "AAPL"
 
 
 # ---------------------------------------------------------------------------

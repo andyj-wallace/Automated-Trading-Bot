@@ -13,14 +13,13 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { api } from "../../api/client";
-import type { DashboardEvent, RiskStatus } from "../../types/api";
+import { useLiveStore } from "../../store/liveStore";
+import type { RiskStatus } from "../../types/api";
 
-interface Props {
-  lastEvent: DashboardEvent | null;
-}
-
-export function RiskGauge({ lastEvent }: Props) {
+export function RiskGauge() {
   const queryClient = useQueryClient();
+  const riskVersion = useLiveStore((s) => s.riskVersion);
+  const tradesVersion = useLiveStore((s) => s.tradesVersion);
 
   const { data, isLoading } = useQuery({
     queryKey: ["portfolio-risk"],
@@ -32,10 +31,10 @@ export function RiskGauge({ lastEvent }: Props) {
   });
 
   useEffect(() => {
-    if (lastEvent?.event === "risk_alert" || lastEvent?.event === "trade_executed" || lastEvent?.event === "trade_closed") {
+    if (riskVersion + tradesVersion > 0) {
       queryClient.invalidateQueries({ queryKey: ["portfolio-risk"] });
     }
-  }, [lastEvent, queryClient]);
+  }, [riskVersion, tradesVersion, queryClient]);
 
   const alertLevel = data?.alert_level ?? "NONE";
   const riskPct = data ? parseFloat(data.aggregate_risk_pct) * 100 : 0;

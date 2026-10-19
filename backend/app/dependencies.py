@@ -10,9 +10,11 @@ from collections.abc import AsyncGenerator
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
+from fastapi import HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 if TYPE_CHECKING:
+    from app.core.engine import TradingEngine
     from app.data.cache import RedisCache
 
 from app.brokers.base import BaseBroker
@@ -79,10 +81,22 @@ def _build_circuit_breaker() -> CircuitBreaker:
     lifetime. Shared by RiskManager, OrderManager (wired in app/main.py's
     lifespan), and the /risk/circuit-breaker admin endpoints below.
     """
-    return CircuitBreaker()
+    settings = get_settings()
+    return CircuitBreaker(
+        daily_loss_limit_pct=settings.daily_loss_limit_pct,
+        max_consecutive_losses=settings.max_consecutive_losses,
+    )
 
 
 async def get_circuit_breaker() -> CircuitBreaker:
     """Circuit breaker dependency. Same instance used by RiskManager/OrderManager."""
     return _build_circuit_breaker()
 
+
+
+def get_engine(request: Request) -> TradingEngine:
+    """Return the running TradingEngine or raise 503."""
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None or not engine.started:
+        raise HTTPException(status_code=503, detail="Trading engine is not running")
+    return engine

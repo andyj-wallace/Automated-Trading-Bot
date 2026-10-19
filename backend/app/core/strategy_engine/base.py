@@ -122,8 +122,9 @@ class BaseStrategy(ABC):
         at most that value. Return 0 to indicate no trade.
         """
 
+    @classmethod
     @abstractmethod
-    def get_config_schema(self) -> dict:
+    def get_config_schema(cls) -> dict:
         """
         Return a JSON-schema dict describing the strategy's config parameters.
 

@@ -105,7 +105,7 @@ The risk engine is the sole authority on whether a trade may be entered and on w
 ### 4. Broker Abstraction Layer (`backend/app/brokers/`)
 - Abstract `BaseBroker` interface; all strategy and execution code depends on this, never on IBKR directly
 - `IBKRClient` wraps `ib_async` (the actively maintained successor to `ib_insync` — see `tasks.md § Library Change`)
-- `MockBroker` decouples all development and testing from any live broker dependency — the default for `ENVIRONMENT=development`
+- `MockBroker` decouples all development and testing from any live broker dependency. The broker is chosen by `BROKER=mock|ibkr`, not by `ENVIRONMENT`
 
 **How IBKR connectivity works at runtime:**
 
@@ -113,7 +113,7 @@ The risk engine is the sole authority on whether a trade may be entered and on w
 
 ```
 IBKRClient (ib_async)
-    │ TCP socket localhost:4001
+    │ TCP socket localhost:4002 (native paper) / ib-gateway:4004 (Docker paper)
     ▼
 IB Gateway process (running locally or in Docker)
     │ authenticated session
@@ -432,3 +432,40 @@ Must include:
 > See `requirements.md` for feature user stories.
 > See `tasks.md` for implementation task breakdown.
 > See `ibkr-gateway.md` for IB Gateway setup, authentication, and daily startup procedure.
+
+---
+
+## Event Contract (Phase 7)
+
+Single source of truth: `app/core/events.py`. Every message is `{"event": ..., "payload": {...}, "timestamp": "<ISO UTC>"}`, built only by `events.envelope()`.
+
+| Channel | `event` | `payload` | Producer | Consumers |
+|---------|---------|-----------|----------|-----------|
+| `watchlist_prices` | `price_update` | `{symbol, price: str, change_pct: str \| null}` | MarketDataFeed | WebSocket, UI |
+| `trade_events` | `trade_executed` | `trade_id, symbol, direction, quantity, entry_price, stop_loss_price, take_profit_price, risk_amount, reward_to_risk_ratio, status` | OrderManager (via TradeHandler) | WebSocket, Notifier |
+| `trade_events` | `trade_closed` | `{trade_id, symbol, reason, exit_price, pnl}` | OrderManager | WebSocket, Notifier |
+| `risk_updates` | `risk_alert` | RiskMonitor payload | RiskMonitor | WebSocket, Notifier |
+| `system_alerts` | `system_alert` | `{alert_type, message, severity, ...details}` | `publish_system_alert()` | WebSocket, Notifier |
+
+Redis key `price:{SYMBOL}` = `{"price": "<decimal str>", "timestamp": "<ISO UTC>"}`, written only by MarketDataFeed.
+
+## Background Tasks (Phase 7)
+
+All are owned and stopped by `TradingEngine` (`app/core/engine.py`). One backend process, one uvicorn worker.
+
+| Task | Interval | Gated by | Owner |
+|------|----------|----------|-------|
+| IBKR connection supervisor | checks every 5 s; backoff 5 to 60 s | none | IBKRClient |
+| Feed universe sync | 60 s | broker connected | MarketDataFeed |
+| Monitor DB resync | 5 s | none | PositionMonitor |
+| Stale-trade sweep | 1 h | market open | PositionMonitor |
+| Price-feed watchdog | 30 s | market open (after a grace period at the open) | PositionMonitor |
+| Strategy cycle | 60 s | 09:45-15:45 ET trading day, not paused, broker connected | StrategyScheduler |
+| Reconciler | 120 s + startup + every reconnect | broker connected; order-placing actions only while market open | Reconciler |
+| Risk monitor | 30 s | none | RiskMonitor |
+| Bar refresh | checks every 60 s; daily 16:30 ET + once after startup | trading day, broker connected | BarRefreshJob |
+| Daily summary | checks every 60 s; daily 16:45 ET | trading day | DailySummaryJob |
+| Engine lock renew | 10 s | none | EngineLock |
+| Notification subscriber | streaming, supervised | none | TradingEngine |
+
+See `production-readiness-plan.md` section 3 for flows and rationale.

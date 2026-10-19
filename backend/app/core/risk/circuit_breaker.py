@@ -10,9 +10,11 @@ inspects/resets it) — see app/main.py lifespan and app/dependencies.py.
 Two independent gates:
   1. Daily circuit breaker — halts ALL new trades for the rest of the
      trading day once cumulative realized loss reaches `daily_loss_limit_pct`
-     of the day's starting balance. Auto-resets at the first recorded trade
-     of a new calendar day (UTC); can also be lifted early by an admin via
-     reset_daily_halt().
+     of the day's starting balance. The halt is bound to its New York
+     trading date, so is_halted() is False the next day even with no new
+     trades; it can also be lifted early by an admin via reset_daily_halt().
+     State is in memory only: the engine re-computes it from the trades table
+     at startup via rehydrate(), so a restart never lifts a halt.
   2. Per-strategy kill switch — disables a single strategy_id after
      `max_consecutive_losses` losing trades in a row. A winning trade resets
      that strategy's streak. Once killed, a strategy stays disabled until
@@ -26,9 +28,11 @@ or cancels orders itself.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from decimal import Decimal
 from uuid import UUID
+
+from app.core import market_calendar
 
 DEFAULT_DAILY_LOSS_LIMIT_PCT = Decimal("0.03")  # between the 1% per-trade rule and 10% hard cap
 DEFAULT_MAX_CONSECUTIVE_LOSSES = 5
@@ -78,32 +82,66 @@ class CircuitBreaker:
         strategy_id: UUID | None = None,
         *,
         now: datetime | None = None,
-    ) -> None:
+    ) -> list[str]:
         """
         Update daily PnL and the strategy's consecutive-loss streak.
 
         `account_balance` is used as the day's starting balance the first
-        time a trade is recorded on a new calendar day, sizing the loss
+        time a trade is recorded on a new trading day (ET), sizing the loss
         threshold for that day.
+
+        Returns the events newly triggered by this trade: "DAILY_HALT" the first
+        time the halt trips today, "STRATEGY_KILLED" the first time a strategy is killed.
         """
+        events: list[str] = []
         self._roll_day_if_needed(account_balance, now=now)
         self._daily_realized_pnl += pnl
 
         threshold = self._day_starting_balance * self._daily_loss_limit_pct
-        if self._daily_realized_pnl <= -threshold:
+        if self._daily_realized_pnl <= -threshold and not self._halted_today:
             self._halted_today = True
+            events.append("DAILY_HALT")
 
         if strategy_id is not None:
             state = self._strategies.setdefault(strategy_id, _StrategyState())
             if pnl < 0:
                 state.consecutive_losses += 1
-                if state.consecutive_losses >= self._max_consecutive_losses:
+                if state.consecutive_losses >= self._max_consecutive_losses and not state.killed:
                     state.killed = True
+                    events.append("STRATEGY_KILLED")
             else:
                 state.consecutive_losses = 0
+        return events
+
+    def rehydrate(
+        self,
+        *,
+        realized_pnl_today: Decimal,
+        day_starting_balance: Decimal,
+        recent_pnls_by_strategy: dict[UUID, list[Decimal]],
+        now: datetime | None = None,
+    ) -> None:
+        """
+        Rebuild state from the trades table after a restart.
+
+        `recent_pnls_by_strategy` holds each strategy's latest closed-trade PnLs,
+        newest first; the loss streak is the run of losses at the front.
+        """
+        self._current_day = market_calendar.trading_date(now)
+        self._day_starting_balance = day_starting_balance
+        self._daily_realized_pnl = realized_pnl_today
+        threshold = day_starting_balance * self._daily_loss_limit_pct
+        self._halted_today = day_starting_balance > 0 and realized_pnl_today <= -threshold
+        for strategy_id, pnls in recent_pnls_by_strategy.items():
+            streak = 0
+            for pnl in pnls:
+                if pnl >= 0:
+                    break
+                streak += 1
+            self._strategies[strategy_id] = _StrategyState(consecutive_losses=streak)
 
     def _roll_day_if_needed(self, account_balance: Decimal, *, now: datetime | None) -> None:
-        today = (now or datetime.now(UTC)).date()
+        today = market_calendar.trading_date(now)
         if self._current_day != today:
             self._current_day = today
             self._day_starting_balance = account_balance
@@ -114,9 +152,24 @@ class CircuitBreaker:
     # Daily halt — queries + admin override
     # ------------------------------------------------------------------
 
-    def is_halted(self) -> bool:
-        """True if today's cumulative realized loss has tripped the halt."""
-        return self._halted_today
+    def is_halted(self, *, now: datetime | None = None) -> bool:
+        """True if today's (ET) cumulative realized loss has tripped the halt."""
+        return self._halted_today and self._current_day == market_calendar.trading_date(now)
+
+    @property
+    def trading_date(self) -> date | None:
+        return self._current_day
+
+    @property
+    def daily_loss_limit_pct(self) -> Decimal:
+        return self._daily_loss_limit_pct
+
+    @property
+    def halt_threshold_amount(self) -> Decimal:
+        return self._day_starting_balance * self._daily_loss_limit_pct
+
+    def strategy_streaks(self) -> dict[UUID, int]:
+        return {sid: st.consecutive_losses for sid, st in self._strategies.items()}
 
     @property
     def daily_realized_pnl(self) -> Decimal:

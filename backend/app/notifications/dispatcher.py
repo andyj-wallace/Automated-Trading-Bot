@@ -44,14 +44,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 import smtplib
 import ssl
+import time
+from collections.abc import Callable
 from email.message import EmailMessage
 from urllib.parse import unquote, urlparse
 
 from app.monitoring.logger import system_logger
 
 _log = system_logger
+
+_ALERT_THROTTLE_SECONDS = 15 * 60
 
 
 class NotificationDispatcher:
@@ -62,7 +67,11 @@ class NotificationDispatcher:
     exceptions internally and log them rather than propagating.
     """
 
-    def __init__(self, settings) -> None:
+    def __init__(
+        self, settings, *, monotonic: Callable[[], float] = time.monotonic
+    ) -> None:
+        self._monotonic = monotonic
+        self._last_alert_sent: dict[tuple[str, str], float] = {}
         self._smtp_url: str = getattr(settings, "notification_email_smtp", "")
         self._enabled = bool(self._smtp_url)
 
@@ -131,10 +140,24 @@ class NotificationDispatcher:
             )
 
         elif event_type == "system_alert":
+            alert_type = payload.get("alert_type", "UNKNOWN")
+            if self._throttled(alert_type, str(payload.get("symbol") or "")):
+                return
             await self.notify_system_alert(
-                alert_type=payload.get("alert_type", "UNKNOWN"),
+                alert_type=alert_type,
                 message=payload.get("message", "No details provided."),
+                severity=payload.get("severity", "CRITICAL"),
             )
+
+    def _throttled(self, alert_type: str, symbol: str) -> bool:
+        """True if the same (alert_type, symbol) was sent within the last 15 minutes."""
+        now = self._monotonic()
+        key = (alert_type, symbol)
+        last = self._last_alert_sent.get(key)
+        if last is not None and now - last < _ALERT_THROTTLE_SECONDS:
+            return True
+        self._last_alert_sent[key] = now
+        return False
 
     async def notify_risk_alert(
         self,
@@ -196,20 +219,27 @@ class NotificationDispatcher:
         self,
         alert_type: str,
         message: str,
+        severity: str = "CRITICAL",
     ) -> None:
-        """Send a critical system fault notification."""
-        subject = f"[TradingBot] CRITICAL system alert — {alert_type}"
+        """Send a system alert; INFO severity goes by email only (no SMS)."""
+        subject = f"[TradingBot] {severity} system alert — {alert_type}"
         body = (
             f"System Alert: {alert_type}\n\n"
             f"{message}\n"
         )
-        sms_body = f"[TradingBot] CRITICAL: {alert_type} — {message[:100]}"
-        _log.critical(
+        sms_body = f"[TradingBot] {severity}: {alert_type} — {message[:100]}"
+        _log.log(
+            logging.INFO if severity == "INFO" else logging.WARNING,
             "NotificationDispatcher: system alert",
-            extra={"alert_type": alert_type, "message": message},
+            extra={"alert_type": alert_type, "alert_message": message, "severity": severity},
         )
         await self._send(subject, body)
-        await self._send_sms(sms_body)
+        if severity != "INFO":
+            await self._send_sms(sms_body)
+
+    async def notify_daily_summary(self, subject: str, body: str) -> None:
+        """Email the end-of-day summary (no SMS)."""
+        await self._send(subject, body)
 
     async def notify_trade_closed(
         self,

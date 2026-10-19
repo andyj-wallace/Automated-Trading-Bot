@@ -16,8 +16,8 @@ position close, covering every component boundary in the execution path:
     (7)  close_position on missing trade: graceful no-op, no crash
 
   PositionMonitor integration
-    (8)  Price below stop_loss published to Redis → PositionMonitor fires close → CLOSED
-    (9)  Price above take_profit published to Redis → PositionMonitor fires close → CLOSED
+    (8)  Price below stop_loss ticked through MarketDataFeed → PositionMonitor fires close → CLOSED
+    (9)  Price above take_profit ticked through MarketDataFeed → PositionMonitor fires close → CLOSED
 
   Strategy → execution pipeline
     (10) MovingAverageStrategy golden-cross signal flows to OPEN trade in DB
@@ -36,6 +36,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import uuid
@@ -59,11 +60,8 @@ from app.data.cache import RedisCache
 from app.db.models.trade import Trade, TradeStatus
 from app.db.repositories.trade_repo import TradeRepo
 
-_DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql+asyncpg://trading:trading@localhost:5432/trading_bot",
-)
-_REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+_DB_URL = os.environ["DATABASE_URL"]
+_REDIS_URL = os.environ["REDIS_URL"]
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -180,6 +178,7 @@ def _make_order_manager(
         order_retry_attempts=order_retry_attempts,
         order_retry_backoff_seconds=order_retry_backoff_seconds,
         circuit_breaker=circuit_breaker,
+        is_market_open=lambda: True,
     )
 
 
@@ -199,6 +198,22 @@ async def _poll_for_status(
                 return trade
         await asyncio.sleep(interval)
     return None
+
+
+def _monitor_with_feed(broker, cache, session_factory, order_manager):
+    """PositionMonitor fed by MarketDataFeed (prices driven via MockBroker ticks)."""
+    from app.data.feed import MarketDataFeed
+
+    feed = MarketDataFeed(broker, cache, session_factory)
+    monitor = PositionMonitor(
+        cache=cache,
+        session_factory=session_factory,
+        order_manager=order_manager,
+        is_market_open=lambda: True,
+        last_tick_at=feed.last_tick_at,
+    )
+    feed.add_listener(monitor.on_price_update)
+    return monitor, feed
 
 
 async def _open_trade(order_manager: OrderManager, **kwargs) -> TradeRequest:
@@ -247,6 +262,46 @@ class TestFullEntryFlow:
         trade = await repo.get_by_id(req.trade_id)
         assert trade is not None
         assert trade.status == TradeStatus.OPEN
+
+    @pytest.mark.asyncio
+    async def test_fill_publishes_exactly_one_trade_executed(
+        self, broker, session_factory, cache
+    ) -> None:
+        """Every OPEN transition publishes one trade_executed event on trade_events."""
+        received: list[dict] = []
+
+        async def _listen() -> None:
+            async for raw in cache.subscribe("trade_events"):
+                received.append(json.loads(raw))
+
+        listener = asyncio.create_task(_listen())
+        await asyncio.sleep(0.3)  # let the subscription establish
+        try:
+            om = _make_order_manager(broker, session_factory, cache=cache)
+            req = _valid_request(symbol="NFLX")
+            await om.submit_order(req)
+            await asyncio.sleep(0.3)
+        finally:
+            listener.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await listener
+
+        executed = [e for e in received if e["event"] == "trade_executed"]
+        assert len(executed) == 1
+        assert executed[0]["payload"]["trade_id"] == str(req.trade_id)
+
+    @pytest.mark.asyncio
+    async def test_publish_failure_does_not_fail_order(self, broker, session_factory) -> None:
+        """A cache that raises on publish must not break submit_order()."""
+
+        class _BrokenCache:
+            async def publish(self, *a, **kw):
+                raise ConnectionError("redis down")
+
+        om = _make_order_manager(broker, session_factory, cache=_BrokenCache())
+        req = _valid_request(symbol="ORCL")
+        _, result = await om.submit_order(req)
+        assert result.status == "FILLED"
 
     @pytest.mark.asyncio
     async def test_trade_db_row_has_correct_fields(
@@ -369,16 +424,18 @@ class TestClosePositionFlow:
     async def test_close_pnl_calculated_correctly_for_buy(
         self, broker, session_factory, session
     ) -> None:
-        """PnL = (fill_price − entry_price) × qty for a BUY trade."""
+        """PnL = (exit fill − entry fill) × filled qty for a BUY trade."""
         om = _make_order_manager(broker, session_factory)
+        broker.last_prices["AAPL"] = Decimal("200")
         req = await _open_trade(om, entry_price=Decimal("200"), quantity=Decimal("10"))
+        broker.last_prices["AAPL"] = Decimal("100")
 
         await om.close_position(req.trade_id, "TAKE_PROFIT")
 
         trade = await TradeRepo(session).get_by_id(req.trade_id)
         assert trade is not None
         assert trade.pnl is not None
-        # MockBroker fills MKT close orders at 100.00; pnl = (100 − 200) × 10 = -1000
+        # entry filled at 200, exit at 100: pnl = (100 − 200) × 10 = -1000
         assert trade.pnl == Decimal("-1000")
 
     @pytest.mark.asyncio
@@ -422,20 +479,19 @@ class TestClosePositionFlow:
         await om.close_position(ghost_id, "STOP_LOSS")
 
     @pytest.mark.asyncio
-    async def test_close_already_closed_trade_logs_critical(
+    async def test_close_already_closed_trade_is_not_open(
         self, broker, session_factory
     ) -> None:
-        """Attempting to close an already-CLOSED trade is logged as CRITICAL."""
+        """Closing an already-CLOSED trade is a NOT_OPEN no-op that sends no order."""
         om = _make_order_manager(broker, session_factory)
         req = await _open_trade(om)
         await om.close_position(req.trade_id, "STOP_LOSS")
 
         # Second close attempt — trade is now CLOSED, not OPEN
-        with patch("app.core.execution.order_manager.error_logger") as mock_err:
-            await om.close_position(req.trade_id, "STOP_LOSS")
+        from app.core.execution.order_manager import CloseOutcome
 
-        mock_err.critical.assert_called_once()
-        assert "unexpected status" in mock_err.critical.call_args.args[0].lower()
+        assert await om.close_position(req.trade_id, "STOP_LOSS") == CloseOutcome.NOT_OPEN
+        assert len(broker.placed_orders) == 2  # entry + one exit, no second exit
 
 
 # ---------------------------------------------------------------------------
@@ -453,11 +509,13 @@ class TestCircuitBreakerIntegration:
 
         cb = CircuitBreaker()
         om = _make_order_manager(broker, session_factory, circuit_breaker=cb)
+        broker.last_prices["AAPL"] = Decimal("200")
         req = await _open_trade(om, entry_price=Decimal("200"), quantity=Decimal("10"))
+        broker.last_prices["AAPL"] = Decimal("100")
 
         await om.close_position(req.trade_id, "TAKE_PROFIT")
 
-        # MockBroker fills MKT close orders at 100.00 → pnl = (100-200)×10 = -1000
+        # entry filled at 200, exit at 100 → pnl = (100-200)×10 = -1000
         assert cb.daily_realized_pnl == Decimal("-1000")
 
     @pytest.mark.asyncio
@@ -470,7 +528,9 @@ class TestCircuitBreakerIntegration:
 
         cb = CircuitBreaker(daily_loss_limit_pct=Decimal("0.005"))  # 0.5% — trips on -1000/100000
         om = _make_order_manager(broker, session_factory, circuit_breaker=cb)
+        broker.last_prices["AAPL"] = Decimal("200")
         req = await _open_trade(om, entry_price=Decimal("200"), quantity=Decimal("10"))
+        broker.last_prices["AAPL"] = Decimal("100")
 
         await om.close_position(req.trade_id, "TAKE_PROFIT")
         assert cb.is_halted() is True
@@ -575,7 +635,7 @@ class TestOrderRetry:
         assert trade.status == TradeStatus.CLOSED
 
     @pytest.mark.asyncio
-    async def test_close_position_exhausts_retries_and_logs_critical(
+    async def test_close_position_exhausts_retries_and_leaves_closing(
         self, broker, session_factory, session
     ) -> None:
         """When every retry fails, the trade is left at CLOSING (not silently
@@ -590,12 +650,10 @@ class TestOrderRetry:
 
         broker.place_order = always_fails
 
-        with patch("app.core.execution.order_manager.error_logger") as mock_err:
-            await om.close_position(req.trade_id, "STOP_LOSS")
+        from app.core.execution.order_manager import CloseOutcome
 
-        mock_err.critical.assert_called_once()
-        extra = mock_err.critical.call_args.kwargs["extra"]
-        assert extra["attempts"] == 2
+        outcome = await om.close_position(req.trade_id, "STOP_LOSS")
+        assert outcome == CloseOutcome.FAILED
 
         trade = await TradeRepo(session).get_by_id(req.trade_id)
         assert trade is not None
@@ -618,25 +676,18 @@ class TestPositionMonitorIntegration:
         Flow:
           1. Submit order → OPEN in DB
           2. Start PositionMonitor (loads open trade from DB)
-          3. Publish price at stop_loss trigger level to Redis
+          3. Tick a price at the stop_loss trigger level through MarketDataFeed
           4. Poll DB for CLOSED status
         """
         om = _make_order_manager(broker, session_factory, cache=cache)
         req = await _open_trade(om, symbol="TSLA")
 
-        monitor = PositionMonitor(
-            cache=cache,
-            session_factory=session_factory,
-            order_manager=om,
-        )
+        monitor, feed = _monitor_with_feed(broker, cache, session_factory, om)
         await monitor.start()
-        # Allow the subscription task to set up
-        await asyncio.sleep(0.2)
+        await feed.add_symbol("TSLA")
 
         try:
-            # Publish a price below stop_loss (195) to trigger the monitor
-            price_payload = json.dumps({"price": str(_STOP_TRIGGER), "ticker": "TSLA"})
-            await cache.publish("price:TSLA", price_payload)
+            await broker.simulate_price_tick("TSLA", _STOP_TRIGGER)
 
             # Poll for CLOSED status (PositionMonitor fires close asynchronously)
             trade = await _poll_for_status(
@@ -658,17 +709,12 @@ class TestPositionMonitorIntegration:
         om = _make_order_manager(broker, session_factory, cache=cache)
         req = await _open_trade(om, symbol="NVDA")
 
-        monitor = PositionMonitor(
-            cache=cache,
-            session_factory=session_factory,
-            order_manager=om,
-        )
+        monitor, feed = _monitor_with_feed(broker, cache, session_factory, om)
         await monitor.start()
-        await asyncio.sleep(0.2)
+        await feed.add_symbol("NVDA")
 
         try:
-            price_payload = json.dumps({"price": str(_TP_TRIGGER), "ticker": "NVDA"})
-            await cache.publish("price:NVDA", price_payload)
+            await broker.simulate_price_tick("NVDA", _TP_TRIGGER)
 
             trade = await _poll_for_status(
                 session_factory, req.trade_id, TradeStatus.CLOSED, timeout=5.0
@@ -688,18 +734,12 @@ class TestPositionMonitorIntegration:
         om = _make_order_manager(broker, session_factory, cache=cache)
         req = await _open_trade(om, symbol="AMD")
 
-        monitor = PositionMonitor(
-            cache=cache,
-            session_factory=session_factory,
-            order_manager=om,
-        )
+        monitor, feed = _monitor_with_feed(broker, cache, session_factory, om)
         await monitor.start()
-        await asyncio.sleep(0.2)
+        await feed.add_symbol("AMD")
 
         try:
-            # Publish a neutral price (between stop and target)
-            neutral_price = json.dumps({"price": "202.00", "ticker": "AMD"})
-            await cache.publish("price:AMD", neutral_price)
+            await broker.simulate_price_tick("AMD", Decimal("202.00"))
             await asyncio.sleep(0.3)
 
             async with session_factory() as s:
@@ -718,11 +758,7 @@ class TestPositionMonitorIntegration:
         om = _make_order_manager(broker, session_factory, cache=cache)
         req = await _open_trade(om, symbol="META")
 
-        monitor = PositionMonitor(
-            cache=cache,
-            session_factory=session_factory,
-            order_manager=om,
-        )
+        monitor, feed = _monitor_with_feed(broker, cache, session_factory, om)
         original_close = om.close_position
 
         async def _count_close(trade_id, reason):
@@ -731,13 +767,11 @@ class TestPositionMonitorIntegration:
 
         om.close_position = _count_close  # type: ignore[method-assign]
         await monitor.start()
-        await asyncio.sleep(0.2)
+        await feed.add_symbol("META")
 
         try:
-            payload = json.dumps({"price": str(_STOP_TRIGGER), "ticker": "META"})
-            # Publish twice in rapid succession
-            await cache.publish("price:META", payload)
-            await cache.publish("price:META", payload)
+            await broker.simulate_price_tick("META", _STOP_TRIGGER)
+            await broker.simulate_price_tick("META", _STOP_TRIGGER)
             await asyncio.sleep(0.5)
 
             # close_position should have been called exactly once
@@ -939,8 +973,8 @@ class TestPortfolioRiskGate:
         om = _make_order_manager(broker, session_factory)
 
         results = await asyncio.gather(
-            om.submit_order(_valid_request(trade_id=uuid.uuid4())),
-            om.submit_order(_valid_request(trade_id=uuid.uuid4())),
+            om.submit_order(_valid_request(trade_id=uuid.uuid4(), symbol="AAPL")),
+            om.submit_order(_valid_request(trade_id=uuid.uuid4(), symbol="NVDA")),
             return_exceptions=True,
         )
 
@@ -950,3 +984,193 @@ class TestPortfolioRiskGate:
         assert len(successes) == 1, f"Expected exactly 1 success, got {len(successes)}"
         assert len(failures) == 1, f"Expected exactly 1 rejection, got {len(failures)}"
         assert "PORTFOLIO_RISK_LIMIT_EXCEEDED" in str(failures[0])
+
+
+# ---------------------------------------------------------------------------
+# Group 12 — Order lifecycle (C2)
+# ---------------------------------------------------------------------------
+
+
+async def test_working_entry_stays_submitted_with_order_id(broker, session_factory):
+    manager = _make_order_manager(broker, session_factory)
+    broker.next_status = "WORKING"
+    req = _valid_request()
+    _, result = await manager.submit_order(req)
+
+    assert result.status == "WORKING"
+    async with session_factory() as s:
+        trade = await TradeRepo(s).get_by_id(req.trade_id)
+    assert trade.status == TradeStatus.SUBMITTED
+    assert trade.entry_order_id == result.broker_order_id
+    assert trade.entry_fill_price is None
+
+
+async def test_partial_entry_opens_with_filled_quantity(broker, session_factory):
+    manager = _make_order_manager(broker, session_factory)
+    broker.next_status = "PARTIAL"
+    broker.next_filled_quantity = Decimal("4")
+    broker.last_prices["AAPL"] = Decimal("200.5")
+    req = _valid_request()
+    await manager.submit_order(req)
+
+    async with session_factory() as s:
+        trade = await TradeRepo(s).get_by_id(req.trade_id)
+    assert trade.status == TradeStatus.OPEN
+    assert trade.filled_quantity == Decimal("4")
+    assert trade.entry_fill_price == Decimal("200.5")
+    assert trade.quantity == _QTY
+    assert trade.entry_price == _ENTRY
+
+
+async def test_rejected_entry_is_cancelled(broker, session_factory):
+    manager = _make_order_manager(broker, session_factory)
+    broker.next_status = "REJECTED"
+    req = _valid_request()
+    await manager.submit_order(req)
+    async with session_factory() as s:
+        trade = await TradeRepo(s).get_by_id(req.trade_id)
+    assert trade.status == TradeStatus.CANCELLED
+
+
+# ---------------------------------------------------------------------------
+# Group 13 — Close path hardening (C4)
+# ---------------------------------------------------------------------------
+
+
+class TestCloseHardening:
+    async def _trade(self, session_factory, trade_id):
+        async with session_factory() as s:
+            return await TradeRepo(s).get_by_id(trade_id)
+
+    async def test_concurrent_closes_send_one_exit_and_record_pnl_once(
+        self, broker, session_factory
+    ):
+        from app.core.execution.order_manager import CloseOutcome
+        from app.core.risk.circuit_breaker import CircuitBreaker
+
+        cb = CircuitBreaker()
+        om = _make_order_manager(broker, session_factory, circuit_breaker=cb)
+        broker.last_prices["AAPL"] = Decimal("200")
+        req = await _open_trade(om)
+        broker.last_prices["AAPL"] = Decimal("190")
+
+        outcomes = await asyncio.gather(
+            om.close_position(req.trade_id, "STOP_LOSS"),
+            om.close_position(req.trade_id, "STOP_LOSS"),
+        )
+
+        assert sorted(o.value for o in outcomes) == sorted(
+            [CloseOutcome.CLOSED.value, CloseOutcome.NOT_OPEN.value]
+        )
+        exits = [o for o in broker.placed_orders if o.order_ref.endswith(":exit")]
+        assert len(exits) == 1
+        assert cb.daily_realized_pnl == Decimal("-100")
+        trade = await self._trade(session_factory, req.trade_id)
+        assert trade.status == TradeStatus.CLOSED
+        assert trade.pnl == Decimal("-100")
+
+    async def test_finalize_close_records_once(self, broker, session_factory):
+        from app.db.models.trade import ExitReason
+
+        om = _make_order_manager(broker, session_factory)
+        req = await _open_trade(om)
+        assert await om.finalize_close(req.trade_id, ExitReason.EXTERNAL, None, Decimal("210"))
+        assert not await om.finalize_close(req.trade_id, ExitReason.EXTERNAL, None, Decimal("210"))
+        trade = await self._trade(session_factory, req.trade_id)
+        assert trade.exit_reason == ExitReason.EXTERNAL
+        assert trade.exit_price == Decimal("210")
+
+    async def test_partially_filled_trade_sells_filled_quantity(self, broker, session_factory):
+        om = _make_order_manager(broker, session_factory)
+        broker.next_status = "PARTIAL"
+        broker.next_filled_quantity = Decimal("4")
+        broker.last_prices["AAPL"] = Decimal("200")
+        req = _valid_request()
+        await om.submit_order(req)
+
+        await om.close_position(req.trade_id, "TAKE_PROFIT")
+
+        exit_order = broker.placed_orders[-1]
+        assert exit_order.direction == "SELL" and exit_order.quantity == Decimal("4")
+        assert broker.positions == {}
+
+    async def test_working_exit_leaves_closing_with_exit_order_id(self, broker, session_factory):
+        from app.core.execution.order_manager import CloseOutcome
+
+        om = _make_order_manager(broker, session_factory)
+        req = await _open_trade(om)
+        broker.next_status = "WORKING"
+
+        outcome = await om.close_position(req.trade_id, "MANUAL")
+
+        assert outcome == CloseOutcome.PENDING_EXIT
+        trade = await self._trade(session_factory, req.trade_id)
+        assert trade.status == TradeStatus.CLOSING
+        assert trade.exit_order_id is not None
+        # A retry must not place a second exit while the first is still working.
+        again = await om.close_position(req.trade_id, "MANUAL", allow_from_closing=True)
+        assert again == CloseOutcome.PENDING_EXIT
+        assert len([o for o in broker.placed_orders if o.order_ref.endswith(":exit")]) == 1
+
+    async def test_market_closed_changes_nothing(self, broker, session_factory):
+        from app.core.execution.order_manager import CloseOutcome
+
+        om = _make_order_manager(broker, session_factory)
+        req = await _open_trade(om)
+        om._is_market_open = lambda: False
+
+        outcome = await om.close_position(req.trade_id, "STOP_LOSS")
+
+        assert outcome == CloseOutcome.MARKET_CLOSED
+        trade = await self._trade(session_factory, req.trade_id)
+        assert trade.status == TradeStatus.OPEN and trade.close_attempts == 0
+        assert len(broker.placed_orders) == 1
+
+    async def test_rejected_exit_stays_closing_then_retry_closes(self, broker, session_factory):
+        from app.core.execution.order_manager import CloseOutcome
+
+        om = _make_order_manager(broker, session_factory)
+        req = await _open_trade(om)
+        broker.next_status = "REJECTED"
+
+        assert await om.close_position(req.trade_id, "STALE_TIMEOUT") == CloseOutcome.FAILED
+        trade = await self._trade(session_factory, req.trade_id)
+        assert trade.status == TradeStatus.CLOSING
+
+        retry = await om.close_position(req.trade_id, "STALE_TIMEOUT", allow_from_closing=True)
+        assert retry == CloseOutcome.CLOSED
+        trade = await self._trade(session_factory, req.trade_id)
+        assert trade.status == TradeStatus.CLOSED
+        assert trade.close_attempts == 2
+        from app.db.models.trade import ExitReason
+
+        assert trade.exit_reason == ExitReason.STALE_TIMEOUT
+
+    async def test_partial_exit_retry_sells_remainder_and_aggregates(self, broker, session_factory):
+        from app.core.execution.order_manager import CloseOutcome
+
+        om = _make_order_manager(broker, session_factory)
+        broker.last_prices["AAPL"] = Decimal("200")
+        req = await _open_trade(om)
+        broker.last_prices["AAPL"] = Decimal("180")
+        broker.next_status = "PARTIAL"
+        broker.next_filled_quantity = Decimal("4")
+
+        assert await om.close_position(req.trade_id, "STOP_LOSS") == CloseOutcome.FAILED
+        broker.last_prices["AAPL"] = Decimal("170")
+        again = await om.close_position(req.trade_id, "STOP_LOSS", allow_from_closing=True)
+
+        assert again == CloseOutcome.CLOSED
+        assert broker.placed_orders[-1].quantity == Decimal("6")
+        trade = await self._trade(session_factory, req.trade_id)
+        # exits: 4 @ 180 + 6 @ 170 -> avg 174; pnl = (174 - 200) x 10
+        assert trade.exit_price == Decimal("174")
+        assert trade.pnl == Decimal("-260")
+
+    async def test_unknown_reason_raises(self, broker, session_factory):
+        om = _make_order_manager(broker, session_factory)
+        req = await _open_trade(om)
+        with pytest.raises(ValueError):
+            await om.close_position(req.trade_id, "BOGUS")
+        trade = await self._trade(session_factory, req.trade_id)
+        assert trade.status == TradeStatus.OPEN

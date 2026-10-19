@@ -16,6 +16,8 @@ redis[asyncio]==5.2.1
 # Data / Math
 pandas==2.2.3
 numpy==2.2.1
+exchange_calendars==4.13.2
+tzdata==2025.2
 scipy==1.15.0
 
 # Broker

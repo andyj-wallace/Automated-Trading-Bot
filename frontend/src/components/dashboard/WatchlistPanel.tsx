@@ -1,32 +1,26 @@
 /**
  * WatchlistPanel — symbol rows with live price and open-position indicator.
  *
- * Initial data: GET /api/v1/symbols and GET /api/v1/trades?status=OPEN
- * Live prices:  WebSocket "price_update" events { symbol, price, change_pct }
+ * Initial data: GET /api/v1/symbols and GET /api/v1/trades/active
+ * Live prices:  live store (fed by the WebSocket "price_update" events)
  * Navigation:   clicking a row navigates to /watchlist/:ticker
  *
- * A "Market Closed" badge is shown outside US equity trading hours (09:30–16:00 ET).
+ * A "Market Closed" badge is shown outside US equity trading hours (from /trading/status).
  * Rows with an open position are highlighted with a left border accent.
  */
 
-import { useQuery } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../api/client";
-import type { DashboardEvent, Trade, WatchedSymbol } from "../../types/api";
+import { useLiveStore } from "../../store/liveStore";
+import type { Trade, TradingStatus, WatchedSymbol } from "../../types/api";
 
-interface PriceState {
-  price: number;
-  change_pct: number | null;
-}
-
-interface Props {
-  lastEvent: DashboardEvent | null;
-}
-
-export function WatchlistPanel({ lastEvent }: Props) {
+export function WatchlistPanel() {
   const navigate = useNavigate();
-  const [prices, setPrices] = useState<Record<string, PriceState>>({});
+  const queryClient = useQueryClient();
+  const prices = useLiveStore((s) => s.prices);
+  const tradesVersion = useLiveStore((s) => s.tradesVersion);
 
   const { data: symbols = [] } = useQuery({
     queryKey: ["symbols"],
@@ -38,30 +32,28 @@ export function WatchlistPanel({ lastEvent }: Props) {
   });
 
   const { data: openTrades = [] } = useQuery({
-    queryKey: ["trades", "OPEN"],
+    queryKey: ["trades", "active"],
     queryFn: async () => {
-      const res = await api.get<Trade[]>("/trades?status=OPEN");
+      const res = await api.get<Trade[]>("/trades/active");
       return res.data ?? [];
     },
     refetchInterval: 60_000,
   });
 
-  // Consume price_update WebSocket events
+  const { data: status } = useQuery({
+    queryKey: ["trading-status"],
+    queryFn: async () => (await api.get<TradingStatus>("/trading/status")).data,
+    refetchInterval: 15_000,
+  });
+
   useEffect(() => {
-    if (lastEvent?.event !== "price_update") return;
-    const p = lastEvent.payload as { symbol?: string; price?: number; change_pct?: number };
-    if (!p.symbol || p.price === undefined) return;
-    setPrices((prev) => ({
-      ...prev,
-      [p.symbol!.toUpperCase()]: {
-        price: p.price!,
-        change_pct: p.change_pct ?? null,
-      },
-    }));
-  }, [lastEvent]);
+    if (tradesVersion > 0) {
+      queryClient.invalidateQueries({ queryKey: ["trades"] });
+    }
+  }, [tradesVersion, queryClient]);
 
   const openSymbols = new Set(openTrades.map((t) => t.symbol.toUpperCase()));
-  const marketOpen = isMarketOpen();
+  const marketOpen = status?.market_open ?? true;
 
   return (
     <div className="rounded-lg border border-gray-800 bg-gray-900 p-5 flex flex-col gap-4">
@@ -121,16 +113,16 @@ export function WatchlistPanel({ lastEvent }: Props) {
                     <span className="text-sm tabular-nums text-gray-200">
                       ${priceData.price.toFixed(2)}
                     </span>
-                    {priceData.change_pct !== null && (
+                    {priceData.changePct !== null && (
                       <span
                         className={`text-xs tabular-nums font-medium w-14 text-right ${
-                          priceData.change_pct >= 0
+                          priceData.changePct >= 0
                             ? "text-emerald-400"
                             : "text-red-400"
                         }`}
                       >
-                        {priceData.change_pct >= 0 ? "+" : ""}
-                        {priceData.change_pct.toFixed(2)}%
+                        {priceData.changePct >= 0 ? "+" : ""}
+                        {priceData.changePct.toFixed(2)}%
                       </span>
                     )}
                   </>
@@ -144,22 +136,4 @@ export function WatchlistPanel({ lastEvent }: Props) {
       </div>
     </div>
   );
-}
-
-/**
- * Returns true if current US/Eastern time is within regular equity market hours
- * (09:30–16:00, Mon–Fri). Does not account for market holidays.
- */
-function isMarketOpen(): boolean {
-  const now = new Date();
-  const et = new Date(
-    now.toLocaleString("en-US", { timeZone: "America/New_York" })
-  );
-  const day = et.getDay(); // 0=Sun, 6=Sat
-  if (day === 0 || day === 6) return false;
-
-  const hours = et.getHours();
-  const minutes = et.getMinutes();
-  const timeMinutes = hours * 60 + minutes;
-  return timeMinutes >= 9 * 60 + 30 && timeMinutes < 16 * 60;
 }

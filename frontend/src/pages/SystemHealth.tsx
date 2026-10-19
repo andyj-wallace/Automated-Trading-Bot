@@ -9,6 +9,8 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
+import { AlertsFeed } from "../components/alerts/AlertsFeed";
+import { CircuitBreakerPanel } from "../components/risk/CircuitBreakerPanel";
 import { SystemHealthPanel } from "../components/dashboard/SystemHealthPanel";
 import { api } from "../api/client";
 
@@ -48,6 +50,11 @@ export function SystemHealth() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <SystemHealthPanel />
         <SystemMetricsPanel />
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <CircuitBreakerPanel />
+        <AlertsFeed />
       </div>
 
       <PerformanceDashboard />

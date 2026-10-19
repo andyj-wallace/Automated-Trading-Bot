@@ -132,41 +132,17 @@ async def test_broker_place_order_called(broker: MockBroker, manager: OrderManag
 
 
 @pytest.mark.asyncio
-async def test_stop_not_forwarded_to_broker_by_default(
+async def test_entry_order_is_plain_market_with_order_ref(
     broker: MockBroker, manager: OrderManager
 ) -> None:
-    """6B.8: stop_loss_price is NOT sent to broker unless submit_stop_to_broker=True."""
-    req = _request()  # submit_stop_to_broker defaults to False
-    calls = []
-    original = broker.place_order
-
-    async def spy(order_request):
-        calls.append(order_request)
-        return await original(order_request)
-
-    broker.place_order = spy
-    await manager.submit_order(req)
-
-    assert calls[0].stop_loss_price is None
-
-
-@pytest.mark.asyncio
-async def test_stop_forwarded_to_broker_when_opted_in(
-    broker: MockBroker, manager: OrderManager
-) -> None:
-    """6B.8: stop_loss_price IS sent to broker when submit_stop_to_broker=True."""
+    """The entry never carries a stop or take-profit; the order_ref ties it to the trade."""
     req = _request(submit_stop_to_broker=True)
-    calls = []
-    original = broker.place_order
-
-    async def spy(order_request):
-        calls.append(order_request)
-        return await original(order_request)
-
-    broker.place_order = spy
     await manager.submit_order(req)
 
-    assert calls[0].stop_loss_price == req.stop_loss_price
+    order = broker.placed_orders[0]
+    assert order.order_type == "MKT"
+    assert order.stop_price is None
+    assert order.order_ref == f"{req.trade_id}:entry"
 
 
 @pytest.mark.asyncio
@@ -346,6 +322,19 @@ class TestOrderRetry:
         assert calls["n"] == 3
         assert result.status == "FILLED"
         assert validation.trade_id == req.trade_id
+
+    @pytest.mark.asyncio
+    async def test_retry_finds_recorded_order_instead_of_resubmitting(
+        self, broker: MockBroker, retrying_manager: OrderManager
+    ) -> None:
+        broker.raise_after_next_order = True  # order reaches the broker, then the call raises
+        req = _request()
+
+        _, result = await retrying_manager.submit_order(req)
+
+        assert result.status == "FILLED"
+        assert len(broker.placed_orders) == 1
+        assert result.order_ref == f"{req.trade_id}:entry"
 
     @pytest.mark.asyncio
     async def test_submit_order_raises_after_exhausting_retries(

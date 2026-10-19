@@ -100,7 +100,6 @@ def _make_order(**kwargs) -> OrderRequest:
         "direction": "BUY",
         "quantity": Decimal("10"),
         "order_type": "MKT",
-        "stop_loss_price": Decimal("150.00"),
     }
     defaults.update(kwargs)
     return OrderRequest(**defaults)
@@ -148,9 +147,38 @@ async def test_broker_order_ids_are_unique(connected_broker: MockBroker) -> None
 
 
 @pytest.mark.asyncio
-async def test_cancel_order_returns_true(connected_broker: MockBroker) -> None:
-    result = await connected_broker.cancel_order("any-order-id")
-    assert result is True
+async def test_cancel_order_cancels_working_order_only(connected_broker: MockBroker) -> None:
+    assert await connected_broker.cancel_order("unknown") is False
+
+    tid = uuid.uuid4()
+    stop = OrderRequest(
+        trade_id=tid, symbol="AAPL", direction="SELL", quantity=Decimal("5"),
+        order_type="STP", stop_price=Decimal("95"), tif="GTC", order_ref=f"{tid}:stop",
+    )
+    placed = await connected_broker.place_order(stop)
+    assert placed.status == "WORKING"
+    assert await connected_broker.cancel_order(placed.broker_order_id) is True
+    after = await connected_broker.find_order_by_ref(f"{tid}:stop")
+    assert after is not None and after.status == "REJECTED"
+    assert await connected_broker.cancel_order(placed.broker_order_id) is False
+
+
+@pytest.mark.asyncio
+async def test_trigger_stop_fills_order_and_reduces_position(connected_broker: MockBroker) -> None:
+    tid = uuid.uuid4()
+    connected_broker.set_position("AAPL", Decimal("5"), Decimal("100"))
+    await connected_broker.place_order(
+        OrderRequest(
+            trade_id=tid, symbol="AAPL", direction="SELL", quantity=Decimal("5"),
+            order_type="STP", stop_price=Decimal("95"), tif="GTC", order_ref=f"{tid}:stop",
+        )
+    )
+    connected_broker.trigger_stop(f"{tid}:stop", Decimal("94.5"))
+
+    assert "AAPL" not in connected_broker.positions
+    summary = await connected_broker.get_execution_summary(f"{tid}:stop")
+    assert summary is not None
+    assert summary.filled_quantity == Decimal("5") and summary.avg_fill_price == Decimal("94.5")
 
 
 # ---------------------------------------------------------------------------
@@ -171,3 +199,86 @@ async def test_subscribe_price_feed_and_simulate_tick(connected_broker: MockBrok
     assert len(received) == 1
     assert received[0].ticker == "AAPL"
     assert received[0].price == Decimal("182.50")
+
+
+@pytest.mark.asyncio
+async def test_market_fill_uses_last_simulated_price_and_tracks_positions(
+    connected_broker: MockBroker,
+) -> None:
+    import uuid
+    from decimal import Decimal
+
+    from app.brokers.base import OrderRequest
+
+    await connected_broker.simulate_price_tick("tsla", Decimal("200"))
+
+    def order(direction: str, qty: str) -> OrderRequest:
+        return OrderRequest(
+            trade_id=uuid.uuid4(), symbol="TSLA", direction=direction, quantity=Decimal(qty)
+        )
+
+    buy = await connected_broker.place_order(order("BUY", "10"))
+    assert buy.avg_fill_price == Decimal("200")
+    positions = await connected_broker.get_positions()
+    assert [(p.symbol, p.quantity) for p in positions] == [("TSLA", Decimal("10"))]
+
+    await connected_broker.place_order(order("SELL", "4"))
+    assert (await connected_broker.get_positions())[0].quantity == Decimal("6")
+    await connected_broker.place_order(order("SELL", "6"))
+    assert await connected_broker.get_positions() == []
+
+    unknown = OrderRequest(
+        trade_id=uuid.uuid4(), symbol="ZZZ", direction="BUY", quantity=Decimal("1")
+    )
+    assert (await connected_broker.place_order(unknown)).avg_fill_price == Decimal("100.00")
+
+
+# ---------------------------------------------------------------------------
+# C2 / C3: order refs, outcome toggles, lookups
+# ---------------------------------------------------------------------------
+
+
+async def _connected() -> MockBroker:
+    b = MockBroker()
+    await b.connect()
+    return b
+
+
+async def test_next_status_toggles_are_one_shot():
+    b = await _connected()
+    b.next_status = "WORKING"
+    working = await b.place_order(_make_order(order_ref="r1"))
+    assert working.status == "WORKING" and working.filled_quantity == 0
+    assert b.positions == {}
+    normal = await b.place_order(_make_order(order_ref="r2"))
+    assert normal.status == "FILLED"
+
+
+async def test_partial_fill_quantity_and_lookup():
+    b = await _connected()
+    b.next_status = "PARTIAL"
+    b.next_filled_quantity = Decimal("4")
+    res = await b.place_order(_make_order(quantity=Decimal("10"), order_ref="r1"))
+    assert res.status == "PARTIAL" and res.filled_quantity == Decimal("4")
+    assert (await b.find_order_by_ref("r1")).status == "PARTIAL"
+    assert await b.find_order_by_ref("missing") is None
+
+
+async def test_execution_summary_aggregates_fills_under_one_ref():
+    b = await _connected()
+    b.last_prices["AAPL"] = Decimal("10")
+    b.next_status = "PARTIAL"
+    b.next_filled_quantity = Decimal("4")
+    await b.place_order(_make_order(quantity=Decimal("10"), order_ref="x:exit"))
+    b.last_prices["AAPL"] = Decimal("20")
+    await b.place_order(_make_order(quantity=Decimal("6"), order_ref="x:exit"))
+    summary = await b.get_execution_summary("x:exit")
+    assert summary.filled_quantity == Decimal("10")
+    assert summary.avg_fill_price == Decimal("16")
+
+
+async def test_stop_order_rests_working():
+    b = await _connected()
+    res = await b.place_order(_make_order(order_type="STP", stop_price=Decimal("95"), order_ref="s"))
+    assert res.status == "WORKING"
+    assert b.positions == {}

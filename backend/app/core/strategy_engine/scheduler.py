@@ -1,34 +1,22 @@
 """
 StrategyScheduler — runs enabled strategies on a fixed interval.
 
-Each cycle:
-  1. Fetch account balance from the broker (needed for risk sizing).
-  2. Load enabled strategies from the DB (fresh each cycle → enable/disable
-     takes effect without restart).
-  3. For each enabled strategy:
-       a. Read config.symbols list.
-       b. For each symbol:
-            - Get current price (Redis price:{symbol}, fallback: latest DB bar close).
-            - Get historical bars (TimescaleDB via OHLCVRepo, fallback: broker).
-            - Call strategy.generate_signal(market_data).
-            - If BUY/SELL: size the position and call order_manager.submit_order().
+Each cycle (only inside the configured ET evaluation window of a trading day,
+while trading is not paused and the broker is connected):
+  1. Fetch the account balance (needed for risk sizing).
+  2. Load enabled strategies from the DB (fresh each cycle).
+  3. For each (strategy, symbol):
+       - Current price: Redis key price:{symbol}, only if fresh.
+       - Bars: TimescaleDB only, completed sessions only (never today's bar).
+       - generate_signal(); skip if the symbol already has an active trade.
+       - BUY/SELL: claim (strategy, symbol, bar date, action) in strategy_signals
+         so a signal acts at most once, then size and submit via OrderManager.
 
-Aggregate portfolio risk (Gate 4) is no longer precomputed here — OrderManager
-now computes it itself, atomically, immediately before validating each trade
-(see order_manager.py module docstring). A scheduler-level snapshot taken once
-per cycle and reused across every strategy/symbol pair in that cycle would be
-stale the moment the first trade in the cycle is submitted. Aggregate exposure
-alerting/visibility is handled independently by the RiskMonitor background
-loop started in app/main.py's lifespan.
+The scheduler never calls the broker for market data; bar freshness is the
+BarRefreshJob's responsibility and price freshness the MarketDataFeed's.
 
-Runs as a background asyncio task, started on app startup (alongside PositionMonitor).
-
-Errors in individual (strategy, symbol) pairs are logged and skipped so one
-bad strategy cannot abort the entire cycle.
-
-Depends on:
-  StrategyRegistry (11.1), StrategyRepo (3.8), OHLCVRepo (5.3),
-  RedisCache (5.1), OrderManager (7.1)
+Aggregate portfolio risk and the one-active-trade-per-symbol rule are enforced
+inside OrderManager.submit_order under its submission lock.
 """
 
 from __future__ import annotations
@@ -36,12 +24,15 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 
 from app.brokers.base import BaseBroker, PriceBar
-from app.core.risk.manager import RiskManager, TradeRequest
+from app.core import market_calendar
+from app.core.events import publish_system_alert
+from app.core.risk.manager import RiskManager, RiskRejectionError, TradeRequest
 from app.core.strategy_engine.base import MarketData, RiskParams, Signal
 from app.core.strategy_engine.registry import StrategyRegistry
 from app.data.cache import RedisCache
@@ -54,6 +45,7 @@ _HISTORY_LOOKBACK_DAYS = 365  # 1 year of daily bars
 # from WARNING to ERROR so a stuck/misconfigured feed doesn't go unnoticed
 # under routine per-cycle warnings.
 _CONSECUTIVE_MISS_ESCALATION_THRESHOLD = 5
+_FAILING_ALERT_THRESHOLD = 3
 
 
 class StrategyScheduler:
@@ -78,6 +70,14 @@ class StrategyScheduler:
         session_factory,
         order_manager,
         interval_seconds: int = _DEFAULT_INTERVAL,
+        *,
+        clock: Callable[[], datetime] = market_calendar.now_et,
+        eval_start: time = time(9, 45),
+        eval_end: time = time(15, 45),
+        price_stale_seconds: int = 120,
+        is_paused: Callable[[], Awaitable[bool]] | None = None,
+        signal_repo_factory=None,
+        trade_repo_factory=None,
     ) -> None:
         self._registry = registry
         self._broker = broker
@@ -89,6 +89,17 @@ class StrategyScheduler:
         self._task: asyncio.Task | None = None
         self._running = False
         self._consecutive_price_misses: dict[str, int] = {}
+        self._clock = clock
+        self._eval_start = eval_start
+        self._eval_end = eval_end
+        self._price_stale_seconds = price_stale_seconds
+        self._is_paused = is_paused
+        self._signal_repo_factory = signal_repo_factory
+        self._trade_repo_factory = trade_repo_factory
+        self._bar_cache: dict[tuple[str, date], list[PriceBar]] = {}
+        self._warned: set[tuple[str, str, date]] = set()
+        self.last_cycle_at: datetime | None = None
+        self._consecutive_failures = 0
 
     async def start(self) -> None:
         """Start the background scheduler loop."""
@@ -116,11 +127,19 @@ class StrategyScheduler:
         while self._running:
             try:
                 await self._run_cycle()
+                self._consecutive_failures = 0
             except Exception as exc:
                 system_logger.error(
                     "StrategyScheduler: unhandled cycle error",
                     extra={"error": str(exc)},
                 )
+                self._consecutive_failures += 1
+                if self._consecutive_failures == _FAILING_ALERT_THRESHOLD:
+                    await publish_system_alert(
+                        self._cache,
+                        "SCHEDULER_FAILING",
+                        f"Strategy scheduler failed {_FAILING_ALERT_THRESHOLD} cycles in a row: {exc}",
+                    )
             try:
                 await asyncio.sleep(self._interval)
             except asyncio.CancelledError:
@@ -128,19 +147,31 @@ class StrategyScheduler:
 
     async def _run_cycle(self) -> None:
         """Execute one full pass through all enabled strategies."""
-        # 1. Account balance (needed for risk sizing and portfolio gate)
-        account_balance = Decimal("0")
-        if self._broker.is_connected():
-            try:
-                summary = await self._broker.get_account_summary()
-                account_balance = summary.net_liquidation
-            except Exception as exc:
-                system_logger.warning(
-                    "StrategyScheduler: could not fetch account balance",
-                    extra={"error": str(exc)},
-                )
+        now = self._clock()
+        trading_day = market_calendar.trading_date(now)
+        if not market_calendar.in_session_window(self._eval_start, self._eval_end, now):
+            return
+        if self._is_paused is not None and await self._is_paused():
+            return
+        if not self._broker.is_connected():
+            self._warn_once("broker_disconnected", "", trading_day,
+                            "StrategyScheduler: broker disconnected, cycles skipped")
+            return
 
-        # 2. Load enabled strategies from DB
+        try:
+            summary = await self._broker.get_account_summary()
+            account_balance = summary.net_liquidation
+        except Exception as exc:
+            system_logger.warning(
+                "StrategyScheduler: could not fetch account balance",
+                extra={"error": str(exc)},
+            )
+            return
+        if account_balance <= 0:
+            system_logger.warning("StrategyScheduler: account balance is not positive")
+            return
+
+        self.last_cycle_at = datetime.now(UTC)
         enabled_strategies = await self._load_enabled_strategies()
         if not enabled_strategies:
             return
@@ -153,7 +184,6 @@ class StrategyScheduler:
             },
         )
 
-        # 3. Run each (strategy, symbol) pair
         for db_strategy in enabled_strategies:
             type_name = db_strategy.type
             if not self._registry.is_registered(type_name):
@@ -206,7 +236,6 @@ class StrategyScheduler:
         account_balance: Decimal,
     ) -> None:
         """Run one strategy against one symbol and submit if a signal fires."""
-        # Get current price
         current_price = await self._get_current_price(symbol)
         if current_price is None:
             miss_count = self._consecutive_price_misses.get(symbol, 0) + 1
@@ -217,24 +246,17 @@ class StrategyScheduler:
                 else system_logger.warning
             )
             log(
-                "StrategyScheduler: no price data for symbol (cache miss and "
-                "broker fallback failed) — strategy evaluation skipped for this cycle",
+                "StrategyScheduler: no fresh price for symbol — "
+                "strategy evaluation skipped for this cycle",
                 extra={"symbol": symbol, "consecutive_misses": miss_count},
             )
             return
         self._consecutive_price_misses.pop(symbol, None)
 
-        # Get historical bars
         bars = await self._get_historical_bars(symbol)
         if not bars:
-            system_logger.warning(
-                "StrategyScheduler: no historical bars for symbol — skipping",
-                extra={"symbol": symbol},
-            )
             return
 
-        # Some strategies (e.g. BullBearStrategy's regime filter) need bars
-        # for an additional ticker beyond the one being evaluated.
         extra_bars: dict[str, list[PriceBar]] = {}
         for extra_symbol in strategy.required_extra_symbols():
             extra_symbol = extra_symbol.upper()
@@ -245,22 +267,35 @@ class StrategyScheduler:
                 extra_bars[extra_symbol] = fetched
             else:
                 system_logger.warning(
-                    "StrategyScheduler: no historical bars for required extra "
+                    "StrategyScheduler: no usable bars for required extra "
                     "symbol — strategy will see it as missing",
                     extra={"symbol": symbol, "extra_symbol": extra_symbol},
                 )
 
+        open_position = await self._has_active_trade(symbol)
         market_data = MarketData(
             symbol=symbol,
             current_price=current_price,
             bars=bars,
             timestamp=datetime.now(UTC),
             extra_bars=extra_bars,
+            open_position=open_position,
         )
 
         signal: Signal = await strategy.generate_signal(market_data)
 
         if signal.action == "HOLD":
+            return
+        if open_position:
+            trading_logger.info(
+                "StrategyScheduler: signal ignored, symbol already has an active trade",
+                extra={"symbol": symbol, "action": signal.action, "strategy_id": str(strategy_id)},
+            )
+            return
+
+        bar_date = bars[-1].timestamp.date()
+        signal_id = await self._claim_signal(strategy_id, symbol, bar_date, signal)
+        if signal_id is None:
             return
 
         trading_logger.info(
@@ -274,7 +309,6 @@ class StrategyScheduler:
             },
         )
 
-        # Size position if strategy did not set quantity
         quantity = signal.quantity
         if (quantity is None or quantity <= 0) and signal.entry_price and signal.stop_loss_price:
             risk_params = RiskParams(
@@ -289,9 +323,9 @@ class StrategyScheduler:
                 "StrategyScheduler: position size is zero — skipping order",
                 extra={"symbol": symbol, "strategy_id": str(strategy_id)},
             )
+            await self._set_outcome(signal_id, "ZERO_QUANTITY")
             return
 
-        # Build and submit trade request
         request = TradeRequest(
             trade_id=uuid.uuid4(),
             symbol=symbol,
@@ -307,6 +341,8 @@ class StrategyScheduler:
 
         try:
             await self._order_manager.submit_order(request)
+        except RiskRejectionError as exc:
+            await self._set_outcome(signal_id, "RISK_REJECTED", detail=exc.reason)
         except Exception as exc:
             trading_logger.warning(
                 "StrategyScheduler: order submission failed",
@@ -316,9 +352,75 @@ class StrategyScheduler:
                     "error": str(exc),
                 },
             )
+            await self._set_outcome(signal_id, "ORDER_FAILED", detail=str(exc))
+        else:
+            await self._set_outcome(signal_id, "SUBMITTED", trade_id=request.trade_id)
 
     # ------------------------------------------------------------------
-    # Internal: helpers
+    # Internal: persistence helpers
+    # ------------------------------------------------------------------
+
+    def _signal_repo(self, session):
+        if self._signal_repo_factory is not None:
+            return self._signal_repo_factory(session)
+        from app.db.repositories.signal_repo import SignalRepo
+
+        return SignalRepo(session)
+
+    def _trade_repo(self, session):
+        if self._trade_repo_factory is not None:
+            return self._trade_repo_factory(session)
+        from app.db.repositories.trade_repo import TradeRepo
+
+        return TradeRepo(session)
+
+    async def _has_active_trade(self, symbol: str) -> bool:
+        async with self._session_factory() as session:
+            return await self._trade_repo(session).has_active_trade(symbol)
+
+    async def _claim_signal(
+        self, strategy_id: uuid.UUID, symbol: str, bar_date: date, signal: Signal
+    ) -> uuid.UUID | None:
+        async with self._session_factory() as session:
+            signal_id = await self._signal_repo(session).claim(
+                strategy_id=strategy_id,
+                symbol=symbol,
+                bar_date=bar_date,
+                action=signal.action,
+                entry_price=signal.entry_price,
+                stop_loss_price=signal.stop_loss_price,
+                take_profit_price=signal.take_profit_price,
+            )
+            await session.commit()
+            return signal_id
+
+    async def _set_outcome(
+        self,
+        signal_id: uuid.UUID,
+        outcome: str,
+        detail: str | None = None,
+        trade_id: uuid.UUID | None = None,
+    ) -> None:
+        try:
+            async with self._session_factory() as session:
+                await self._signal_repo(session).set_outcome(
+                    signal_id, outcome, detail=detail, trade_id=trade_id
+                )
+                await session.commit()
+        except Exception as exc:
+            system_logger.error(
+                "StrategyScheduler: failed to record signal outcome",
+                extra={"signal_id": str(signal_id), "outcome": outcome, "error": str(exc)},
+            )
+
+    def _warn_once(self, kind: str, symbol: str, day: date, message: str) -> None:
+        key = (kind, symbol, day)
+        if key not in self._warned:
+            self._warned.add(key)
+            system_logger.warning(message, extra={"symbol": symbol, "kind": kind})
+
+    # ------------------------------------------------------------------
+    # Internal: data helpers
     # ------------------------------------------------------------------
 
     async def _load_enabled_strategies(self):
@@ -336,78 +438,74 @@ class StrategyScheduler:
             return []
 
     async def _get_current_price(self, symbol: str) -> Decimal | None:
-        """
-        Try Redis price:{symbol} first.
-        Falls back to the broker's most recent historical close if the cache
-        has no price (feed hasn't published yet, or Redis is briefly down).
-        """
+        """Price from Redis price:{symbol}, only if its timestamp is fresh."""
         try:
             raw = await self._cache.get(f"price:{symbol}")
-            if raw:
-                payload = json.loads(raw)
-                price_val = payload.get("price", payload) if isinstance(payload, dict) else payload
-                return Decimal(str(price_val))
+            if not raw:
+                return None
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or "timestamp" not in payload:
+                return None
+            stamp = datetime.fromisoformat(payload["timestamp"])
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=UTC)
+            age = (datetime.now(UTC) - stamp).total_seconds()
+            if age > self._price_stale_seconds:
+                return None
+            return Decimal(str(payload["price"]))
         except Exception as exc:
             system_logger.warning(
-                "StrategyScheduler: Redis price lookup failed — trying broker fallback",
+                "StrategyScheduler: Redis price lookup failed",
                 extra={"symbol": symbol, "error": str(exc)},
             )
+            return None
 
-        try:
-            bars = await self._broker.get_historical_data(
-                symbol, duration="5 D", bar_size="1 day"
-            )
-            if bars:
-                return Decimal(str(bars[-1].close))
-        except Exception as exc:
-            system_logger.warning(
-                "StrategyScheduler: broker price fallback also failed",
-                extra={"symbol": symbol, "error": str(exc)},
-            )
+    async def _fetch_db_bars(self, symbol: str, trading_day: date) -> list[PriceBar]:
+        """Completed daily sessions (strictly before trading_day) from the DB."""
+        from app.db.repositories.ohlcv_repo import OHLCVRepo
 
-        return None
+        end = datetime.now(UTC)
+        start = end - timedelta(days=_HISTORY_LOOKBACK_DAYS)
+        async with self._session_factory() as session:
+            rows = await OHLCVRepo(session).get_bars(symbol, start=start, end=end)
+        return [
+            PriceBar(
+                timestamp=row.time,
+                open=row.open,
+                high=row.high,
+                low=row.low,
+                close=row.close,
+                volume=row.volume,
+                bar_size=row.bar_size,
+            )
+            for row in rows
+            if row.time.date() < trading_day
+        ]
 
     async def _get_historical_bars(self, symbol: str) -> list[PriceBar]:
-        """
-        Fetch historical bars from TimescaleDB.
-        Falls back to broker.get_historical_data() if no DB rows.
-        """
+        """Completed-session bars from the DB; [] if missing or stale."""
+        trading_day = market_calendar.trading_date(self._clock())
+        key = (symbol, trading_day)
+        cached = self._bar_cache.get(key)
+        if cached is not None:
+            return cached
         try:
-
-            from app.db.repositories.ohlcv_repo import OHLCVRepo
-
-            end = datetime.now(UTC)
-            start = end - timedelta(days=_HISTORY_LOOKBACK_DAYS)
-
-            async with self._session_factory() as session:
-                repo = OHLCVRepo(session)
-                db_bars = await repo.get_bars(symbol, start=start, end=end)
-
-            if db_bars:
-                return [
-                    PriceBar(
-                        timestamp=bar.time,
-                        open=bar.open,
-                        high=bar.high,
-                        low=bar.low,
-                        close=bar.close,
-                        volume=bar.volume,
-                        bar_size=bar.bar_size,
-                    )
-                    for bar in db_bars
-                ]
+            bars = await self._fetch_db_bars(symbol, trading_day)
         except Exception as exc:
             system_logger.warning(
-                "StrategyScheduler: DB bar fetch failed, trying broker",
-                extra={"symbol": symbol, "error": str(exc)},
-            )
-
-        # Fallback: fetch directly from broker
-        try:
-            return await self._broker.get_historical_data(symbol)
-        except Exception as exc:
-            system_logger.warning(
-                "StrategyScheduler: broker bar fetch also failed",
+                "StrategyScheduler: DB bar fetch failed",
                 extra={"symbol": symbol, "error": str(exc)},
             )
             return []
+        if not bars:
+            self._warn_once("no_bars", symbol, trading_day,
+                            "StrategyScheduler: no completed bars for symbol — skipping")
+            return []
+        if bars[-1].timestamp.date() < market_calendar.previous_trading_day(trading_day):
+            self._warn_once("stale_bars", symbol, trading_day,
+                            "StrategyScheduler: bars are stale — skipping")
+            return []
+        for old in [k for k in self._bar_cache if k[1] != trading_day]:
+            del self._bar_cache[old]
+        self._bar_cache[key] = bars
+        return bars

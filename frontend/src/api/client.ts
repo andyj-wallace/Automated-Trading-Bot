@@ -20,18 +20,29 @@ async function request<T>(
     headers: { "Content-Type": "application/json", ...options.headers },
     ...options,
   });
-  return res.json() as Promise<ApiResponse<T>>;
+  const text = await res.text();
+  try {
+    return JSON.parse(text) as ApiResponse<T>;
+  } catch {
+    return {
+      data: null,
+      meta: { timestamp: new Date().toISOString(), request_id: "" },
+      error: {
+        code: `HTTP_${res.status}`,
+        message: text.slice(0, 200) || res.statusText,
+      },
+    };
+  }
 }
-
 export const api = {
   get<T>(path: string): Promise<ApiResponse<T>> {
     return request<T>(path);
   },
 
-  post<T>(path: string, body: unknown): Promise<ApiResponse<T>> {
+  post<T>(path: string, body?: unknown): Promise<ApiResponse<T>> {
     return request<T>(path, {
       method: "POST",
-      body: JSON.stringify(body),
+      body: body === undefined ? undefined : JSON.stringify(body),
     });
   },
 

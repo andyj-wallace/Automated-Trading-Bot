@@ -120,3 +120,23 @@ class TradeHandler:
         )
 
         return trade
+
+    async def publish_for_trade(self, trade, order_result: OrderResult) -> None:
+        """Publish trade_executed from a stored trade row (used when the reconciler adopts a fill)."""
+        event = {
+            "event": "trade_executed",
+            "payload": {
+                "trade_id": str(trade.id),
+                "symbol": trade.symbol,
+                "direction": trade.direction.value,
+                "quantity": str(order_result.filled_quantity),
+                "entry_price": str(order_result.avg_fill_price),
+                "stop_loss_price": str(trade.stop_loss_price),
+                "take_profit_price": str(trade.take_profit_price),
+                "risk_amount": str(trade.risk_amount),
+                "reward_to_risk_ratio": str(trade.reward_to_risk_ratio),
+                "status": trade.status.value,
+            },
+            "timestamp": datetime.now(UTC).isoformat(),
+        }
+        await self._cache.publish(TRADE_EVENTS_CHANNEL, json.dumps(event))

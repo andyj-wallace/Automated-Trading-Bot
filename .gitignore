@@ -6,6 +6,9 @@
 .env
 .env.local
 .env.*.local
+.env.prod
+deploy/nginx/.htpasswd
+backups/
 credentials.txt
 secrets/
 IB Gateway*/
@@ -13,6 +16,7 @@ IB Gateway*/
 
 # Keep the example template committed
 !.env.example
+!.env.prod.example
 
 # --- Python ------------------------------------------------------------------
 __pycache__/

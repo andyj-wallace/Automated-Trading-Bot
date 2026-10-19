@@ -11,14 +11,14 @@
 
 There are **no API keys or tokens** with the TWS API. This is different from every modern REST API you've probably used. Authentication works at the Gateway level, not the application level.
 
-IB Gateway is a Java desktop application — a stripped-down version of the full TWS trading platform. It handles your IBKR session. Your Python code (via `ib_async`) simply connects to a TCP socket that Gateway exposes on `localhost:4001`. Gateway itself is what's authenticated with IBKR's servers.
+IB Gateway is a Java desktop application — a stripped-down version of the full TWS trading platform. It handles your IBKR session. Your Python code (via `ib_async`) simply connects to a TCP socket that Gateway exposes on `localhost:4002`. Gateway itself is what's authenticated with IBKR's servers.
 
 ```
 You log into IB Gateway (username + password + 2FA phone tap)
         ↓
 Gateway holds an authenticated IBKR session
         ↓
-Your Python app connects to Gateway via TCP socket on localhost:4001
+Your Python app connects to Gateway via TCP socket on localhost:4002
         ↓
 ib_async sends and receives messages over that socket
 ```
@@ -67,7 +67,7 @@ Gateway does not stay authenticated across restarts. IBKR also performs a mandat
 2. Enter your **paper trading** username and password
 3. Approve the 2FA push notification on IBKR Mobile
 4. Gateway is now running — leave it open in the background
-5. Your FastAPI app can now connect via `ib_async` on `localhost:4001`
+5. Your FastAPI app can now connect via `ib_async` on `localhost:4002`
 
 The application's reconnect logic (task 17.1) handles the case where Gateway drops and reconnects mid-session, but it cannot re-authenticate on your behalf — that always requires the 2FA tap.
 
@@ -79,10 +79,10 @@ Before starting the application, confirm Gateway is listening:
 
 ```bash
 # macOS / Linux
-nc -zv localhost 4001
+nc -zv localhost 4002
 
 # Windows (PowerShell)
-Test-NetConnection -ComputerName localhost -Port 4001
+Test-NetConnection -ComputerName localhost -Port 4002
 ```
 
 You should see a successful connection. If it fails, Gateway isn't running or the port is wrong.
@@ -95,7 +95,7 @@ from ib_async import IB
 
 async def check():
     ib = IB()
-    await ib.connectAsync('127.0.0.1', 4001, clientId=99)
+    await ib.connectAsync('127.0.0.1', 4002, clientId=99)
     print("Connected:", ib.isConnected())
     summary = await ib.accountSummaryAsync()
     print("Account entries:", len(summary))
@@ -110,7 +110,7 @@ asyncio.run(check())
 
 | Setting | Location | Value for Dev |
 |---------|----------|---------------|
-| API port | Gateway → Configure → API → Settings | `4001` (default) |
+| API port | Gateway → Configure → API → Settings | `4002` (paper), `4001` (live; never used by this bot) |
 | Read-Only API | Gateway → Configure → API → Settings | **Unchecked** |
 | Trusted IPs | Gateway → Configure → API → Settings | `127.0.0.1` (default, fine for local) |
 | Socket port for TWS (if using TWS instead) | Edit → Global Configuration → API → Settings | `7497` |
@@ -123,7 +123,7 @@ asyncio.run(check())
 Every connection to Gateway requires a `clientId` — an integer you assign. It identifies which client is talking to Gateway.
 
 ```python
-await ib.connectAsync('127.0.0.1', 4001, clientId=1)
+await ib.connectAsync('127.0.0.1', 4002, clientId=1)
 ```
 
 Rules:
@@ -150,7 +150,7 @@ After calling `connectAsync()`, Gateway sends a `connectAck` callback immediatel
 |-|-------|------|
 | **Use for** | All development and testing | Production only, never during dev |
 | **Credentials** | Separate paper username/password | Your main IBKR credentials |
-| **Gateway port** | `4001` (same) | `4001` (same) |
+| **Gateway port** | `4002` native / `4004` ib-gateway-docker | `4001` native / `4003` ib-gateway-docker (never used by this bot) |
 | **Orders** | Simulated — no real money moves | Real orders, real money |
 | **Market data** | Same real-time feed | Same real-time feed |
 | **Account balance** | Simulated starting balance | Real account balance |
@@ -183,20 +183,7 @@ When moving to a cloud environment, the recommended approach is the community `i
 
 The image is configured entirely via environment variables:
 
-```yaml
-# docker-compose excerpt (for future cloud use)
-ib-gateway:
-  image: ghcr.io/gnzsnz/ib-gateway:stable
-  environment:
-    TWS_USERID: ${IBKR_USERNAME}
-    TWS_PASSWORD: ${IBKR_PASSWORD}
-    TRADING_MODE: paper          # or: live
-    AUTO_RESTART_TIME: "11:59 PM"
-    VNC_SERVER_PASSWORD: ${VNC_PASSWORD}
-  ports:
-    - "127.0.0.1:4001:4001"     # API port — localhost only
-    - "127.0.0.1:5900:5900"     # VNC — localhost only, tunnel if needed
-```
+The production stack runs the container for you: see `docker-compose.prod.yml` and `DEPLOYMENT.md`. In that stack the backend reaches the Gateway at `ib-gateway:4004` (paper). Ports 4001/4002 listen only inside the container; the only published port is VNC on `127.0.0.1:5900`.
 
 When this container starts, IBC fills in your credentials automatically. Gateway then sends a 2FA push to your phone — you tap it once, and the session is live. IBC keeps the session alive and handles the daily restart.
 
@@ -206,7 +193,7 @@ For the local setup described in this document, none of this Docker complexity i
 
 ## Troubleshooting
 
-**Connection refused on port 4001**
+**Connection refused on port 4002**
 Gateway isn't running, or hasn't finished starting up. Wait a few seconds after login and try again.
 
 **Connected but immediately disconnected**

@@ -1,23 +1,22 @@
 /**
- * Dashboard — Layer 10 assembly.
+ * Dashboard.
  *
- * Layout:
- *   Top row (full-width): RiskGauge
- *   Middle row:           ActiveTradesTable | WatchlistPanel
- *   Bottom row:           SystemHealthPanel (full-width)
- *
- * A single useWebSocket() call lives here; the lastEvent is passed down to
- * each panel so they can react to live data without opening their own sockets.
+ * Top: trading controls. Then risk gauge + circuit breaker, active trades +
+ * watchlist, alerts feed, system health. All live data comes from the live
+ * store; the single WebSocket is mounted in Layout.
  */
 
+import { AlertsFeed } from "../components/alerts/AlertsFeed";
+import { TradingControlsPanel } from "../components/controls/TradingControlsPanel";
 import { ActiveTradesTable } from "../components/dashboard/ActiveTradesTable";
 import { RiskGauge } from "../components/dashboard/RiskGauge";
 import { SystemHealthPanel } from "../components/dashboard/SystemHealthPanel";
 import { WatchlistPanel } from "../components/dashboard/WatchlistPanel";
-import { useWebSocket } from "../hooks/useWebSocket";
+import { CircuitBreakerPanel } from "../components/risk/CircuitBreakerPanel";
+import { useLiveStore } from "../store/liveStore";
 
 export function Dashboard() {
-  const { lastEvent, readyState } = useWebSocket();
+  const socketState = useLiveStore((s) => s.socketState);
 
   return (
     <div className="p-8 flex flex-col gap-4">
@@ -25,22 +24,26 @@ export function Dashboard() {
         <div>
           <h1 className="text-2xl font-bold text-white mb-1">Dashboard</h1>
           <p className="text-gray-500 text-sm">
-            Risk gauge · active trades · watchlist · system status
+            Controls · risk · active trades · watchlist · alerts · system status
           </p>
         </div>
-        <WsIndicator readyState={readyState} />
+        <WsIndicator readyState={socketState} />
       </div>
 
-      {/* Row 1: Risk Gauge — full width, prominent */}
-      <RiskGauge lastEvent={lastEvent} />
+      <TradingControlsPanel />
 
-      {/* Row 2: Active Trades + Watchlist */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <ActiveTradesTable lastEvent={lastEvent} />
-        <WatchlistPanel lastEvent={lastEvent} />
+        <RiskGauge />
+        <CircuitBreakerPanel />
       </div>
 
-      {/* Row 3: System Health */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <ActiveTradesTable />
+        <WatchlistPanel />
+      </div>
+
+      <AlertsFeed />
+
       <SystemHealthPanel />
     </div>
   );

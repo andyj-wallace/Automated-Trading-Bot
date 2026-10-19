@@ -14,19 +14,18 @@ submit_order() orchestrates the full execution pipeline:
         trades, not just OPEN — see TradeRepo.get_active_trades.
   3. Pre-submission audit entry → audit.log (before any broker call)
   4. Transition trade to SUBMITTED
-  5. Broker order submission (stop sent only when submit_stop_to_broker=True)
+  5. Broker order submission (market entry with order_ref "<trade_id>:entry")
   6. Post-confirmation audit entry → audit.log (after broker responds)
      └─ If this write fails: escalate to error.log — treated as system fault
-  7. Transition trade to OPEN (fill) or CANCELLED (rejection/error)
+  7. Record fill and go OPEN; WORKING stays SUBMITTED; REJECTED/ERROR goes CANCELLED
   8. Returns (ValidationResult, OrderResult) for the caller
 
-close_position() handles the full exit flow:
-  1. Load trade from DB; validate it is OPEN
-  2. Transition to CLOSING
-  3. Submit market close order to broker
-  4. Report realized pnl to the circuit breaker (if configured)
-  5. Transition to CLOSED; write exit_price, exit_reason, pnl
-  6. Publish trade_closed event to Redis
+close_position() handles the full exit flow (market hours only):
+  1. Atomic OPEN -> CLOSING (stores intended exit_reason)
+  2. Cancel protective stop; reuse any existing "<id>:exit" order
+  3. Submit one market close order for the filled quantity
+  4. finalize_close(): pnl from fill prices, atomic CLOSING -> CLOSED, circuit
+     breaker, trade_closed event (only if this call won the CLOSED transition)
 
 Audit entries are append-only. No path in this codebase may modify or delete
 them after writing. See design.md § Audit Trail.
@@ -38,21 +37,37 @@ Depends on: RiskManager (6.3), BaseBroker (Layer 4), TradeRepo (3.7),
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
+from enum import Enum
 
 from app.brokers.base import BaseBroker, OrderRequest, OrderResult
+from app.core import market_calendar
+from app.core.events import envelope, publish_system_alert
 from app.core.risk.calculator import RiskCalculator
 from app.core.risk.circuit_breaker import CircuitBreaker
-from app.core.risk.manager import RiskManager, TradeRequest, ValidationResult
-from app.monitoring.logger import audit_logger, error_logger, trading_logger
+from app.core.risk.manager import (
+    RiskManager,
+    RiskRejectionError,
+    TradeRequest,
+    ValidationResult,
+)
+from app.monitoring.logger import audit_logger, error_logger, risk_logger, trading_logger
 
 _calculator = RiskCalculator()
 
 # Redis channel for trade events — consumed by WebSocket handler and PositionMonitor
 TRADE_EVENTS_CHANNEL = "trade_events"
+
+
+class CloseOutcome(str, Enum):
+    CLOSED = "CLOSED"
+    PENDING_EXIT = "PENDING_EXIT"  # exit order is working at the broker
+    FAILED = "FAILED"  # trade stays CLOSING; the reconciler retries
+    NOT_OPEN = "NOT_OPEN"
+    MARKET_CLOSED = "MARKET_CLOSED"
 
 
 class OrderManager:
@@ -87,7 +102,7 @@ class OrderManager:
     Usage:
         order_manager = OrderManager(broker, risk_manager, session_factory, cache)
         validation, result = await order_manager.submit_order(request)
-        # Then call TradeHandler.on_fill() for event publishing
+        # trade_executed is published automatically on every fill
     """
 
     def __init__(
@@ -99,6 +114,9 @@ class OrderManager:
         order_retry_attempts: int = 3,
         order_retry_backoff_seconds: float = 0.5,
         circuit_breaker: CircuitBreaker | None = None,
+        is_market_open: Callable[[], bool] = market_calendar.is_market_open,
+        protective_stops: bool = False,
+        stop_cancel_wait_seconds: float = 5.0,
     ) -> None:
         self._broker = broker
         self._risk_manager = risk_manager
@@ -107,6 +125,9 @@ class OrderManager:
         self._order_retry_attempts = max(1, order_retry_attempts)
         self._order_retry_backoff_seconds = order_retry_backoff_seconds
         self._circuit_breaker = circuit_breaker
+        self._is_market_open = is_market_open
+        self._protective_stops = protective_stops
+        self._stop_cancel_wait_seconds = stop_cancel_wait_seconds
         # Serializes "compute aggregate risk → validate → insert PENDING row"
         # across concurrent submit_order() calls in this process — see the
         # portfolio-risk-cap race note in the module docstring.
@@ -123,8 +144,8 @@ class OrderManager:
             request: Trade parameters including current account balance.
 
         Returns:
-            (ValidationResult, OrderResult) — pass both to TradeHandler.on_fill()
-            if the order filled successfully.
+            (ValidationResult, OrderResult). A filled order has already had its
+            trade_executed event published (best effort).
 
         Raises:
             RiskRejectionError: If risk validation fails. No audit entries or DB rows
@@ -140,7 +161,16 @@ class OrderManager:
         # so the broker round-trip below does NOT need to hold the lock.
         # ------------------------------------------------------------------
         async with self._submission_lock:
-            current_aggregate_risk = await self._compute_aggregate_risk()
+            active_trades = await self._load_active_trades()
+            symbol = request.symbol.upper()
+            if any(t.symbol.upper() == symbol for t in active_trades):
+                reason = f"SYMBOL_ALREADY_ACTIVE: {symbol} already has an active trade"
+                risk_logger.warning(
+                    "OrderManager: trade rejected, symbol already active",
+                    extra={"trade_id": str(request.trade_id), "symbol": symbol},
+                )
+                raise RiskRejectionError(reason=reason, request=request)
+            current_aggregate_risk = sum((t.risk_amount for t in active_trades), Decimal("0"))
             validation = self._risk_manager.validate(request, current_aggregate_risk)
 
             if self._session_factory:
@@ -158,19 +188,16 @@ class OrderManager:
             await self._transition(request.trade_id, "SUBMITTED")
 
         # ------------------------------------------------------------------
-        # Step 5 — Submit to broker
-        # stop_loss_price is only forwarded when the strategy opted in
+        # Step 5 — Submit to broker (entry is always a plain market order;
+        # the protective stop is placed after the fill, see place_protective_stop)
         # ------------------------------------------------------------------
-        broker_stop = (
-            request.stop_loss_price if request.submit_stop_to_broker else None
-        )
         broker_request = OrderRequest(
             trade_id=request.trade_id,
             symbol=request.symbol,
             direction=request.direction,
             quantity=request.quantity,
             order_type="MKT",
-            stop_loss_price=broker_stop,
+            order_ref=f"{request.trade_id}:entry",
             strategy_id=request.strategy_id,
         )
 
@@ -184,6 +211,7 @@ class OrderManager:
                 status="ERROR",
                 filled_quantity=Decimal("0"),
                 avg_fill_price=Decimal("0"),
+                order_ref=broker_request.order_ref,
                 error_message=str(broker_error),
                 timestamp=datetime.now(UTC),
             )
@@ -208,11 +236,27 @@ class OrderManager:
             raise  # missing post-confirmation entry is a system fault
 
         # ------------------------------------------------------------------
-        # Step 7 — Transition to final status (OPEN or CANCELLED)
+        # Step 7 — Record the outcome. Nothing becomes OPEN without a real fill.
         # ------------------------------------------------------------------
+        filled = order_result.status in ("FILLED", "PARTIAL") and order_result.filled_quantity > 0
         if self._session_factory:
-            if order_result.status in ("FILLED", "PARTIAL"):
+            if filled:
+                await self._record_entry_fill(request.trade_id, order_result)
                 await self._transition(request.trade_id, "OPEN")
+                await self._publish_trade_executed(request, validation, order_result)
+                await self.place_protective_stop(
+                    request.trade_id, force=request.submit_stop_to_broker
+                )
+            elif order_result.status == "WORKING":
+                await self._record_entry_order(request.trade_id, order_result.broker_order_id)
+                await publish_system_alert(
+                    self._cache,
+                    "ORDER_STUCK_WORKING",
+                    f"Entry order for {request.symbol} is still working at the broker",
+                    trade_id=str(request.trade_id),
+                    symbol=request.symbol,
+                    order_ref=broker_request.order_ref,
+                )
             else:
                 await self._transition(request.trade_id, "CANCELLED")
 
@@ -222,7 +266,7 @@ class OrderManager:
         # ------------------------------------------------------------------
         # Step 8 — Record KPI snapshot (non-fatal if it fails)
         # ------------------------------------------------------------------
-        if self._session_factory and self._broker and order_result.status in ("FILLED", "PARTIAL"):
+        if self._session_factory and self._broker and filled:
             try:
                 from app.core.metrics.collector import MetricsCollector
                 async with self._session_factory() as session:
@@ -235,24 +279,43 @@ class OrderManager:
 
         return validation, order_result
 
-    async def _compute_aggregate_risk(self) -> Decimal:
-        """
-        Sum risk_amount across all non-terminal trades (PENDING, SUBMITTED,
-        OPEN). Always called from inside self._submission_lock so the read
-        and the subsequent PENDING-row insert are atomic with respect to any
-        other concurrent submit_order() call in this process.
+    async def _publish_trade_executed(
+        self,
+        request: TradeRequest,
+        validation: ValidationResult,
+        order_result: OrderResult,
+    ) -> None:
+        """Publish trade_executed for a fill; a failure here never fails the order."""
+        if self._cache is None or self._session_factory is None:
+            return
+        try:
+            from app.core.execution.trade_handler import TradeHandler
 
-        Returns 0 if no session_factory is configured (e.g. unit tests).
+            async with self._session_factory() as session:
+                await TradeHandler(self._cache).on_fill(request, validation, order_result, session)
+        except Exception as exc:
+            trading_logger.warning(
+                "OrderManager: trade_executed publish failed",
+                extra={"trade_id": str(request.trade_id), "error": str(exc)},
+            )
+
+    async def _load_active_trades(self) -> list:
+        """
+        Non-terminal trades (PENDING, SUBMITTED, OPEN, CLOSING), used for the
+        one-active-trade-per-symbol check and the aggregate risk sum. Always
+        called from inside self._submission_lock so the read and the subsequent
+        PENDING-row insert are atomic with respect to any other concurrent
+        submit_order() call in this process.
+
+        Returns [] if no session_factory is configured (e.g. unit tests).
         """
         if not self._session_factory:
-            return Decimal("0")
+            return []
 
         from app.db.repositories.trade_repo import TradeRepo
 
         async with self._session_factory() as session:
-            repo = TradeRepo(session)
-            active = await repo.get_active_trades()
-            return sum((t.risk_amount for t in active), Decimal("0"))
+            return await TradeRepo(session).get_active_trades()
 
     async def _place_order_with_retry(
         self,
@@ -279,6 +342,9 @@ class OrderManager:
                 return result, None
             except Exception as exc:
                 last_exc = exc
+                existing = await self._find_existing_order(broker_request)
+                if existing is not None:
+                    return existing, None
                 if attempt < self._order_retry_attempts:
                     delay = self._order_retry_backoff_seconds * (2 ** (attempt - 1))
                     trading_logger.warning(
@@ -294,177 +360,403 @@ class OrderManager:
                     await asyncio.sleep(delay)
         return None, last_exc
 
+    async def _find_existing_order(self, broker_request: OrderRequest) -> OrderResult | None:
+        """After a failed place_order, return the broker's record of that order_ref if any."""
+        if not broker_request.order_ref:
+            return None
+        try:
+            return await self._broker.find_order_by_ref(broker_request.order_ref)
+        except Exception as exc:
+            trading_logger.warning(
+                "OrderManager: find_order_by_ref failed",
+                extra={"trade_id": str(broker_request.trade_id), "error": str(exc)},
+            )
+            return None
+
     async def close_position(
         self,
         trade_id: uuid.UUID,
-        reason: str,  # "STOP_LOSS" | "TAKE_PROFIT" | "MANUAL"
-    ) -> None:
+        reason: str,  # an ExitReason value: "STOP_LOSS" | "TAKE_PROFIT" | "MANUAL" | "STALE_TIMEOUT" | "EXTERNAL"
+        *,
+        allow_from_closing: bool = False,
+    ) -> CloseOutcome:
         """
-        Close an open position by submitting a market close order to the broker.
+        Close a position with one market order, at most once per trade.
 
-        Transitions the trade: OPEN → CLOSING → CLOSED (or logs error and
-        stays at CLOSING if the broker rejects the close order).
-
-        Args:
-            trade_id: UUID of the trade to close.
-            reason:   Exit reason — "STOP_LOSS", "TAKE_PROFIT", or "MANUAL".
+        OPEN -> CLOSING (atomic, stores the intended exit_reason) -> order ref
+        "<id>:exit" -> CLOSED only after a real fill. Raises ValueError for an
+        unknown reason string. Never touches state while the market is closed.
         """
         if not self._session_factory:
             raise RuntimeError("close_position requires a session_factory")
 
-        from app.db.models.trade import ExitReason, TradeDirection, TradeStatus
+        from app.db.models.trade import ExitReason, TradeDirection
         from app.db.repositories.trade_repo import TradeRepo
 
-        # ------------------------------------------------------------------
-        # Load trade and validate current status
-        # ------------------------------------------------------------------
+        exit_reason = ExitReason(reason)
+
+        if not self._is_market_open():
+            return CloseOutcome.MARKET_CLOSED
+
         async with self._session_factory() as session:
-            repo = TradeRepo(session)
-            trade = await repo.get_by_id(trade_id)
-
-            if trade is None:
-                error_logger.error(
-                    "close_position: trade not found",
-                    extra={"trade_id": str(trade_id), "reason": reason},
-                )
-                return
-
-            if trade.status != TradeStatus.OPEN:
-                error_logger.critical(
-                    "close_position: unexpected status — expected OPEN",
-                    extra={
-                        "trade_id": str(trade_id),
-                        "current_status": trade.status.value,
-                        "reason": reason,
-                    },
-                )
-                return
-
-            # Snapshot fields needed for the close order and PnL calculation
-            symbol = trade.symbol
-            close_direction = "SELL" if trade.direction == TradeDirection.BUY else "BUY"
-            quantity = trade.quantity
-            entry_price = trade.entry_price
-            strategy_id = trade.strategy_id
-            account_balance_at_entry = trade.account_balance_at_entry
-
-            # Transition to CLOSING
-            await repo.update_status(trade_id, TradeStatus.CLOSING)
+            trade = await TradeRepo(session).begin_close(
+                trade_id, exit_reason, allow_from_closing=allow_from_closing
+            )
             await session.commit()
+        if trade is None:
+            trading_logger.warning(
+                "close_position: trade not found or not eligible to close",
+                extra={"trade_id": str(trade_id), "exit_reason": reason},
+            )
+            return CloseOutcome.NOT_OPEN
 
-        # ------------------------------------------------------------------
-        # Submit close order to broker (market order, no stop)
-        # ------------------------------------------------------------------
+        symbol = trade.symbol
+        close_direction = "SELL" if trade.direction == TradeDirection.BUY else "BUY"
+        total_quantity = trade.filled_quantity if trade.filled_quantity else trade.quantity
+        stop_order_id = trade.stop_order_id
+        exit_ref = f"{trade_id}:exit"
+
+        async def fail(alert_type: str, message: str, **details) -> CloseOutcome:
+            await publish_system_alert(
+                self._cache,
+                alert_type,
+                message,
+                trade_id=str(trade_id),
+                symbol=symbol,
+                exit_reason=reason,
+                **details,
+            )
+            return CloseOutcome.FAILED
+
+        # A protective stop must be gone (or found filled) before we sell.
+        if stop_order_id:
+            try:
+                stop_fill = await self._cancel_protective_stop(trade_id, stop_order_id)
+            except Exception as exc:
+                return await fail(
+                    "CLOSE_FAILED",
+                    f"Could not cancel protective stop for {symbol}; exit not sent",
+                    error=str(exc),
+                )
+            if stop_fill is not None:
+                done = await self.finalize_close(
+                    trade_id, ExitReason.STOP_LOSS, stop_fill, stop_fill.avg_fill_price
+                )
+                return CloseOutcome.CLOSED if done else CloseOutcome.FAILED
+
+        try:
+            existing = await self._broker.find_order_by_ref(exit_ref)
+            sold_summary = await self._broker.get_execution_summary(exit_ref)
+        except Exception as exc:
+            return await fail(
+                "CLOSE_FAILED",
+                f"Could not query broker for existing exit of {symbol}; exit not sent",
+                error=str(exc),
+            )
+
+        if existing is not None and existing.status == "WORKING":
+            await self._record_exit_order(trade_id, existing.broker_order_id)
+            return CloseOutcome.PENDING_EXIT
+
+        sold = sold_summary.filled_quantity if sold_summary else Decimal("0")
+        remaining = total_quantity - sold
+        if remaining <= 0 and sold_summary is not None:
+            done = await self.finalize_close(
+                trade_id, exit_reason, sold_summary, sold_summary.avg_fill_price
+            )
+            return CloseOutcome.CLOSED if done else CloseOutcome.FAILED
+
         close_request = OrderRequest(
             trade_id=trade_id,
             symbol=symbol,
             direction=close_direction,
-            quantity=quantity,
+            quantity=remaining,
             order_type="MKT",
-            stop_loss_price=None,
+            order_ref=exit_ref,
         )
-
         order_result, broker_error = await self._place_order_with_retry(
             close_request, context="close order"
         )
         if order_result is None:
-            error_logger.critical(
-                "close_position: broker close order failed after all retries — "
-                "position remains OPEN at the broker, stop/target is no longer "
-                "being enforced for this trade",
-                extra={
-                    "trade_id": str(trade_id),
-                    "reason": reason,
-                    "attempts": self._order_retry_attempts,
-                    "error": str(broker_error),
-                },
-            )
-            return
-
-        # ------------------------------------------------------------------
-        # Record exit and transition to CLOSED
-        # ------------------------------------------------------------------
-        if order_result.status in ("FILLED", "PARTIAL"):
-            fill_price = order_result.avg_fill_price
-
-            # PnL: positive when trade moved in our favour
-            if close_direction == "SELL":  # was a BUY trade
-                pnl = (fill_price - entry_price) * order_result.filled_quantity
-            else:  # was a SELL (short) trade
-                pnl = (entry_price - fill_price) * order_result.filled_quantity
-
-            try:
-                exit_reason = ExitReason(reason)
-            except ValueError:
-                exit_reason = ExitReason.MANUAL
-
-            # Feed realized pnl to the circuit breaker before anything else
-            # can short-circuit this method (DB write, event publish, etc.)
-            # so a halt/kill triggered by this trade applies to the very
-            # next validate() call, not just the one after that.
-            if self._circuit_breaker is not None:
-                self._circuit_breaker.record_closed_trade(
-                    pnl=pnl,
-                    account_balance=account_balance_at_entry,
-                    strategy_id=strategy_id,
-                )
-
-            async with self._session_factory() as session:
-                repo = TradeRepo(session)
-                await repo.close_trade(
-                    trade_id=trade_id,
-                    exit_price=fill_price,
-                    pnl=pnl,
-                    exit_reason=exit_reason,
-                )
-                await session.commit()
-
-            trading_logger.info(
-                "Position closed",
-                extra={
-                    "trade_id": str(trade_id),
-                    "symbol": symbol,
-                    "reason": reason,
-                    "exit_price": str(fill_price),
-                    "pnl": str(pnl),
-                },
+            return await fail(
+                "CLOSE_FAILED",
+                f"Exit order for {symbol} failed after all retries; trade left CLOSING",
+                attempts=self._order_retry_attempts,
+                error=str(broker_error),
             )
 
-            # Publish trade_closed event for PositionMonitor and WebSocket consumers
-            if self._cache:
-                event = {
-                    "event": "trade_closed",
-                    "payload": {
-                        "trade_id": str(trade_id),
-                        "symbol": symbol,
-                        "reason": reason,
-                        "exit_price": str(fill_price),
-                        "pnl": str(pnl),
-                    },
-                    "timestamp": datetime.now(UTC).isoformat(),
-                }
-                await self._cache.publish(TRADE_EVENTS_CHANNEL, json.dumps(event))
-
-            # Record KPI snapshot after close (non-fatal)
+        if order_result.status == "FILLED":
             try:
-                from app.core.metrics.collector import MetricsCollector
-                async with self._session_factory() as session:
-                    await MetricsCollector().record_snapshot(session, self._broker)
+                summary = await self._broker.get_execution_summary(exit_ref)
+            except Exception:
+                summary = None
+            fill = summary or order_result
+            done = await self.finalize_close(trade_id, exit_reason, fill, fill.avg_fill_price)
+            return CloseOutcome.CLOSED if done else CloseOutcome.FAILED
+        if order_result.status == "WORKING":
+            await self._record_exit_order(trade_id, order_result.broker_order_id)
+            return CloseOutcome.PENDING_EXIT
+        if order_result.status == "PARTIAL":
+            return await fail(
+                "CLOSE_PARTIAL",
+                f"Exit for {symbol} only partly filled; trade left CLOSING",
+                filled_quantity=str(order_result.filled_quantity),
+            )
+        return await fail(
+            "CLOSE_FAILED",
+            f"Exit order for {symbol} was {order_result.status}; trade left CLOSING",
+            error=order_result.error_message,
+        )
+
+    async def place_protective_stop(self, trade_id: uuid.UUID, *, force: bool = False) -> bool:
+        """
+        Rest a GTC stop order at the broker at the risk-approved stop price (RSK-07).
+
+        Idempotent: does nothing unless the trade is OPEN with no stop recorded.
+        The internal monitor stays the primary exit; this is the outage backstop.
+        A failure alerts PROTECTIVE_STOP_FAILED and never raises.
+        """
+        if not (self._protective_stops or force) or not self._session_factory:
+            return False
+
+        from app.db.models.trade import TradeDirection, TradeStatus
+        from app.db.repositories.trade_repo import TradeRepo
+
+        async with self._session_factory() as session:
+            trade = await TradeRepo(session).get_by_id(trade_id)
+        if trade is None or trade.status != TradeStatus.OPEN or trade.stop_order_id:
+            return False
+
+        symbol = trade.symbol
+        quantity = trade.filled_quantity if trade.filled_quantity else trade.quantity
+        stop_ref = f"{trade_id}:stop"
+        try:
+            existing = await self._broker.find_order_by_ref(stop_ref)
+            if existing is not None and existing.status == "WORKING":
+                await self._record_stop_order(trade_id, existing.broker_order_id, trade.stop_loss_price)
+                return True
+            request = OrderRequest(
+                trade_id=trade_id,
+                symbol=symbol,
+                direction="SELL" if trade.direction == TradeDirection.BUY else "BUY",
+                quantity=quantity,
+                order_type="STP",
+                stop_price=trade.stop_loss_price,
+                tif="GTC",
+                order_ref=stop_ref,
+            )
+            result, error = await self._place_order_with_retry(request, context="protective stop")
+        except Exception as exc:
+            result, error = None, exc
+
+        if result is None or result.status in ("REJECTED", "ERROR"):
+            await publish_system_alert(
+                self._cache,
+                "PROTECTIVE_STOP_FAILED",
+                f"Broker stop for {symbol} could not be placed; internal monitor still protects it",
+                trade_id=str(trade_id),
+                symbol=symbol,
+                error=str(error) if error else (result.error_message if result else None),
+            )
+            return False
+        await self._record_stop_order(trade_id, result.broker_order_id, trade.stop_loss_price)
+        return True
+
+    async def _cancel_protective_stop(
+        self, trade_id: uuid.UUID, stop_order_id: str
+    ) -> OrderResult | None:
+        """
+        Cancel the resting stop and wait for it to settle.
+
+        Returns the stop's fill summary if it executed (so the caller must not sell
+        again), None once it is gone. Raises if it is still working after the wait.
+        """
+        stop_ref = f"{trade_id}:stop"
+        await self._broker.cancel_order(stop_order_id)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._stop_cancel_wait_seconds
+        while True:
+            state = await self._broker.find_order_by_ref(stop_ref)
+            if state is None or state.status != "WORKING":
+                break
+            if loop.time() >= deadline:
+                raise RuntimeError("protective stop still working after cancel")
+            await asyncio.sleep(0.25)
+        fill = await self._broker.get_execution_summary(stop_ref)
+        if fill is not None and fill.filled_quantity > 0:
+            return fill
+        return None
+
+    async def adopt_entry_fill(self, trade_id: uuid.UUID, fill: OrderResult) -> bool:
+        """
+        Move a PENDING/SUBMITTED trade to OPEN from a fill found at the broker
+        (reconciler path): atomic, publishes trade_executed, places the protective stop.
+        Returns False if the trade had already moved on.
+        """
+        from app.core.execution.trade_handler import TradeHandler
+        from app.db.repositories.trade_repo import TradeRepo
+
+        async with self._session_factory() as session:
+            trade = await TradeRepo(session).open_from_fill(
+                trade_id, fill.broker_order_id, fill.avg_fill_price, fill.filled_quantity
+            )
+            await session.commit()
+        if trade is None:
+            return False
+        trading_logger.info(
+            "Entry fill adopted from broker",
+            extra={
+                "trade_id": str(trade_id),
+                "symbol": trade.symbol,
+                "filled_quantity": str(fill.filled_quantity),
+            },
+        )
+        if self._cache is not None:
+            try:
+                await TradeHandler(self._cache).publish_for_trade(trade, fill)
             except Exception as exc:
                 trading_logger.warning(
-                    "OrderManager: MetricsCollector snapshot failed on close",
+                    "OrderManager: trade_executed publish failed",
+                    extra={"trade_id": str(trade_id), "error": str(exc)},
+                )
+        await self.place_protective_stop(trade_id)
+        return True
+
+    async def finalize_close(
+        self,
+        trade_id: uuid.UUID,
+        exit_reason,
+        fill: OrderResult | None,
+        fallback_price: Decimal,
+    ) -> bool:
+        """
+        Record a confirmed exit: PnL, CLOSED row, circuit breaker, event, snapshot.
+
+        Never places an order and ignores market hours. Returns True only if this
+        call moved the trade CLOSING -> CLOSED, so PnL is recorded exactly once.
+        """
+        if not self._session_factory:
+            raise RuntimeError("finalize_close requires a session_factory")
+
+        from app.db.models.trade import TradeDirection, TradeStatus
+        from app.db.repositories.trade_repo import TradeRepo
+
+        async with self._session_factory() as session:
+            repo = TradeRepo(session)
+            trade = await repo.get_by_id(trade_id)
+            if trade is None:
+                error_logger.error(
+                    "finalize_close: trade not found", extra={"trade_id": str(trade_id)}
+                )
+                return False
+            if trade.status == TradeStatus.OPEN:
+                trade = await repo.begin_close(trade_id, exit_reason)
+                if trade is None:
+                    await session.commit()
+                    return False
+            elif trade.status != TradeStatus.CLOSING:
+                return False
+
+            if fill is not None:
+                shares, exit_price = fill.filled_quantity, fill.avg_fill_price
+            else:
+                shares = trade.filled_quantity if trade.filled_quantity else trade.quantity
+                exit_price = fallback_price
+            entry = trade.entry_fill_price if trade.entry_fill_price else trade.entry_price
+            if trade.direction == TradeDirection.BUY:
+                pnl = (exit_price - entry) * shares
+            else:
+                pnl = (entry - exit_price) * shares
+
+            closed = await repo.finish_close(
+                trade_id,
+                exit_price,
+                pnl,
+                fill.broker_order_id if fill else None,
+                exit_reason=exit_reason,
+            )
+            await session.commit()
+        if closed is None:
+            return False
+
+        if self._circuit_breaker is not None:
+            events = self._circuit_breaker.record_closed_trade(
+                pnl=pnl,
+                account_balance=closed.account_balance_at_entry,
+                strategy_id=closed.strategy_id,
+            )
+            await self._handle_breaker_events(events, closed.strategy_id)
+
+        trading_logger.info(
+            "Position closed",
+            extra={
+                "trade_id": str(trade_id),
+                "symbol": closed.symbol,
+                "reason": exit_reason.value,
+                "exit_price": str(exit_price),
+                "pnl": str(pnl),
+            },
+        )
+        if self._cache:
+            try:
+                await self._cache.publish(
+                    TRADE_EVENTS_CHANNEL,
+                    envelope(
+                        "trade_closed",
+                        {
+                            "trade_id": str(trade_id),
+                            "symbol": closed.symbol,
+                            "reason": exit_reason.value,
+                            "exit_price": str(exit_price),
+                            "pnl": str(pnl),
+                        },
+                    ),
+                )
+            except Exception as exc:
+                trading_logger.warning(
+                    "OrderManager: trade_closed publish failed",
                     extra={"trade_id": str(trade_id), "error": str(exc)},
                 )
 
-        else:
-            error_logger.error(
-                "close_position: broker rejected close order — trade left at CLOSING",
-                extra={
-                    "trade_id": str(trade_id),
-                    "broker_status": order_result.status,
-                    "error": order_result.error_message,
-                },
+        try:
+            from app.core.metrics.collector import MetricsCollector
+
+            async with self._session_factory() as session:
+                await MetricsCollector().record_snapshot(session, self._broker)
+        except Exception as exc:
+            trading_logger.warning(
+                "OrderManager: MetricsCollector snapshot failed on close",
+                extra={"trade_id": str(trade_id), "error": str(exc)},
             )
+        return True
+
+    async def _handle_breaker_events(self, events: list[str], strategy_id: uuid.UUID | None) -> None:
+        """Alert on a new daily halt; durably disable a strategy the breaker just killed."""
+        for event in events:
+            if event == "DAILY_HALT":
+                await publish_system_alert(
+                    self._cache,
+                    "CIRCUIT_BREAKER_HALT",
+                    "Daily loss limit reached: new trades are halted for the rest of the trading day",
+                )
+            elif event == "STRATEGY_KILLED" and strategy_id is not None:
+                try:
+                    from app.db.repositories.strategy_repo import StrategyRepo
+
+                    async with self._session_factory() as session:
+                        await StrategyRepo(session).set_enabled(strategy_id, False)
+                        await session.commit()
+                except Exception as exc:
+                    error_logger.error(
+                        "OrderManager: could not disable killed strategy",
+                        extra={"strategy_id": str(strategy_id), "error": str(exc)},
+                    )
+                await publish_system_alert(
+                    self._cache,
+                    "STRATEGY_AUTO_DISABLED",
+                    "Strategy disabled after too many consecutive losses",
+                    strategy_id=str(strategy_id),
+                )
 
     # ------------------------------------------------------------------
     # DB helpers
@@ -494,6 +786,38 @@ class OrderManager:
                 account_balance_at_entry=validation.account_balance_at_entry,
                 strategy_id=request.strategy_id,
             )
+            await session.commit()
+
+    async def _record_entry_fill(self, trade_id: uuid.UUID, result: OrderResult) -> None:
+        from app.db.repositories.trade_repo import TradeRepo
+
+        async with self._session_factory() as session:
+            await TradeRepo(session).record_entry_fill(
+                trade_id, result.broker_order_id, result.avg_fill_price, result.filled_quantity
+            )
+            await session.commit()
+
+    async def _record_exit_order(self, trade_id: uuid.UUID, order_id: str) -> None:
+        from app.db.repositories.trade_repo import TradeRepo
+
+        async with self._session_factory() as session:
+            await TradeRepo(session).set_exit_order(trade_id, order_id)
+            await session.commit()
+
+    async def _record_stop_order(
+        self, trade_id: uuid.UUID, order_id: str, stop_price: Decimal
+    ) -> None:
+        from app.db.repositories.trade_repo import TradeRepo
+
+        async with self._session_factory() as session:
+            await TradeRepo(session).set_stop_order(trade_id, order_id, stop_price)
+            await session.commit()
+
+    async def _record_entry_order(self, trade_id: uuid.UUID, order_id: str) -> None:
+        from app.db.repositories.trade_repo import TradeRepo
+
+        async with self._session_factory() as session:
+            await TradeRepo(session).set_entry_order(trade_id, order_id)
             await session.commit()
 
     async def _transition(self, trade_id: uuid.UUID, new_status: str) -> None:

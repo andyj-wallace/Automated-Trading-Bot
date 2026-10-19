@@ -157,7 +157,8 @@ class MeanReversionStrategy(BaseStrategy):
         except Exception:
             return 0
 
-    def get_config_schema(self) -> dict:
+    @classmethod
+    def get_config_schema(cls) -> dict:
         """JSON Schema for the mean reversion strategy configuration."""
         return {
             "type": "object",

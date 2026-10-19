@@ -83,8 +83,8 @@ This is the canonical template. Copy this content verbatim into `.env.example` a
 
 # --- Application ----------------------------------------------------------
 
-# Runtime environment. Controls MockBroker vs IBKRClient selection and
-# enables/disables the live trading guard in IBKRClient.connect().
+# Runtime environment. Enables/disables the live trading guard in
+# IBKRClient.connect(). The broker is chosen by BROKER, not by this.
 # Values: development | production
 ENVIRONMENT=development
 
@@ -112,8 +112,9 @@ REDIS_URL=redis://localhost:6379/0
 # IB Gateway host. Always localhost for local development.
 IBKR_HOST=127.0.0.1
 
-# IB Gateway API port. Default: 4001 (Gateway), 7497 (TWS).
-IBKR_PORT=4001
+# IB Gateway API port. Native Gateway: 4002 paper / 4001 live.
+# ib-gateway-docker image: 4004 paper / 4003 live. TWS: 7497 paper / 7496 live.
+IBKR_PORT=4002
 
 # Client ID for this application's connection to Gateway.
 # Must be unique per simultaneous connection. Use 1 for the main app.
@@ -151,7 +152,7 @@ VNC_PASSWORD=
 ### Application
 
 **`ENVIRONMENT`**
-Controls which broker implementation is injected and whether the live trading guard is active. `development` selects `MockBroker` by default and raises an error if `IBKR_TRADING_MODE=live`. `production` selects `IBKRClient`.
+Controls the live trading guard and the security audit. `development` raises an error if `IBKR_TRADING_MODE=live`. It does **not** choose the broker: `BROKER` does (`mock` = `MockBroker`, `ibkr` = `IBKRClient`).
 - Required: yes
 - Default in example: `development`
 
@@ -193,9 +194,9 @@ The host where IB Gateway is listening. Always `127.0.0.1` for local development
 - Local default: `127.0.0.1`
 
 **`IBKR_PORT`**
-The TCP port Gateway exposes for API connections. `4001` is the IB Gateway default. `7497` is the TWS default — only relevant if you switch to running TWS instead of Gateway.
+The TCP port Gateway exposes for API connections. Native IB Gateway: `4002` paper, `4001` live. The ib-gateway-docker image: `4004` paper, `4003` live. TWS uses `7497` paper / `7496` live. Never point the bot at a live port.
 - Required: yes
-- Local default: `4001`
+- Local default: `4002`
 
 **`IBKR_CLIENT_ID`**
 An integer identifying this application's connection to Gateway. Must be unique per simultaneous connection to the same Gateway instance. If you run a separate test script alongside the app, give the script a different ID (e.g. `99`).
@@ -212,6 +213,46 @@ Controls paper vs live mode. The application reads this and enforces that `devel
 - Required: yes
 - Local default: `paper`
 - ⚠️ Changing to `live` on a production deployment places real orders with real money.
+
+---
+
+**`BROKER`**
+Selects the broker implementation: `mock` (simulated, default) or `ibkr` (real IB Gateway connection). `ENVIRONMENT` has no effect on this choice.
+- Required: no
+- Default: `mock`
+
+### Trading engine
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ENGINE_ENABLED` | `true` | Start the trading engine with the API. `false` runs the API only (tests force this). |
+| `LOG_DIR` | `logs` | Directory for log files. |
+| `CORS_ORIGINS` | `["http://localhost:5173"]` | Allowed CORS origins, as a JSON list. |
+| `SCHEDULER_INTERVAL_SECONDS` | `60` | Seconds between strategy evaluation cycles. |
+| `STRATEGY_EVAL_START_ET` / `STRATEGY_EVAL_END_ET` | `09:45` / `15:45` | Strategy evaluation window (ET) on NYSE trading days. |
+| `BAR_REFRESH_TIME_ET` | `16:30` | Daily bar refresh time (ET). |
+| `DAILY_SUMMARY_TIME_ET` | `16:45` | Daily summary time (ET). |
+| `PRICE_STALE_SECONDS` | `120` | Max age of a cached price before strategies ignore it. |
+
+### Risk
+
+The 1% per-trade risk rule is fixed in code and is not a setting.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `MAX_PORTFOLIO_RISK_PCT` | `0.05` | Max aggregate open risk; must be > 0 and <= 0.10. |
+| `MIN_REWARD_TO_RISK` | `2.0` | Minimum reward-to-risk ratio. |
+| `DAILY_LOSS_LIMIT_PCT` | `0.03` | Circuit breaker daily loss limit. |
+| `MAX_CONSECUTIVE_LOSSES` | `5` | Circuit breaker consecutive-loss limit per strategy. |
+| `STALE_TRADE_MAX_DAYS` | `14` | Close trades open longer than this. |
+
+### Execution / broker
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ORDER_FILL_TIMEOUT_SECONDS` | `30` | Seconds to wait for an order fill. |
+| `BROKER_PROTECTIVE_STOPS` | `true` | Keep a GTC stop order at the broker for each open position. |
+| `IBKR_MARKET_DATA_TYPE` | `1` | 1 = live, 3 = delayed (paper accounts only). |
 
 ---
 
@@ -252,7 +293,7 @@ class Settings(BaseSettings):
 
     # IBKR
     ibkr_host: str = "127.0.0.1"
-    ibkr_port: int = 4001
+    ibkr_port: int = 4002
     ibkr_client_id: int = 1
     ibkr_username: str = ""
     ibkr_password: str = ""

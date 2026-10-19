@@ -49,7 +49,14 @@ def _make_trade(symbol: str = "AAPL") -> MagicMock:
     t.quantity = Decimal("10")
     t.entry_price = Decimal("150.00")
     t.stop_loss_price = Decimal("148.50")
+    t.take_profit_price = Decimal("153.00")
+    t.reward_to_risk_ratio = Decimal("2")
     t.exit_price = None
+    t.exit_reason = None
+    t.entry_fill_price = None
+    t.filled_quantity = None
+    t.current_stop_price = None
+    t.close_attempts = 0
     t.status = "OPEN"
     t.risk_amount = Decimal("15.00")
     t.account_balance_at_entry = Decimal("100000.00")
@@ -318,8 +325,10 @@ class TestStrategiesEndpoints:
 
     def test_patch_strategy_update_config(self, client):
         strategy = _make_strategy()
+        strategy.type = "moving_average"
         strategy.config = {"fast_period": 20, "slow_period": 50, "symbols": ["TSLA"]}
         with patch("app.api.v1.strategies.StrategyRepo") as MockRepo:
+            MockRepo.return_value.get_by_id = AsyncMock(return_value=strategy)
             MockRepo.return_value.patch = AsyncMock(return_value=strategy)
             response = client.patch(
                 f"/api/v1/strategies/{strategy.id}",

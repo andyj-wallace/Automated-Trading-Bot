@@ -4,21 +4,33 @@ Symbol management endpoints.
 GET    /api/v1/symbols           — List all watchlist symbols
 POST   /api/v1/symbols           — Add a symbol (validates ticker with broker first)
 DELETE /api/v1/symbols/{ticker}  — Remove a symbol (requires confirm=true if open position)
+GET    /api/v1/symbols/{ticker}/bars?days=365 — Daily OHLCV bars, oldest first
 """
 
-from fastapi import APIRouter, Body, Depends, Path, Query
+from datetime import UTC, datetime, timedelta
+
+from fastapi import APIRouter, Body, Depends, Path, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.schemas import SymbolCreateIn, SymbolDeleteConfirmIn, SymbolOut, err, ok
+from app.api.v1.schemas import BarOut, SymbolCreateIn, SymbolDeleteConfirmIn, SymbolOut, err, ok
 from app.brokers.base import BaseBroker
 from app.data.historical import HistoricalDataFetcher
+from app.db.repositories.ohlcv_repo import OHLCVRepo
 from app.db.repositories.symbol_repo import SymbolRepo
 from app.dependencies import get_broker, get_db
 from app.monitoring.logger import system_logger
 
 router = APIRouter(prefix="/symbols", tags=["symbols"])
+
+
+def _kick_feed_sync(request: Request) -> None:
+    """Best effort: resync feed subscriptions now; the periodic sync covers failures."""
+    engine = getattr(request.app.state, "engine", None)
+    feed = getattr(engine, "feed", None)
+    if engine is not None and feed is not None and engine.started:
+        engine.spawn(feed.sync(), "feed-sync")
 
 
 @router.get("")
@@ -35,6 +47,7 @@ async def list_symbols(
 
 @router.post("", status_code=201)
 async def add_symbol(
+    request: Request,
     body: SymbolCreateIn,
     db: AsyncSession = Depends(get_db),
     broker: BaseBroker = Depends(get_broker),
@@ -70,6 +83,12 @@ async def add_symbol(
     except ValueError as exc:
         return JSONResponse(status_code=409, content=err("SYMBOL_EXISTS", str(exc)))
 
+    _kick_feed_sync(request)
+    engine = getattr(request.app.state, "engine", None)
+    bar_refresh = getattr(engine, "bar_refresh", None)
+    if engine is not None and bar_refresh is not None and engine.started:
+        engine.spawn(bar_refresh.refresh({ticker}, "2 Y"), "bar-backfill")
+
     return JSONResponse(
         status_code=201,
         content=ok(jsonable_encoder(SymbolOut.model_validate(symbol))),
@@ -78,6 +97,7 @@ async def add_symbol(
 
 @router.delete("/{ticker}")
 async def remove_symbol(
+    request: Request,
     ticker: str = Path(..., description="Ticker symbol to remove, e.g. AAPL"),
     body: SymbolDeleteConfirmIn = Body(default_factory=SymbolDeleteConfirmIn),
     db: AsyncSession = Depends(get_db),
@@ -116,6 +136,7 @@ async def remove_symbol(
         )
 
     await db.commit()
+    _kick_feed_sync(request)
     return JSONResponse(content=ok({"ticker": ticker, "deleted": True}))
 
 
@@ -141,3 +162,14 @@ async def fetch_symbol_history(
         )
 
     return JSONResponse(content=ok({"ticker": ticker, "bars_stored": count}))
+
+
+@router.get("/{ticker}/bars")
+async def get_bars(
+    ticker: str = Path(..., description="Ticker symbol"),
+    days: int = Query(365, ge=1, le=1825, description="Calendar days of history"),
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    end = datetime.now(UTC)
+    bars = await OHLCVRepo(db).get_bars(ticker.upper(), start=end - timedelta(days=days), end=end)
+    return JSONResponse(content=ok(jsonable_encoder([BarOut.model_validate(b) for b in bars])))

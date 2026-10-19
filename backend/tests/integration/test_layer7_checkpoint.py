@@ -37,11 +37,8 @@ from app.data.cache import RedisCache
 from app.db.models.trade import TradeStatus
 from app.db.repositories.trade_repo import TradeRepo
 
-_DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql+asyncpg://trading:trading@localhost:5432/trading_bot",
-)
-_REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+_DB_URL = os.environ["DATABASE_URL"]
+_REDIS_URL = os.environ["REDIS_URL"]
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +133,7 @@ async def test_trade_created_at_pending_before_broker_call(
     6B.8: OrderManager creates a PENDING row before place_order() is called.
     Verified by intercepting place_order and reading the DB inside it.
     """
-    order_manager = OrderManager(broker, RiskManager(), session_factory)
+    order_manager = OrderManager(broker, RiskManager(), session_factory, is_market_open=lambda: True)
     req = _valid_request()
 
     pending_status_observed = []
@@ -171,7 +168,7 @@ async def test_trade_status_open_after_fill(
     session_factory,
     session: AsyncSession,
 ) -> None:
-    order_manager = OrderManager(broker, RiskManager(), session_factory)
+    order_manager = OrderManager(broker, RiskManager(), session_factory, is_market_open=lambda: True)
     req = _valid_request()
 
     validation, order_result = await order_manager.submit_order(req)
@@ -193,7 +190,7 @@ async def test_audit_entries_written(
     broker: MockBroker,
     session_factory,
 ) -> None:
-    order_manager = OrderManager(broker, RiskManager(), session_factory)
+    order_manager = OrderManager(broker, RiskManager(), session_factory, is_market_open=lambda: True)
     req = _valid_request()
 
     with patch("app.core.execution.order_manager.audit_logger") as mock_audit:
@@ -219,7 +216,7 @@ async def test_on_fill_persists_trade_to_db(
     """
     Full flow: submit_order() → on_fill() → trade row readable from DB.
     """
-    order_manager = OrderManager(broker, RiskManager(), session_factory)
+    order_manager = OrderManager(broker, RiskManager(), session_factory, is_market_open=lambda: True)
     trade_handler = TradeHandler(cache)
     req = _valid_request()
 
@@ -253,7 +250,7 @@ async def test_on_fill_publishes_trade_event_to_redis(
     session_factory,
     session: AsyncSession,
 ) -> None:
-    order_manager = OrderManager(broker, RiskManager(), session_factory)
+    order_manager = OrderManager(broker, RiskManager(), session_factory, is_market_open=lambda: True)
     trade_handler = TradeHandler(cache)
     req = _valid_request(symbol="MSFT")
 
@@ -294,7 +291,7 @@ async def test_risk_rejection_writes_no_db_row(
     session: AsyncSession,
 ) -> None:
     """A rejected trade must leave zero rows in the DB for that trade_id."""
-    order_manager = OrderManager(broker, RiskManager(), session_factory)
+    order_manager = OrderManager(broker, RiskManager(), session_factory, is_market_open=lambda: True)
     req = _valid_request(stop_loss_price=None)
 
     with pytest.raises(RiskRejectionError):
