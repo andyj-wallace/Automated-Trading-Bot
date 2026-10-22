@@ -6,7 +6,8 @@ x-logging: &default-logging
 
 services:
   ib-gateway:
-    image: ghcr.io/gnzsnz/ib-gateway:10.50
+    # Pinned: IBC (the auto-login tool inside) was retired upstream in 2026-09; check release notes before bumping.
+    image: ghcr.io/gnzsnz/ib-gateway:10.50.1f
     restart: always
     environment:
       TWS_USERID: ${IBKR_USERNAME}
@@ -15,7 +16,7 @@ services:
       READ_ONLY_API: "no"
       TWOFA_TIMEOUT_ACTION: restart
       RELOGIN_AFTER_TWOFA_TIMEOUT: "yes"
-      AUTO_RESTART_TIME: "11:59 PM"
+      AUTO_RESTART_TIME: ${IB_AUTO_RESTART_TIME:-07:00 PM}
       TIME_ZONE: America/New_York
       TZ: America/New_York
       VNC_SERVER_PASSWORD: ${VNC_PASSWORD}
@@ -62,6 +63,7 @@ services:
       IBKR_HOST: ib-gateway
       IBKR_PORT: "4004"
       IBKR_TRADING_MODE: paper
+      IB_AUTO_RESTART_TIME: ${IB_AUTO_RESTART_TIME:-07:00 PM}
       DATABASE_URL: postgresql+asyncpg://trading:${POSTGRES_PASSWORD}@db:5432/trading_bot
       REDIS_URL: redis://redis:6379/0
       LOG_DIR: /app/logs

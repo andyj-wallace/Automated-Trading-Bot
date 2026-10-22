@@ -13,8 +13,9 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../api/client";
+import { useTradingStatus } from "../../hooks/useTradingStatus";
 import { useLiveStore } from "../../store/liveStore";
-import type { Trade, TradingStatus, WatchedSymbol } from "../../types/api";
+import type { Trade, WatchedSymbol } from "../../types/api";
 
 export function WatchlistPanel() {
   const navigate = useNavigate();
@@ -40,11 +41,7 @@ export function WatchlistPanel() {
     refetchInterval: 60_000,
   });
 
-  const { data: status } = useQuery({
-    queryKey: ["trading-status"],
-    queryFn: async () => (await api.get<TradingStatus>("/trading/status")).data,
-    refetchInterval: 15_000,
-  });
+  const { data: status } = useTradingStatus();
 
   useEffect(() => {
     if (tradesVersion > 0) {

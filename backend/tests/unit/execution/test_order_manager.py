@@ -337,6 +337,27 @@ class TestOrderRetry:
         assert result.order_ref == f"{req.trade_id}:entry"
 
     @pytest.mark.asyncio
+    async def test_no_blind_resubmit_when_broker_lookup_also_fails(
+        self, broker: MockBroker, retrying_manager: OrderManager
+    ) -> None:
+        calls = {"n": 0}
+
+        async def fails(order_request):
+            calls["n"] += 1
+            raise ConnectionError("gateway gone")
+
+        async def lookup_fails(order_ref):
+            raise ConnectionError("gateway gone")
+
+        broker.place_order = fails
+        broker.find_order_by_ref = lookup_fails
+
+        with pytest.raises(ConnectionError):
+            await retrying_manager.submit_order(_request())
+
+        assert calls["n"] == 1  # the first order may be live; a retry could place a second
+
+    @pytest.mark.asyncio
     async def test_submit_order_raises_after_exhausting_retries(
         self, broker: MockBroker, retrying_manager: OrderManager
     ) -> None:

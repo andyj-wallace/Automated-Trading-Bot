@@ -34,6 +34,7 @@ async def trading_status(
                 "market_open": engine.market_open(),
                 "in_eval_window": engine.in_eval_window(),
                 "broker_connected": engine.broker.is_connected(),
+                "broker": engine.broker.connection_info().model_dump(mode="json"),
                 "engine_lock_held": engine.is_leader,
                 "scheduler_last_cycle_at": last_cycle.isoformat() if last_cycle else None,
                 "open_trade_count": len(open_trades),

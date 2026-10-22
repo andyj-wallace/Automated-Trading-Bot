@@ -12,6 +12,10 @@ backups/
 credentials.txt
 secrets/
 IB Gateway*/
+# IB Gateway standalone installers (~300 MB each); the Docker image ships its own Gateway
+ibgateway-*.sh
+ibgateway-*.dmg
+ibgateway-*.exe
 *.html
 
 # Keep the example template committed

@@ -57,25 +57,25 @@ def test_normal_case_small_account(calc: RiskCalculator) -> None:
 
 def test_tiny_stop_distance(calc: RiskCalculator) -> None:
     """
-    $100k account, entry $100.00, stop $99.99 → risk/share $0.01
-    max risk = $1000, qty = floor(1000 / 0.01) = 100,000
+    $100k account, entry $100.00, stop $99.99 → the 1% rule allows 100,000 shares
+    ($10M of stock), but the account can only pay for 1,000.
     """
     qty = calc.max_quantity(
         account_balance=Decimal("100000"),
         entry_price=Decimal("100.00"),
         stop_loss_price=Decimal("99.99"),
     )
-    assert qty == 100_000
+    assert qty == 1_000
 
 
 def test_small_stop_distance(calc: RiskCalculator) -> None:
-    """$50k account, entry $500, stop $499 → risk/share $1, max risk $500 → qty 500."""
+    """$50k account, entry $500, stop $499 → 1% rule allows 500, cash allows 100."""
     qty = calc.max_quantity(
         account_balance=Decimal("50000"),
         entry_price=Decimal("500"),
         stop_loss_price=Decimal("499"),
     )
-    assert qty == 500
+    assert qty == 100
 
 
 # ---------------------------------------------------------------------------

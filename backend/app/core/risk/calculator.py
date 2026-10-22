@@ -48,7 +48,8 @@ class RiskCalculator:
         stop_loss_price: Decimal,
     ) -> int:
         """
-        Return the maximum number of shares that keeps loss within 1% of balance.
+        Return the maximum number of shares that keeps loss within 1% of balance
+        and position value within the balance (no margin).
 
         Args:
             account_balance:  Current account equity (must be > 0).
@@ -70,7 +71,10 @@ class RiskCalculator:
 
         # floor division in Decimal space, then convert to int
         raw = (max_risk / risk_per_share).to_integral_value(rounding=ROUND_DOWN)
-        return int(raw)
+        # A tight stop must not buy more stock than the account is worth: a gap past the stop
+        # loses in proportion to position value, not to the 1% budget.
+        affordable = (account_balance / entry_price).to_integral_value(rounding=ROUND_DOWN)
+        return int(min(raw, affordable))
 
     def risk_amount(
         self,

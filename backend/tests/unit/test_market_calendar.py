@@ -50,3 +50,10 @@ def test_in_session_window():
 def test_trading_date_uses_et():
     utc_late = datetime(2026, 10, 20, 2, 0, tzinfo=UTC)
     assert mc.trading_date(utc_late) == date(2026, 10, 19)
+
+
+def test_calendar_covers_through_next_year():
+    # The library default ended one year after the calendar was built (2027-10-21 for a process
+    # started 2026-10-21), so dates past that raised DateOutOfBounds.
+    assert mc._calendar(2026).last_session.date() >= date(2027, 12, 30)
+    assert mc._calendar(2027).last_session.date() >= date(2028, 12, 28)

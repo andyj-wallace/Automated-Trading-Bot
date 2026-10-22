@@ -330,6 +330,11 @@ class TradingEngine:
         except LiveTradingGuardError as exc:
             error_logger.critical("Live trading guard triggered, trading components not started")
             await publish_system_alert(self.cache, "BROKER_ACCOUNT_MODE_MISMATCH", str(exc))
+            # The notifier is not subscribed yet (pub/sub keeps nothing), so email this one directly.
+            try:
+                await self.dispatcher.notify_system_alert("BROKER_ACCOUNT_MODE_MISMATCH", str(exc))
+            except Exception:
+                system_logger.exception("Could not send the account-mode alert")
             return
         except Exception as exc:
             system_logger.warning(

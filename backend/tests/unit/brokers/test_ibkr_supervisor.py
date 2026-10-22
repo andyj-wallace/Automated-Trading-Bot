@@ -154,3 +154,32 @@ async def test_disconnect_stops_supervisor():
     await client.disconnect()
     assert task.done()
     assert client._supervisor_task is None
+
+
+async def test_connection_info_tracks_outage_and_recovery():
+    ib = FakeIB(fail_times=10_000)
+    cache = MagicMock()
+    cache.publish = AsyncMock()
+    client = _client(ib, cache)
+    await client.connect()
+    info = client.connection_info()
+    assert info.state == "reconnecting"
+    assert info.down_since is not None and info.last_error == "down" and info.hint
+    await _until(lambda: cache.publish.await_count >= 1)
+    assert client.connection_info().state == "down"
+    payload = json.loads(cache.publish.call_args.args[1])["payload"]
+    assert payload["alert_type"] == "BROKER_DISCONNECTED"
+    assert payload["hint"] and payload["hint"] in payload["message"]
+    ib.fail_times = 0
+    await _until(lambda: ib.connected)
+    info = client.connection_info()
+    assert info.state == "connected"
+    assert info.last_connected_at is not None and info.down_since is None
+    await client.disconnect()
+
+
+async def test_connection_info_reports_account_mismatch():
+    client = _client(FakeIB(accounts=("U1234567",)))
+    with pytest.raises(LiveTradingGuardError):
+        await client.connect()
+    assert client.connection_info().state == "account_mismatch"

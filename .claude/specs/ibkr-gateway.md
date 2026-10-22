@@ -59,17 +59,17 @@ These steps only need to be done once after installation:
 
 ---
 
-### Daily Startup Procedure (every dev session)
+### Starting the Gateway (Docker, no manual login)
 
-Gateway does not stay authenticated across restarts. IBKR also performs a mandatory daily system restart between **00:15–01:45 ET** which disconnects all sessions. Each time you sit down to work:
+Run the Gateway in Docker instead of opening the app. IBC inside the image types the paper username and password from `.env` and restarts the Gateway daily at `IB_AUTO_RESTART_TIME` without asking for 2FA:
 
-1. Launch IB Gateway
-2. Enter your **paper trading** username and password
-3. Approve the 2FA push notification on IBKR Mobile
-4. Gateway is now running — leave it open in the background
-5. Your FastAPI app can now connect via `ib_async` on `localhost:4002`
+```bash
+docker compose --profile ibkr up -d ib-gateway   # API on 127.0.0.1:4002, VNC on 127.0.0.1:5900
+```
 
-The application's reconnect logic (task 17.1) handles the case where Gateway drops and reconnects mid-session, but it cannot re-authenticate on your behalf — that always requires the 2FA tap.
+Quit the native app first (same login, same port 4002). Approve the IBKR Mobile push the first time and then about once a week (the first login after Sunday 01:00 ET, i.e. Sunday's restart). The backend reconnects by itself after every restart; if the Gateway stays down, the dashboard banner and the `BROKER_DISCONNECTED` alert say what to do. IBKR's nightly server reset (about 00:15–01:45 ET) also drops the connection briefly; that needs nothing from you.
+
+Native app (fallback only): launch IB Gateway, log in with the **paper** username and password, approve the push, and leave it open. It does not restart or log back in by itself.
 
 ---
 
@@ -161,20 +161,17 @@ Switch between paper and live by changing which credentials you use at the Gatew
 
 ## The 2FA Constraint
 
-IBKR currently requires 2FA (via IBKR Mobile) for every login. There is no way to fully bypass this for a live account. This is a deliberate security decision on IBKR's part.
+IBKR requires 2FA (via IBKR Mobile) for a full login. No tool can bypass it.
 
-**What this means in practice:**
+**What this means in practice:** with the Docker Gateway, a daily restart (`AUTO_RESTART_TIME`) logs back in without 2FA, so you approve a push about once a week: the first login after Sunday 01:00 ET. Set `IB_AUTO_RESTART_TIME` (default 7:00 PM ET) to a time you're awake on Sundays. If you miss the push, the Gateway retries and sends another (`TWOFA_TIMEOUT_ACTION: restart`).
 
-- **Local dev**: Not a problem. You're at your computer, you tap your phone, done. Gateway stays authenticated all day.
-- **Cloud deployment**: Requires a person to manually approve the 2FA prompt once per session (after the daily restart). The recommended tooling for this is IBC + `ib-gateway-docker` (see Cloud Deployment section below).
-
-**IBC** (Interactive Brokers Controller) is a separate open-source tool that automates Gateway's login form — it fills in your username and password automatically so you don't have to type them. However, it cannot tap your phone for you. It can re-present the 2FA prompt repeatedly until you approve it.
+**IBC** (Interactive Brokers Controller) is the open-source tool inside the image that fills in the login form and handles the daily restart. It cannot tap your phone for you. IBC was retired upstream on 2026-09-01; the image (pinned at `10.50.1f`) still ships its last version, IBC 3.24.2, and the image maintainer has not picked a replacement yet (gnzsnz/ib-gateway-docker#366). If auto-login ever breaks, see DEPLOYMENT.md §9.
 
 ---
 
-## Cloud Deployment (Future Reference)
+## Docker Gateway (development and production)
 
-When moving to a cloud environment, the recommended approach is the community `ib-gateway-docker` image, which bundles:
+The community `ib-gateway-docker` image (`ghcr.io/gnzsnz/ib-gateway`, amd64 and arm64) bundles:
 
 - IB Gateway (the application itself)
 - IBC (automated login form filling)
@@ -187,14 +184,17 @@ The production stack runs the container for you: see `docker-compose.prod.yml` a
 
 When this container starts, IBC fills in your credentials automatically. Gateway then sends a 2FA push to your phone — you tap it once, and the session is live. IBC keeps the session alive and handles the daily restart.
 
-For the local setup described in this document, none of this Docker complexity is needed. Keep it simple locally, introduce the container when you actually deploy.
+For development, `docker-compose.yml` has the same service under the `ibkr` profile, published on `127.0.0.1:4002` so a backend on the host connects exactly as it would to the native app.
 
 ---
 
 ## Troubleshooting
 
 **Connection refused on port 4002**
-Gateway isn't running, or hasn't finished starting up. Wait a few seconds after login and try again.
+Gateway isn't running, hasn't finished starting up, or is waiting for you to approve the login in IBKR Mobile. `docker compose logs ib-gateway` shows where the login is.
+
+**"Port 4002 is already allocated" when starting the Docker Gateway**
+The native Gateway app is still running. Quit it.
 
 **Connected but immediately disconnected**
 Usually a `clientId` conflict — another process is already connected with the same ID. Check for lingering Python processes and use a different `clientId`.

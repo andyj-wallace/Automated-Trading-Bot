@@ -1,4 +1,4 @@
-from datetime import time
+from datetime import datetime, time
 from decimal import Decimal
 from functools import lru_cache
 
@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     ibkr_username: str = ""
     ibkr_password: str = ""
     ibkr_trading_mode: str = "paper"
+    # The Docker Gateway's daily restart (ET); Sunday's restart asks for the weekly IBKR Mobile approval.
+    ib_auto_restart_time: time = time(19, 0)
 
     # Broker selection
     broker: str = "mock"  # "mock" | "ibkr"
@@ -88,6 +90,17 @@ class Settings(BaseSettings):
     def _cap_portfolio_risk(cls, value: Decimal) -> Decimal:
         if value <= 0 or value > Decimal("0.10"):
             raise ValueError("max_portfolio_risk_pct must be > 0 and <= 0.10")
+        return value
+
+    @field_validator("ib_auto_restart_time", mode="before")
+    @classmethod
+    def _parse_gateway_time(cls, value):
+        """Accept the Gateway's own "07:00 PM" format as well as "19:00"."""
+        if isinstance(value, str):
+            try:
+                return datetime.strptime(value.strip(), "%I:%M %p").time()
+            except ValueError:
+                pass
         return value
 
     @property

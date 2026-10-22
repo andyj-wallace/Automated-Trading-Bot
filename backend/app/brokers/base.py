@@ -86,6 +86,16 @@ class PriceBar(BaseModel):
     bar_size: str = "1 day"
 
 
+class BrokerConnectionInfo(BaseModel):
+    """Broker connection state for operators: what is wrong and what to do about it."""
+
+    state: Literal["connected", "reconnecting", "down", "account_mismatch"]
+    down_since: datetime | None = None
+    last_connected_at: datetime | None = None
+    last_error: str | None = None
+    hint: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Abstract broker interface
 # ---------------------------------------------------------------------------
@@ -113,6 +123,10 @@ class BaseBroker(ABC):
     @abstractmethod
     def is_connected(self) -> bool:
         """Return True if currently connected."""
+
+    def connection_info(self) -> BrokerConnectionInfo:
+        """Connection state for operators; brokers with richer state override this."""
+        return BrokerConnectionInfo(state="connected" if self.is_connected() else "down")
 
     @abstractmethod
     async def get_account_summary(self) -> AccountSummary:

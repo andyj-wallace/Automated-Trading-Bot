@@ -104,3 +104,35 @@ async def test_order_manager_rejects_second_trade_for_same_symbol(session_factor
         await s.commit()
         assert await repo.has_active_trade("AAPL")
     await broker.disconnect()
+
+
+async def test_order_manager_never_trades_on_margin(session_factory):
+    broker = MockBroker()
+    await broker.connect()
+    manager = OrderManager(
+        broker=broker,
+        risk_manager=RiskManager(),
+        session_factory=session_factory,
+        order_retry_attempts=1,
+        order_retry_backoff_seconds=0,
+    )
+
+    def request(symbol: str, quantity: str) -> TradeRequest:
+        # $3 stop: each 300-share trade risks $900 (under 1%) but is worth $60,000.
+        return TradeRequest(
+            trade_id=uuid.uuid4(),
+            symbol=symbol,
+            direction="BUY",
+            quantity=Decimal(quantity),
+            entry_price=Decimal("200"),
+            stop_loss_price=Decimal("197"),
+            account_balance=Decimal("100000"),
+        )
+
+    await broker.simulate_price_tick("AAPL", Decimal("200"))  # mock fills at the last simulated price
+    await manager.submit_order(request("AAPL", "300"))
+    with pytest.raises(RiskRejectionError) as exc:
+        await manager.submit_order(request("MSFT", "300"))  # $120,000 total on a $100,000 account
+    assert exc.value.reason.startswith("NOTIONAL_LIMIT_EXCEEDED")
+    await manager.submit_order(request("MSFT", "200"))  # $100,000 total: allowed
+    await broker.disconnect()

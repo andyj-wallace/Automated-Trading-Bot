@@ -282,3 +282,9 @@ async def test_stop_order_rests_working():
     res = await b.place_order(_make_order(order_type="STP", stop_price=Decimal("95"), order_ref="s"))
     assert res.status == "WORKING"
     assert b.positions == {}
+
+
+async def test_connection_info_default_follows_is_connected(broker: MockBroker) -> None:
+    assert broker.connection_info().state == "down"
+    await broker.connect()
+    assert broker.connection_info().state == "connected"

@@ -109,7 +109,8 @@ REDIS_URL=redis://localhost:6379/0
 
 # --- IBKR / IB Gateway ----------------------------------------------------
 
-# IB Gateway host. Always localhost for local development.
+# IB Gateway host as seen by the backend: 127.0.0.1 for a backend on the host
+# (Docker Gateway or native app); ib-gateway for a backend inside docker-compose.yml.
 IBKR_HOST=127.0.0.1
 
 # IB Gateway API port. Native Gateway: 4002 paper / 4001 live.
@@ -120,12 +121,15 @@ IBKR_PORT=4002
 # Must be unique per simultaneous connection. Use 1 for the main app.
 IBKR_CLIENT_ID=1
 
-# Paper trading credentials — used by the ib-gateway-docker image for
-# automated login (cloud deployment). Not read by the FastAPI app directly;
+# Paper trading credentials — the Docker Gateway (docker compose --profile ibkr)
+# uses them to log in by itself. Not read by the FastAPI app directly;
 # the app connects to an already-authenticated Gateway via socket.
-# Still useful to have defined for the Docker setup later.
 IBKR_USERNAME=
 IBKR_PASSWORD=
+
+# Daily Docker Gateway restart (ET); Sunday's restart asks for the weekly
+# IBKR Mobile approval, so pick a time you're awake.
+IB_AUTO_RESTART_TIME="07:00 PM"
 
 # Trading mode. Must be 'paper' in development — the application enforces
 # this via a hard guard in IBKRClient.connect().
@@ -138,10 +142,10 @@ IBKR_TRADING_MODE=paper
 # Format: smtp://user:password@host:port
 NOTIFICATION_EMAIL_SMTP=
 
-# --- VNC (cloud deployment only, not needed locally) ----------------------
+# --- VNC (Docker Gateway screen) -------------------------------------------
 
-# Password for VNC access to the ib-gateway-docker container.
-# Leave empty for local development.
+# Password for the Docker Gateway's VNC screen (last-resort manual login).
+# Leave empty to keep VNC off.
 VNC_PASSWORD=
 ```
 
@@ -189,7 +193,7 @@ Redis connection string. Database index `/0` is used for all application data. F
 ### IBKR / IB Gateway
 
 **`IBKR_HOST`**
-The host where IB Gateway is listening. Always `127.0.0.1` for local development. In a Docker deployment, this would be the Gateway container's hostname on the internal network.
+The host where IB Gateway is listening, as seen by the backend: `127.0.0.1` for a backend on the host (Docker Gateway via `docker compose --profile ibkr`, or the native app), `ib-gateway` for a backend inside a compose stack, `host.docker.internal` for a backend in Docker talking to the native app.
 - Required: yes
 - Local default: `127.0.0.1`
 
@@ -204,9 +208,14 @@ An integer identifying this application's connection to Gateway. Must be unique 
 - Local default: `1`
 
 **`IBKR_USERNAME` / `IBKR_PASSWORD`**
-Your IBKR paper trading username and password. These are **not read by the FastAPI application directly** — the app connects to an already-authenticated Gateway via socket and never sees your credentials. These variables exist for the `ib-gateway-docker` automated login setup used in cloud deployment. Define them now so the Docker config is ready when you need it.
-- Required for cloud deployment; optional locally
+Your IBKR paper trading username and password. These are **not read by the FastAPI application directly** — the app connects to an already-authenticated Gateway via socket and never sees your credentials. The Docker Gateway (`docker compose --profile ibkr`, and `docker-compose.prod.yml` via `.env.prod`) uses them to log in by itself.
+- Required for the Docker Gateway; not needed with the native app
 - Security note: plaintext in `.env` is a pragmatic tradeoff for local development. Treat this file like a password — don't share it, don't paste it in chat, don't leave it on shared machines.
+
+**`IB_AUTO_RESTART_TIME`**
+Daily restart time (ET) of the Docker Gateway. Sunday's restart asks for the weekly IBKR Mobile approval, so pick a time you're awake; keep it after 16:45 ET and before 23:00 ET (IBKR's nightly reset). The backend reads the same value to tell "daily restart" and "weekly approval" outages apart. Accepts `"07:00 PM"` or `"19:00"`.
+- Required: no
+- Default: `07:00 PM`
 
 **`IBKR_TRADING_MODE`**
 Controls paper vs live mode. The application reads this and enforces that `development` + `live` cannot be set simultaneously. Must default to `paper` — never change this to `live` during development.

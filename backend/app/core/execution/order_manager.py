@@ -172,6 +172,25 @@ class OrderManager:
                 raise RiskRejectionError(reason=reason, request=request)
             current_aggregate_risk = sum((t.risk_amount for t in active_trades), Decimal("0"))
             validation = self._risk_manager.validate(request, current_aggregate_risk)
+            position_value = request.quantity * request.entry_price + sum(
+                (
+                    (t.filled_quantity or t.quantity) * (t.entry_fill_price or t.entry_price)
+                    for t in active_trades
+                ),
+                Decimal("0"),
+            )
+            if position_value > request.account_balance:
+                reason = (
+                    f"NOTIONAL_LIMIT_EXCEEDED: open positions plus this trade would be worth "
+                    f"{position_value}, more than the account ({request.account_balance}); "
+                    "the bot never trades on margin"
+                )
+                risk_logger.warning(
+                    "OrderManager: trade rejected, total position value above account value",
+                    extra={"trade_id": str(request.trade_id), "symbol": symbol,
+                           "position_value": str(position_value)},
+                )
+                raise RiskRejectionError(reason=reason, request=request)
 
             if self._session_factory:
                 await self._create_pending(request, validation)
@@ -204,6 +223,14 @@ class OrderManager:
         order_result, broker_error = await self._place_order_with_retry(
             broker_request, context="entry order"
         )
+        state_unknown = False
+        if order_result is None:
+            try:
+                order_result = await self._find_existing_order(broker_request)
+            except Exception:
+                state_unknown = True
+            if order_result is not None:
+                broker_error = None
         if order_result is None:
             order_result = OrderResult(
                 trade_id=request.trade_id,
@@ -253,6 +280,17 @@ class OrderManager:
                     self._cache,
                     "ORDER_STUCK_WORKING",
                     f"Entry order for {request.symbol} is still working at the broker",
+                    trade_id=str(request.trade_id),
+                    symbol=request.symbol,
+                    order_ref=broker_request.order_ref,
+                )
+            elif state_unknown:
+                # The order may be live at the broker: stay SUBMITTED so the reconciler adopts or cancels it.
+                await publish_system_alert(
+                    self._cache,
+                    "ORDER_STATE_UNKNOWN",
+                    f"Entry order for {request.symbol} failed and the broker could not say whether "
+                    "it arrived; the reconciler will resolve it",
                     trade_id=str(request.trade_id),
                     symbol=request.symbol,
                     order_ref=broker_request.order_ref,
@@ -342,7 +380,18 @@ class OrderManager:
                 return result, None
             except Exception as exc:
                 last_exc = exc
-                existing = await self._find_existing_order(broker_request)
+                try:
+                    existing = await self._find_existing_order(broker_request)
+                except Exception as lookup_exc:
+                    trading_logger.warning(
+                        f"OrderManager: {context} failed and the broker lookup failed too; not resubmitting",
+                        extra={
+                            "trade_id": str(broker_request.trade_id),
+                            "error": str(exc),
+                            "lookup_error": str(lookup_exc),
+                        },
+                    )
+                    return None, exc
                 if existing is not None:
                     return existing, None
                 if attempt < self._order_retry_attempts:
@@ -361,17 +410,10 @@ class OrderManager:
         return None, last_exc
 
     async def _find_existing_order(self, broker_request: OrderRequest) -> OrderResult | None:
-        """After a failed place_order, return the broker's record of that order_ref if any."""
+        """The broker's record of this order_ref, None if it has none; raises if the lookup fails."""
         if not broker_request.order_ref:
             return None
-        try:
-            return await self._broker.find_order_by_ref(broker_request.order_ref)
-        except Exception as exc:
-            trading_logger.warning(
-                "OrderManager: find_order_by_ref failed",
-                extra={"trade_id": str(broker_request.trade_id), "error": str(exc)},
-            )
-            return None
+        return await self._broker.find_order_by_ref(broker_request.order_ref)
 
     async def close_position(
         self,
@@ -465,6 +507,28 @@ class OrderManager:
                 trade_id, exit_reason, sold_summary, sold_summary.avg_fill_price
             )
             return CloseOutcome.CLOSED if done else CloseOutcome.FAILED
+
+        try:
+            held = sum(
+                (p.quantity for p in await self._broker.get_positions() if p.symbol.upper() == symbol.upper()),
+                Decimal("0"),
+            )
+        except Exception as exc:
+            return await fail(
+                "CLOSE_FAILED",
+                f"Could not read the broker position for {symbol}; exit not sent",
+                error=str(exc),
+            )
+        if trade.direction != TradeDirection.BUY:
+            held = -held
+        if held <= 0:
+            # IBKR reports today's fills only, so a stop that filled on an earlier day looks unfilled
+            # here; selling would open a short. The reconciler books the exit from the broker instead.
+            return await fail(
+                "CLOSE_FAILED",
+                f"Broker holds no {symbol}; nothing sold. The reconciler will book the exit.",
+            )
+        remaining = min(remaining, held)
 
         close_request = OrderRequest(
             trade_id=trade_id,

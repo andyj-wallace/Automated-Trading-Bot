@@ -72,9 +72,14 @@ async def system_health(
     """
     request_start = time.monotonic()
 
-    # Broker — synchronous; no I/O required
+    # Broker — synchronous; no I/O required. info/detail tell the operator what to do when it's down.
     broker_connected = broker.is_connected()
-    broker_status = ComponentStatus(status="ok" if broker_connected else "disconnected")
+    connection = broker.connection_info()
+    broker_status = ComponentStatus(
+        status="ok" if broker_connected else "disconnected",
+        detail=None if broker_connected else connection.hint,
+        info=connection.model_dump(mode="json"),
+    )
     system_logger.debug(
         "Health check: broker",
         extra={"status": broker_status.status, "broker_type": type(broker).__name__},

@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.v1 import signals, symbols, trades, trading
+from app.brokers.base import BrokerConnectionInfo
 from app.core.execution.order_manager import CloseOutcome
 from app.core.risk.manager import RiskRejectionError
 from app.core.trading_state import TradingState
@@ -62,6 +63,7 @@ def env(monkeypatch):
         circuit_breaker=SimpleNamespace(is_halted=lambda: False),
         broker=SimpleNamespace(
             is_connected=lambda: True,
+            connection_info=lambda: BrokerConnectionInfo(state="connected"),
             get_account_summary=AsyncMock(
                 return_value=SimpleNamespace(net_liquidation=Decimal("100000"))
             ),
@@ -103,7 +105,24 @@ def test_status_shape(env):
         "broker_connected": True, "engine_lock_held": True,
         "scheduler_last_cycle_at": NOW.isoformat(), "open_trade_count": 1,
         "circuit_breaker_halted": False,
+        "broker": {
+            "state": "connected", "down_since": None, "last_connected_at": None,
+            "last_error": None, "hint": None,
+        },
     }
+
+
+def test_status_reports_broker_outage_and_hint(env):
+    env.monkeypatch.setattr(trading.TradeRepo, "get_open_trades", AsyncMock(return_value=[]))
+    env.engine.broker.is_connected = lambda: False
+    env.engine.broker.connection_info = lambda: BrokerConnectionInfo(
+        state="down", down_since=NOW, last_error="Connect call failed", hint="Check IBKR Mobile"
+    )
+    data = env.client.get("/api/v1/trading/status").json()["data"]
+    assert data["broker_connected"] is False
+    assert data["broker"]["state"] == "down"
+    assert data["broker"]["down_since"].startswith("2026-10-19T15:00:00")
+    assert data["broker"]["hint"] == "Check IBKR Mobile"
 
 
 def test_pause_and_resume_endpoints(env):

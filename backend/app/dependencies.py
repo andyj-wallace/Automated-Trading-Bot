@@ -51,8 +51,8 @@ def _build_broker() -> BaseBroker:
     """
     Build and cache the broker instance for the lifetime of the process.
 
-    Returns MockBroker when ENVIRONMENT=development (no live connection needed).
-    Returns IBKRClient for all other environments (requires IB Gateway running).
+    BROKER=mock returns MockBroker (no Gateway needed); any other value returns
+    IBKRClient, which needs a reachable IB Gateway.
     """
     settings = get_settings()
 

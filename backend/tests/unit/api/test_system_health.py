@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from app.brokers.base import BaseBroker
+from app.brokers.base import BaseBroker, BrokerConnectionInfo
 from app.data.cache import RedisCache
 from app.dependencies import get_broker, get_cache, get_db
 from app.main import app
@@ -32,6 +32,11 @@ def _engine(leader=True, started=True):
 def client():
     broker = MagicMock(spec=BaseBroker)
     broker.is_connected.return_value = False
+    broker.connection_info.side_effect = lambda: (
+        BrokerConnectionInfo(state="connected")
+        if broker.is_connected()
+        else BrokerConnectionInfo(state="down", hint="Check IBKR Mobile")
+    )
     cache = MagicMock(spec=RedisCache)
     cache.ping = AsyncMock(return_value=True)
     app.dependency_overrides[get_broker] = lambda: broker
@@ -71,6 +76,23 @@ def test_engine_without_lock_is_error(client):
     app.state.engine = _engine(leader=False)
     resp = c.get("/api/v1/system/health")
     assert resp.status_code == 503 and resp.json()["data"]["engine"]["status"] == "error"
+
+
+def test_broker_down_reports_hint_and_state(client):
+    c, _ = client
+    app.state.engine = _engine()
+    broker = c.get("/api/v1/system/health").json()["data"]["broker"]
+    assert broker["status"] == "disconnected"
+    assert broker["detail"] == "Check IBKR Mobile"
+    assert broker["info"]["state"] == "down"
+
+
+def test_broker_connected_has_no_detail(client):
+    c, broker = client
+    broker.is_connected.return_value = True
+    app.state.engine = _engine()
+    data = c.get("/api/v1/system/health").json()["data"]["broker"]
+    assert data["status"] == "ok" and data["detail"] is None and data["info"]["state"] == "connected"
 
 
 def test_liveness_is_200_with_broker_disconnected(client):

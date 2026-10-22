@@ -4,7 +4,7 @@ IBKRClient — wraps ib_async to implement BaseBroker for Interactive Brokers.
 Connects via TCP socket to a locally running IB Gateway process. The Gateway
 holds the authenticated IBKR session; this client never handles credentials.
 
-See .claude/specs/ibkr-gateway.md for setup and daily startup procedure.
+See .claude/specs/ibkr-gateway.md and DEPLOYMENT.md for running the Gateway (Docker, auto-login).
 """
 
 import asyncio
@@ -20,6 +20,7 @@ from ib_async import IB, LimitOrder, MarketOrder, Stock, StopOrder
 from app.brokers.base import (
     AccountSummary,
     BaseBroker,
+    BrokerConnectionInfo,
     OrderRequest,
     OrderResult,
     Position,
@@ -28,7 +29,9 @@ from app.brokers.base import (
     PriceUpdate,
 )
 from app.brokers.ibkr import mapper
+from app.brokers.ibkr.hints import login_hint
 from app.config import Settings
+from app.core import market_calendar
 from app.core.events import publish_system_alert
 from app.core.tasks import spawn
 from app.monitoring.logger import system_logger
@@ -79,8 +82,10 @@ class IBKRClient(BaseBroker):
         backoff_seconds: tuple[float, ...] = _DEFAULT_BACKOFF,
         alert_after_seconds: float = 300,
         check_seconds: float = 5,
+        clock: Callable[[], datetime] = market_calendar.now_et,
     ) -> None:
         self._settings = settings
+        self._clock = clock
         self._cache = cache
         self._backoff = backoff_seconds
         self._alert_after = alert_after_seconds
@@ -95,6 +100,11 @@ class IBKRClient(BaseBroker):
         self._stopping = False
         self._supervisor_task: asyncio.Task | None = None
         self._reconnect_listeners: list[Callable[[], Awaitable[None]]] = []
+        # Operator-facing connection state (see connection_info)
+        self._down_since: datetime | None = None
+        self._last_connected_at: datetime | None = None
+        self._last_error: str | None = None
+        self._account_mismatch = False
         self._ib.disconnectedEvent += self._on_disconnected
         self._ib.errorEvent += self._on_error
 
@@ -116,6 +126,7 @@ class IBKRClient(BaseBroker):
         except LiveTradingGuardError:
             raise
         except Exception as exc:
+            self._mark_down(exc)
             system_logger.warning(
                 "IBKRClient: initial connect failed, supervisor will keep retrying",
                 extra={"error": str(exc), "exception_type": type(exc).__name__},
@@ -136,6 +147,9 @@ class IBKRClient(BaseBroker):
         self._ib.reqMarketDataType(self._settings.ibkr_market_data_type)
         for contract in self._subscribed_contracts.values():
             self._ib.reqMktData(contract)
+        self._last_connected_at = self._now()
+        self._down_since = None
+        self._last_error = None
         system_logger.info(
             "IBKRClient connected",
             extra={
@@ -154,6 +168,7 @@ class IBKRClient(BaseBroker):
         accounts = list(self._ib.managedAccounts() or [])
         bad = [a for a in accounts if not str(a).startswith("D")]
         if bad:
+            self._account_mismatch = True
             self._ib.disconnect()
             raise LiveTradingGuardError(
                 "IBKR_TRADING_MODE=paper but the Gateway is logged into a non-paper account "
@@ -163,6 +178,37 @@ class IBKRClient(BaseBroker):
     def add_reconnect_listener(self, fn: Callable[[], Awaitable[None]]) -> None:
         """Register a coroutine function awaited after every successful reconnect."""
         self._reconnect_listeners.append(fn)
+
+    def _now(self) -> datetime:
+        return self._clock().astimezone(UTC)
+
+    def _mark_down(self, exc: BaseException | None = None) -> None:
+        if self._down_since is None:
+            self._down_since = self._now()
+        if exc is not None:
+            self._last_error = str(exc) or type(exc).__name__
+
+    def _hint(self) -> str:
+        return login_hint(self._clock(), self._settings.ib_auto_restart_time)
+
+    def connection_info(self) -> BrokerConnectionInfo:
+        """Connection state plus the most likely fix, for the dashboard and health check."""
+        if self._ib.isConnected():
+            return BrokerConnectionInfo(state="connected", last_connected_at=self._last_connected_at)
+        if self._account_mismatch:
+            state = "account_mismatch"
+            hint = "The Gateway is logged into a non-paper account; log it into the paper account."
+        else:
+            down_for = (self._now() - self._down_since).total_seconds() if self._down_since else 0
+            state = "down" if down_for >= self._alert_after else "reconnecting"
+            hint = self._hint()
+        return BrokerConnectionInfo(
+            state=state,
+            down_since=self._down_since,
+            last_connected_at=self._last_connected_at,
+            last_error=self._last_error,
+            hint=hint,
+        )
 
     async def _supervise(self) -> None:
         loop = asyncio.get_running_loop()
@@ -182,6 +228,7 @@ class IBKRClient(BaseBroker):
                 await asyncio.sleep(self._check_seconds)
                 continue
             down_since = down_since or loop.time()
+            self._mark_down()
             await asyncio.sleep(self._backoff[min(attempt, len(self._backoff) - 1)])
             if self._stopping:
                 return
@@ -193,18 +240,21 @@ class IBKRClient(BaseBroker):
                 self._stopping = True
                 return
             except Exception as exc:
+                self._mark_down(exc)
                 system_logger.warning(
                     "IBKRClient: reconnect attempt failed",
                     extra={"attempt": attempt, "error": str(exc)},
                 )
                 if not alerted and loop.time() - down_since >= self._alert_after:
+                    hint = self._hint()
+                    minutes = max(1, int((loop.time() - down_since) // 60))
                     await publish_system_alert(
                         self._cache,
                         "BROKER_DISCONNECTED",
-                        f"IB Gateway unreachable for {int(loop.time() - down_since)}s; "
-                        "still retrying",
+                        f"IB Gateway down {minutes} min. {hint}",
                         host=self._settings.ibkr_host,
                         port=self._settings.ibkr_port,
+                        hint=hint,
                     )
                     alerted = True
                 continue

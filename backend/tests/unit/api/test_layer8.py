@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from app.brokers.base import BaseBroker
+from app.brokers.base import BaseBroker, BrokerConnectionInfo
 from app.data.cache import RedisCache
 from app.dependencies import get_broker, get_cache, get_db
 from app.main import app
@@ -88,6 +88,9 @@ def mock_dependencies():
     """Replace all I/O dependencies with mocks for every test in this module."""
     mock_broker = MagicMock(spec=BaseBroker)
     mock_broker.is_connected.return_value = False
+    mock_broker.connection_info.side_effect = lambda: BrokerConnectionInfo(
+        state="connected" if mock_broker.is_connected() else "down"
+    )
     mock_broker.validate_ticker = AsyncMock(return_value=True)
     mock_broker.get_positions = AsyncMock(return_value=[])
     mock_broker.get_account_summary = AsyncMock(

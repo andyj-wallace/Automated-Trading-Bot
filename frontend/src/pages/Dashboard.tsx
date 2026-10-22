@@ -1,12 +1,14 @@
 /**
  * Dashboard.
  *
- * Top: trading controls. Then risk gauge + circuit breaker, active trades +
+ * Top: broker-connection banner (only when the Gateway is down) and trading
+ * controls. Then risk gauge + circuit breaker, active trades +
  * watchlist, alerts feed, system health. All live data comes from the live
  * store; the single WebSocket is mounted in Layout.
  */
 
 import { AlertsFeed } from "../components/alerts/AlertsFeed";
+import { BrokerConnectionBanner } from "../components/controls/BrokerConnectionBanner";
 import { TradingControlsPanel } from "../components/controls/TradingControlsPanel";
 import { ActiveTradesTable } from "../components/dashboard/ActiveTradesTable";
 import { RiskGauge } from "../components/dashboard/RiskGauge";
@@ -29,6 +31,8 @@ export function Dashboard() {
         </div>
         <WsIndicator readyState={socketState} />
       </div>
+
+      <BrokerConnectionBanner />
 
       <TradingControlsPanel />
 

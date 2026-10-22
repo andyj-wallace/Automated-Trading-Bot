@@ -14,7 +14,9 @@ ET = ZoneInfo("America/New_York")
 
 @lru_cache(maxsize=2)
 def _calendar(year: int):
-    return xcals.get_calendar("XNYS")
+    # Without an explicit end, exchange_calendars returns one cached calendar that ends a year
+    # after it was built, so a process running longer than that would fail every market check.
+    return xcals.get_calendar("XNYS", end=f"{year + 1}-12-31")
 
 
 def _cal():

@@ -172,6 +172,14 @@ export interface RiskStatus {
   critical_threshold_pct: string;
 }
 
+export interface BrokerConnection {
+  state: "connected" | "reconnecting" | "down" | "account_mismatch";
+  down_since: string | null;
+  last_connected_at: string | null;
+  last_error: string | null;
+  hint: string | null;
+}
+
 export interface TradingStatus {
   paused: boolean;
   market_open: boolean;
@@ -181,6 +189,7 @@ export interface TradingStatus {
   scheduler_last_cycle_at: string | null;
   open_trade_count: number;
   circuit_breaker_halted: boolean;
+  broker: BrokerConnection;
 }
 
 export interface FlattenResult {

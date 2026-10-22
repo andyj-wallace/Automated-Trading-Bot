@@ -434,3 +434,58 @@ async def test_unmanaged_position_alerts_once_and_is_never_closed(broker, sessio
     assert len(cache.alerts("UNMANAGED_POSITION")) == 1
     assert cache.alerts("UNMANAGED_POSITION")[0]["symbol"] == "MSFT"
     assert broker.placed_orders == []
+
+
+# ---------------------------------------------------------------------------
+# Close and entry paths when the broker's answer is incomplete
+# ---------------------------------------------------------------------------
+
+
+async def test_close_never_sells_shares_the_broker_does_not_hold(broker, session_factory, cache):
+    # e.g. the stop filled on an earlier day: IBKR reports today's fills only, so it looks unfilled.
+    manager = _manager(broker, session_factory, cache, protective_stops=False)
+    req = _request()
+    await manager.submit_order(req)
+    broker.set_position("AAPL", Decimal("0"))
+
+    assert await manager.close_position(req.trade_id, "STOP_LOSS") == CloseOutcome.FAILED
+
+    assert not [o for o in broker.placed_orders if o.order_ref.endswith(":exit")]
+    assert (await _get(session_factory, req.trade_id)).status == TradeStatus.CLOSING
+    assert "nothing sold" in cache.alerts("CLOSE_FAILED")[0]["message"]
+
+
+async def test_close_sells_only_what_the_broker_holds(broker, session_factory, cache):
+    manager = _manager(broker, session_factory, cache, protective_stops=False)
+    req = _request()
+    await manager.submit_order(req)
+    broker.set_position("AAPL", Decimal("4"))
+
+    assert await manager.close_position(req.trade_id, "MANUAL") == CloseOutcome.CLOSED
+
+    exits = [o for o in broker.placed_orders if o.order_ref.endswith(":exit")]
+    assert [o.quantity for o in exits] == [Decimal("4")]
+
+
+async def test_entry_with_unknown_broker_state_stays_submitted_until_reconciled(
+    broker, session_factory, cache, clock
+):
+    manager = _manager(broker, session_factory, cache, protective_stops=False)
+
+    async def lookup_down(order_ref):
+        raise ConnectionError("gateway gone")
+
+    broker.raise_after_next_order = True  # the order reaches the broker, then the call raises
+    broker.find_order_by_ref = lookup_down  # and asking "did it arrive?" fails too
+    req = _request()
+    with pytest.raises(ConnectionError):
+        await manager.submit_order(req)
+
+    assert (await _get(session_factory, req.trade_id)).status == TradeStatus.SUBMITTED
+    assert len(broker.placed_orders) == 1
+    assert cache.alerts("ORDER_STATE_UNKNOWN")
+
+    del broker.find_order_by_ref  # the broker answers again
+    clock.state["offset"] = timedelta(minutes=2)
+    await _reconciler(broker, session_factory, manager, cache, clock).run_once()
+    assert (await _get(session_factory, req.trade_id)).status == TradeStatus.OPEN

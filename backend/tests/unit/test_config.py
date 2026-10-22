@@ -17,6 +17,7 @@ def _base_env(monkeypatch):
         "CORS_ORIGINS",
         "ENGINE_ENABLED",
         "LOG_DIR",
+        "IB_AUTO_RESTART_TIME",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -35,6 +36,7 @@ def test_defaults_load():
     assert s.strategy_eval_end_et == time(15, 45)
     assert s.cors_origins == ["http://localhost:5173"]
     assert s.broker_protective_stops is True
+    assert s.ib_auto_restart_time == time(19, 0)
 
 
 def test_portfolio_risk_above_cap_rejected(monkeypatch):
@@ -57,3 +59,15 @@ def test_time_parses(monkeypatch):
 def test_cors_origins_json(monkeypatch):
     monkeypatch.setenv("CORS_ORIGINS", '["https://a"]')
     assert _settings().cors_origins == ["https://a"]
+
+
+@pytest.mark.parametrize("value", ["07:00 PM", "19:00"])
+def test_gateway_restart_time_accepts_both_formats(monkeypatch, value):
+    monkeypatch.setenv("IB_AUTO_RESTART_TIME", value)
+    assert _settings().ib_auto_restart_time == time(19, 0)
+
+
+def test_gateway_restart_time_rejects_garbage(monkeypatch):
+    monkeypatch.setenv("IB_AUTO_RESTART_TIME", "7pm")
+    with pytest.raises(ValidationError):
+        _settings()

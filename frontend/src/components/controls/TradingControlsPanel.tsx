@@ -1,8 +1,9 @@
 /** Trading controls: status chip, pause/resume, and flatten-all (typed confirmation). */
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { api } from "../../api/client";
+import { useTradingStatus } from "../../hooks/useTradingStatus";
 import type { FlattenResult, TradingStatus } from "../../types/api";
 import { ConfirmDialog } from "../common/ConfirmDialog";
 
@@ -19,11 +20,7 @@ export function TradingControlsPanel() {
   const [flattenOpen, setFlattenOpen] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
-  const { data: status } = useQuery({
-    queryKey: ["trading-status"],
-    queryFn: async () => (await api.get<TradingStatus>("/trading/status")).data,
-    refetchInterval: 15_000,
-  });
+  const { data: status } = useTradingStatus();
 
   const refresh = () => {
     queryClient.invalidateQueries({ queryKey: ["trading-status"] });

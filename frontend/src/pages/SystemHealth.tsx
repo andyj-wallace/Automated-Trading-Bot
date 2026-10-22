@@ -10,6 +10,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { AlertsFeed } from "../components/alerts/AlertsFeed";
+import { BrokerConnectionBanner } from "../components/controls/BrokerConnectionBanner";
 import { CircuitBreakerPanel } from "../components/risk/CircuitBreakerPanel";
 import { SystemHealthPanel } from "../components/dashboard/SystemHealthPanel";
 import { api } from "../api/client";
@@ -46,6 +47,8 @@ export function SystemHealth() {
           Broker · database · Redis · performance metrics
         </p>
       </div>
+
+      <BrokerConnectionBanner />
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <SystemHealthPanel />
