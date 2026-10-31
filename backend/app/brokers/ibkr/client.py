@@ -4,14 +4,14 @@ IBKRClient — wraps ib_async to implement BaseBroker for Interactive Brokers.
 Connects via TCP socket to a locally running IB Gateway process. The Gateway
 holds the authenticated IBKR session; this client never handles credentials.
 
-See .claude/specs/ibkr-gateway.md and DEPLOYMENT.md for running the Gateway (Docker, auto-login).
+See DEPLOYMENT.md for running the Gateway (Docker, auto-login).
 """
 
 import asyncio
 import math
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 # whatever status we have.  Market orders on paper typically fill in <1s;
 # this guard prevents an infinite wait on edge cases.
 _CANCEL_WAIT_SECONDS = 10
+_COMMISSION_WAIT_SECONDS = 2
 _STOP_ACK_SECONDS = 10
 
 # Re-emit an unchanged price after this many seconds so the Redis price key stays fresh.
@@ -443,6 +444,12 @@ class IBKRClient(BaseBroker):
                 deadline = loop.time() + _CANCEL_WAIT_SECONDS
                 while not trade.isDone() and loop.time() < deadline:
                     await asyncio.sleep(0.1)
+            # Commission reports arrive just after the execution.
+            deadline = loop.time() + _COMMISSION_WAIT_SECONDS
+            while trade.fills and loop.time() < deadline and any(
+                not f.commissionReport.commission for f in trade.fills
+            ):
+                await asyncio.sleep(0.1)
 
         return mapper.map_order_result(order.trade_id, trade)
 
@@ -488,6 +495,22 @@ class IBKRClient(BaseBroker):
             useRTH=True,          # regular trading hours only
         )
         return [mapper.map_price_bar(bar, bar_size) for bar in bars]
+
+    async def get_intraday_bars(self, symbol: str) -> list[PriceBar]:
+        """Today's completed 5-minute regular-hours bars; the still-forming bar is dropped."""
+        self._require_connected()
+        bars = await self._ib.reqHistoricalDataAsync(
+            Stock(symbol, "SMART", "USD"),
+            endDateTime="",
+            durationStr="1 D",
+            barSizeSetting="5 mins",
+            whatToShow="TRADES",
+            useRTH=True,
+            formatDate=2,  # UTC datetimes; the default is exchange-local time that would be mislabelled as UTC
+        )
+        now = datetime.now(UTC)
+        mapped = [mapper.map_price_bar(bar, "5 mins") for bar in bars]
+        return [b for b in mapped if b.timestamp + timedelta(minutes=5) <= now]
 
     async def validate_ticker(self, symbol: str) -> bool:
         """
@@ -541,7 +564,7 @@ class IBKRClient(BaseBroker):
         Raise if development environment is combined with live trading mode.
 
         This is a hard guard against accidentally placing real orders during
-        development. See design.md § Security Considerations.
+        development.
         """
         if (
             self._settings.environment == "development"

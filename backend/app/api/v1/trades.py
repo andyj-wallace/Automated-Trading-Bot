@@ -20,6 +20,7 @@ from app.api.v1.schemas import ManualTradeIn, TradeOut, err, ok
 from app.core.engine import TradingEngine
 from app.core.execution.order_manager import CloseOutcome
 from app.core.risk.calculator import RiskCalculator
+from app.core.risk.growth import effective_equity
 from app.core.risk.manager import RiskRejectionError, TradeRequest
 from app.db.models.trade import TradeStatus
 from app.db.repositories.trade_repo import TradeRepo
@@ -124,7 +125,9 @@ async def create_manual_trade(
             status_code=409, content=err("BROKER_DISCONNECTED", "Broker is not connected")
         )
     try:
-        balance = (await engine.broker.get_account_summary()).net_liquidation
+        balance = effective_equity(
+            await engine.broker.get_account_summary(), engine.settings.trading_capital_limit
+        )
     except Exception as exc:
         return JSONResponse(status_code=409, content=err("BROKER_UNAVAILABLE", str(exc)))
 

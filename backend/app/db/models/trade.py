@@ -41,13 +41,12 @@ class ExitReason(str, enum.Enum):
     MANUAL = "MANUAL"
     STALE_TIMEOUT = "STALE_TIMEOUT"
     EXTERNAL = "EXTERNAL"  # closed outside the app, found by the reconciler
+    TIME_EXIT = "TIME_EXIT"  # day trade closed at its exit_deadline
 
 
 class Trade(Base):
     """
     A single trade execution record.
-
-    Columns match design.md § trades.
 
     Audit-sensitive fields (entry_price, stop_loss_price, risk_amount,
     account_balance_at_entry) must never be updated after creation.
@@ -115,6 +114,15 @@ class Trade(Base):
         Numeric(precision=18, scale=8), nullable=True
     )
     filled_quantity: Mapped[Decimal | None] = mapped_column(
+        Numeric(precision=18, scale=8), nullable=True
+    )
+    exit_deadline: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    entry_commission: Mapped[Decimal | None] = mapped_column(
+        Numeric(precision=18, scale=8), nullable=True
+    )
+    exit_commission: Mapped[Decimal | None] = mapped_column(
         Numeric(precision=18, scale=8), nullable=True
     )
     exit_order_id: Mapped[str | None] = mapped_column(String(32), nullable=True)

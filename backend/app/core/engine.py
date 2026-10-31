@@ -16,6 +16,8 @@ from app.core.engine_lock import EngineLock
 from app.core.events import RISK_UPDATES, SYSTEM_ALERTS, TRADE_EVENTS, publish_system_alert
 from app.core.jobs.bar_refresh import BarRefreshJob
 from app.core.jobs.daily_summary import DailySummaryJob
+from app.core.risk.costs import CostModel
+from app.core.risk.growth import GrowthPolicy, effective_equity
 from app.core.tasks import PeriodicTask, spawn, supervised_subscribe
 from app.core.trading_state import TradingState
 from app.monitoring.logger import error_logger, system_logger
@@ -60,10 +62,15 @@ class TradingEngine:
         self.broker = _build_broker()
         self.cache = _build_cache()
         self.circuit_breaker = _build_circuit_breaker()
+        self.cost_model = CostModel.from_settings(settings)
+        self.growth = GrowthPolicy.from_settings(settings)
         self.risk_manager = RiskManager(
             min_reward_to_risk=settings.min_reward_to_risk,
             max_portfolio_risk_pct=settings.max_portfolio_risk_pct,
             circuit_breaker=self.circuit_breaker,
+            cost_model=self.cost_model,
+            max_breakeven_win_rate=settings.max_breakeven_win_rate,
+            growth=self.growth,
         )
         self.order_manager = OrderManager(
             broker=self.broker,
@@ -73,6 +80,9 @@ class TradingEngine:
             circuit_breaker=self.circuit_breaker,
             is_market_open=is_market_open,
             protective_stops=settings.broker_protective_stops,
+            growth=self.growth,
+            account_type=settings.account_type,
+            cost_model=self.cost_model,
         )
         self.feed = MarketDataFeed(self.broker, self.cache, AsyncSessionFactory)
         self.position_monitor = PositionMonitor(
@@ -123,6 +133,10 @@ class TradingEngine:
             eval_end=settings.strategy_eval_end_et,
             price_stale_seconds=settings.price_stale_seconds,
             is_paused=self.trading_state.is_paused,
+            capital_limit=settings.trading_capital_limit,
+            growth=self.growth,
+            max_spread_bps=settings.max_spread_bps,
+            min_avg_dollar_volume=settings.min_avg_dollar_volume,
         )
         self.risk_monitor = RiskMonitor(
             config=RiskMonitorConfig(max_aggregate_risk_pct=settings.max_portfolio_risk_pct),
@@ -136,6 +150,9 @@ class TradingEngine:
             self.dispatcher,
             run_at=settings.daily_summary_time_et,
             clock=clock,
+            cost_model=self.cost_model,
+            growth=self.growth,
+            capital_limit=settings.trading_capital_limit,
         )
         self._daily_summary_task = PeriodicTask("daily_summary", 60, self.daily_summary.tick)
         self._session_factory = AsyncSessionFactory
@@ -152,11 +169,12 @@ class TradingEngine:
         """Create a tracked background task owned by the engine."""
         return spawn(coro, name=name, registry=self._tasks)
 
-    async def _get_balance(self) -> Decimal:
+    async def get_equity(self) -> Decimal:
+        """Net liquidation capped at TRADING_CAPITAL_LIMIT; 0 when the broker is unreachable."""
         if self.broker.is_connected():
             try:
                 summary = await self.broker.get_account_summary()
-                return summary.net_liquidation
+                return effective_equity(summary, self.settings.trading_capital_limit)
             except Exception:
                 pass
         return Decimal("0")
@@ -185,7 +203,7 @@ class TradingEngine:
             closed_today = await repo.closed_since(midnight)
             recents = await repo.recent_pnls_by_strategy(self.settings.max_consecutive_losses)
         realized = sum((t.pnl or Decimal("0") for t in closed_today), Decimal("0"))
-        balance = await self._get_balance()
+        balance = await self.get_equity()
         if balance > 0:
             starting = balance - realized
         else:
@@ -348,7 +366,7 @@ class TradingEngine:
         await self._sync_feed_at_start()
         self._feed_sync.start()
         self._risk_task = self.spawn(
-            self.risk_monitor.run_loop(self._session_factory, self._get_balance),
+            self.risk_monitor.run_loop(self._session_factory, self.get_equity),
             name="risk_monitor",
         )
         self._notifier_task = self.spawn(

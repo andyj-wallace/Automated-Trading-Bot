@@ -38,12 +38,14 @@ Limitations (intentional scope):
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from uuid import UUID, uuid4
 
 from app.brokers.base import PriceBar
+from app.core.risk.costs import CostModel
 from app.core.risk.manager import RiskManager, RiskRejectionError, TradeRequest
 from app.core.strategy_engine.base import BaseStrategy, MarketData, RiskParams
 
@@ -95,6 +97,7 @@ class BacktestMetrics:
     signals_generated: int
     signals_rejected: int        # by RiskManager
     total_commission_paid: Decimal = Decimal("0")
+    ending_balance: Decimal = Decimal("0")  # initial balance + total_return
 
 
 @dataclass
@@ -126,6 +129,10 @@ class BacktestingEngine:
                               "0.0005" (5bps). Set to "0" to disable.
         commission_per_trade: Flat fee charged on the entry leg and again on the
                               exit leg. Default "1.00". Set to "0" to disable.
+        cost_model:           When set, each leg pays the broker's real fee schedule
+                              (see core/risk/costs.py) instead of the flat fee.
+        compound:             Size each entry from the initial balance plus closed
+                              P&L instead of holding the balance fixed.
     """
 
     def __init__(
@@ -134,11 +141,16 @@ class BacktestingEngine:
         risk_manager: RiskManager,
         slippage_pct: Decimal = Decimal("0.0005"),
         commission_per_trade: Decimal = Decimal("1.00"),
+        *,
+        cost_model: CostModel | None = None,
+        compound: bool = False,
     ) -> None:
         self._strategy = strategy
         self._risk_manager = risk_manager
         self._slippage_pct = slippage_pct
         self._commission_per_trade = commission_per_trade
+        self._cost_model = cost_model
+        self._compound = compound
 
     async def run(
         self,
@@ -147,6 +159,7 @@ class BacktestingEngine:
         account_balance: Decimal,
         strategy_type: str = "unknown",
         strategy_config: dict | None = None,
+        extra_bars: dict[str, list[PriceBar]] | None = None,
     ) -> BacktestResult:
         """
         Replay the strategy over `bars` and return a full BacktestResult.
@@ -157,6 +170,9 @@ class BacktestingEngine:
             account_balance:  Starting equity; held fixed throughout the run.
             strategy_type:    Name tag for the result (e.g. "moving_average").
             strategy_config:  Config dict tag for the result.
+            extra_bars:       Bars for other symbols a strategy needs (e.g. SPY for a
+                              regime filter); each step sees only bars dated <= the
+                              current bar.
         """
         if len(bars) < 2:
             raise ValueError("Need at least 2 bars to run a backtest.")
@@ -173,6 +189,8 @@ class BacktestingEngine:
         open_trade: SimulatedTrade | None = None
         signals_generated = 0
         signals_rejected = 0
+        extra_bars = extra_bars or {}
+        extra_times = {sym: [b.timestamp for b in series] for sym, series in extra_bars.items()}
 
         # We need at least 1 previous bar before we can call generate_signal
         # (the strategy itself may need more, but we start iteration at bar 1).
@@ -195,6 +213,7 @@ class BacktestingEngine:
                     current_price=current_bar.close,
                     bars=history,
                     timestamp=current_bar.timestamp,
+                    extra_bars=visible_extra_bars(extra_bars, extra_times, current_bar.timestamp),
                 )
                 signal = await self._strategy.generate_signal(market_data)
 
@@ -218,8 +237,13 @@ class BacktestingEngine:
                 # using the requested price — slippage is only realized after,
                 # in the actual fill. This keeps gate accept/reject decisions
                 # identical to the frictionless case; only PnL is affected.
+                balance = account_balance
+                if self._compound:
+                    balance += sum((t.pnl or Decimal("0") for t in result.trades), Decimal("0"))
+                    if balance <= 0:
+                        continue
                 risk_params = RiskParams(
-                    account_balance=account_balance,
+                    account_balance=balance,
                     entry_price=raw_fill_price,
                     stop_loss_price=signal.stop_loss_price or (raw_fill_price * Decimal("0.97")),
                 )
@@ -239,7 +263,7 @@ class BacktestingEngine:
                     quantity=Decimal(str(quantity)),
                     entry_price=raw_fill_price,
                     stop_loss_price=stop,
-                    account_balance=account_balance,
+                    account_balance=balance,
                     take_profit_price=tp_hint,
                 )
                 try:
@@ -262,7 +286,9 @@ class BacktestingEngine:
                     risk_amount=risk_amt,
                     entry_bar_index=i + 1,
                     entry_time=fill_bar.timestamp,
-                    commission_paid=self._commission_per_trade,  # entry leg
+                    commission_paid=leg_commission(
+                        self._cost_model, self._commission_per_trade, quantity, fill_price
+                    ),  # entry leg
                 )
 
         # Close any trade still open at end of data
@@ -272,7 +298,9 @@ class BacktestingEngine:
             open_trade.exit_price = self._apply_slippage(last_bar.close, worse_direction=-1)
             open_trade.exit_time = last_bar.timestamp
             open_trade.exit_reason = "END_OF_DATA"
-            open_trade.commission_paid += self._commission_per_trade  # exit leg
+            open_trade.commission_paid += leg_commission(
+                self._cost_model, self._commission_per_trade, open_trade.quantity, open_trade.exit_price
+            )  # exit leg
             open_trade.pnl = (
                 (open_trade.exit_price - open_trade.entry_price) * open_trade.quantity
                 - open_trade.commission_paid
@@ -298,23 +326,19 @@ class BacktestingEngine:
         """
         Check whether stop or take-profit is hit on `bar`.
 
-        Bar's low ≤ stop → stopped out at stop price.
-        Bar's high ≥ take-profit → target hit at take-profit price.
-        If both hit on the same bar, stop wins (conservative assumption).
+        See exit_fill(): a bar that gaps past a level fills at its open; if both
+        levels are hit on the same bar, the stop wins (conservative assumption).
 
         Exit fills apply slippage (unfavorable) and the exit-leg commission,
         same as a real close order would incur.
         """
-        if bar.low <= trade.stop_loss_price:
-            trade.exit_price = self._apply_slippage(trade.stop_loss_price, worse_direction=-1)
-            trade.exit_reason = "STOP_LOSS"
-        elif bar.high >= trade.take_profit_price:
-            trade.exit_price = self._apply_slippage(trade.take_profit_price, worse_direction=-1)
-            trade.exit_reason = "TAKE_PROFIT"
-
-        if trade.exit_price is not None:
+        filled = exit_fill(trade, bar, self._slippage_pct)
+        if filled is not None:
+            trade.exit_price, trade.exit_reason = filled
             trade.exit_time = bar.timestamp
-            trade.commission_paid += self._commission_per_trade  # exit leg
+            trade.commission_paid += leg_commission(
+                self._cost_model, self._commission_per_trade, trade.quantity, trade.exit_price
+            )  # exit leg
             trade.pnl = (
                 (trade.exit_price - trade.entry_price) * trade.quantity - trade.commission_paid
             )
@@ -324,6 +348,37 @@ class BacktestingEngine:
     def _apply_slippage(self, price: Decimal, *, worse_direction: int) -> Decimal:
         """Adjust `price` unfavorably by this engine's `_slippage_pct`."""
         return apply_slippage(price, worse_direction, self._slippage_pct)
+
+
+def exit_fill(
+    trade: SimulatedTrade, bar: PriceBar, slippage_pct: Decimal
+) -> tuple[Decimal, str] | None:
+    """Exit price and reason if `bar` reaches the stop or target; a gap past a level fills at the open."""
+    if bar.open <= trade.stop_loss_price:
+        return apply_slippage(bar.open, -1, slippage_pct), "STOP_LOSS"
+    if bar.low <= trade.stop_loss_price:
+        return apply_slippage(trade.stop_loss_price, -1, slippage_pct), "STOP_LOSS"
+    if bar.open >= trade.take_profit_price:
+        return apply_slippage(bar.open, -1, slippage_pct), "TAKE_PROFIT"
+    if bar.high >= trade.take_profit_price:
+        return apply_slippage(trade.take_profit_price, -1, slippage_pct), "TAKE_PROFIT"
+    return None
+
+
+def leg_commission(
+    cost_model: CostModel | None, flat_fee: Decimal, quantity: int, price: Decimal
+) -> Decimal:
+    """One order's fee: the broker schedule when a cost model is set, else the flat per-leg fee."""
+    return cost_model.commission(Decimal(quantity), price) if cost_model else flat_fee
+
+
+def visible_extra_bars(
+    extra_bars: dict[str, list[PriceBar]], extra_times: dict[str, list[datetime]], now: datetime
+) -> dict[str, list[PriceBar]]:
+    """Each extra symbol's bars dated <= `now` (no look-ahead)."""
+    return {
+        sym: series[: bisect_right(extra_times[sym], now)] for sym, series in extra_bars.items()
+    }
 
 
 def apply_slippage(price: Decimal, worse_direction: int, slippage_pct: Decimal) -> Decimal:
@@ -360,6 +415,7 @@ def _compute_metrics(
             largest_loser=Decimal("0"), max_drawdown_pct=0.0,
             sharpe_ratio=0.0, bars_tested=bars_tested,
             signals_generated=signals_generated, signals_rejected=signals_rejected,
+            ending_balance=initial_balance,
         )
 
     pnls = [t.pnl or Decimal("0") for t in trades]
@@ -412,4 +468,5 @@ def _compute_metrics(
         signals_generated=signals_generated,
         signals_rejected=signals_rejected,
         total_commission_paid=total_commission,
+        ending_balance=initial_balance + total_return,
     )

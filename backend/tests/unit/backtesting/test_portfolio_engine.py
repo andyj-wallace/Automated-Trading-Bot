@@ -430,3 +430,23 @@ async def test_zero_friction_matches_frictionless_behavior(risk_manager: RiskMan
     assert trade.entry_price == Decimal("100")
     assert trade.commission_paid == Decimal("0")
     assert trade.pnl == (trade.exit_price - trade.entry_price) * trade.quantity
+
+
+@pytest.mark.asyncio
+async def test_portfolio_gap_and_fee_model_match_single_engine() -> None:
+    """The portfolio engine shares exit_fill and the fee model with the single engine."""
+    from app.core.backtesting.engine import apply_slippage
+    from app.core.risk.costs import PLANS, CostModel
+
+    bars = [_bar(0, 25, 25.2, 24.8, 25), _bar(1, 25, 25.2, 24.8, 25), _bar(2, 25, 25.2, 24.8, 25),
+            _bar(3, 23.0, 23.5, 22.5, 23.0)]
+    slippage = Decimal("0.0005")
+    slot = PortfolioSlot(strategy=FixedRiskBuyStrategy(1, Decimal("0.50"), 2), symbol="SCHB", bars=bars)
+    engine = PortfolioBacktestEngine(
+        RiskManager(), slippage_pct=slippage, cost_model=CostModel(PLANS["ibkr_tiered"], Decimal("5")),
+        compound=True,
+    )
+    result = await engine.run([slot], account_balance=Decimal("1000"))
+    trade = result.per_strategy[0].trades[0]
+    assert trade.exit_price == apply_slippage(Decimal("23.0"), -1, slippage)
+    assert result.combined_metrics.ending_balance == Decimal("1000") + result.combined_metrics.total_return

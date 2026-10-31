@@ -7,6 +7,8 @@ POST /api/v1/trading/resume   — Allow automated entries again
 POST /api/v1/trading/flatten  — Pause, then close every OPEN trade ({"confirm": "FLATTEN"})
 """
 
+from decimal import Decimal
+
 from fastapi import APIRouter, Body, Depends
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +29,21 @@ async def trading_status(
 ) -> JSONResponse:
     open_trades = await TradeRepo(db).get_open_trades()
     last_cycle = engine.scheduler.last_cycle_at
+    equity = await engine.get_equity()
+    growth = engine.growth
+    limit = engine.settings.trading_capital_limit
+    growth_mode = {
+        "enabled": growth.enabled,
+        "active": growth.is_active(equity) if equity > 0 else None,
+        "equity": str(equity) if equity > 0 else None,
+        "exit_equity": str(growth.exit_equity),
+        "progress_pct": str((equity / growth.exit_equity * 100).quantize(Decimal("0.1"))) if equity > 0 else None,
+        "max_open_positions": growth.max_open_positions,
+        "universe": sorted(growth.universe),
+        "commission_plan": engine.settings.commission_plan,
+        "account_type": engine.settings.account_type,
+        "capital_limit": str(limit) if limit is not None else None,
+    }
     return JSONResponse(
         content=ok(
             {
@@ -39,6 +56,7 @@ async def trading_status(
                 "scheduler_last_cycle_at": last_cycle.isoformat() if last_cycle else None,
                 "open_trade_count": len(open_trades),
                 "circuit_breaker_halted": engine.circuit_breaker.is_halted(),
+                "growth_mode": growth_mode,
             }
         )
     )

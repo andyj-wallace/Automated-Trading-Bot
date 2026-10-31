@@ -4,7 +4,7 @@ RiskCalculator — derives the maximum safe position size from the 1% rule.
 Formula:
     max_quantity = floor((account_balance × 0.01) / (entry_price − stop_loss_price))
 
-The 1% rule is a hard system constraint (design.md § Risk Management):
+The 1% rule is a hard system constraint:
   - Maximum loss per trade = 1% of account balance
   - Loss is defined as: quantity × (entry_price − stop_loss_price)
   - A stop-loss price is required; orders without one are rejected upstream

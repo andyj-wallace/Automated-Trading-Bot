@@ -1,10 +1,8 @@
 /**
- * Dashboard.
- *
- * Top: broker-connection banner (only when the Gateway is down) and trading
- * controls. Then risk gauge + circuit breaker, active trades +
- * watchlist, alerts feed, system health. All live data comes from the live
- * store; the single WebSocket is mounted in Layout.
+ * Home. Shows one plain-English status line with pause/resume, any alerts, and
+ * open positions. Risk, watchlist and system panels are tucked in a collapsed
+ * "details" section. Live data comes from the live store; the single WebSocket
+ * is mounted in Layout.
  */
 
 import { AlertsFeed } from "../components/alerts/AlertsFeed";
@@ -19,16 +17,12 @@ import { useLiveStore } from "../store/liveStore";
 
 export function Dashboard() {
   const socketState = useLiveStore((s) => s.socketState);
+  const hasAlerts = useLiveStore((s) => s.alerts.length > 0);
 
   return (
-    <div className="p-8 flex flex-col gap-4">
-      <div className="flex items-center justify-between mb-4">
-        <div>
-          <h1 className="text-2xl font-bold text-white mb-1">Dashboard</h1>
-          <p className="text-gray-500 text-sm">
-            Controls · risk · active trades · watchlist · alerts · system status
-          </p>
-        </div>
+    <div className="p-8 flex flex-col gap-4 max-w-4xl">
+      <div className="flex items-center justify-between mb-2">
+        <h1 className="text-2xl font-bold text-white">Home</h1>
         <WsIndicator readyState={socketState} />
       </div>
 
@@ -36,19 +30,23 @@ export function Dashboard() {
 
       <TradingControlsPanel />
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <RiskGauge />
-        <CircuitBreakerPanel />
-      </div>
+      {hasAlerts && <AlertsFeed />}
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <ActiveTradesTable />
-        <WatchlistPanel />
-      </div>
+      <ActiveTradesTable compact />
 
-      <AlertsFeed />
-
-      <SystemHealthPanel />
+      <details className="rounded-lg border border-gray-800 bg-gray-900/50">
+        <summary className="px-5 py-3 text-sm text-gray-400 cursor-pointer select-none">
+          Risk &amp; system details
+        </summary>
+        <div className="p-4 flex flex-col gap-4">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <RiskGauge />
+            <CircuitBreakerPanel />
+          </div>
+          <WatchlistPanel />
+          <SystemHealthPanel />
+        </div>
+      </details>
     </div>
   );
 }

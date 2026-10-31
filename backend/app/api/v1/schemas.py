@@ -91,6 +91,8 @@ class TradeOut(BaseModel):
     account_balance_at_entry: Decimal
     entry_fill_price: Decimal | None
     filled_quantity: Decimal | None
+    entry_commission: Decimal | None = None
+    exit_commission: Decimal | None = None
     current_stop_price: Decimal | None
     close_attempts: int
     pnl: Decimal | None

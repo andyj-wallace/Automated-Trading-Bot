@@ -47,6 +47,7 @@ class MarketData(BaseModel):
     timestamp: datetime
     extra_bars: dict[str, list[PriceBar]] = {}
     open_position: bool = False
+    intraday_bars: list[PriceBar] = []  # today's completed 5-minute bars, only for needs_intraday strategies
 
 
 class RiskParams(BaseModel):
@@ -88,6 +89,7 @@ class Signal(BaseModel):
     timestamp: datetime
     take_profit_price: Decimal | None = None
     submit_stop_to_broker: bool = False
+    exit_deadline: datetime | None = None  # close the trade at this time if still open (day trades)
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +105,8 @@ class BaseStrategy(ABC):
     by the strategy scheduler (Layer 11). They receive market data and produce
     signals that flow through the risk layer before reaching the broker.
     """
+
+    needs_intraday: bool = False  # True: the scheduler fills MarketData.intraday_bars
 
     @abstractmethod
     async def generate_signal(self, market_data: MarketData) -> Signal:

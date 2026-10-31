@@ -18,7 +18,7 @@ import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
@@ -27,12 +27,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.schemas import err, ok
 from app.brokers.base import PriceBar
+from app.config import get_settings
 from app.core.backtesting.engine import BacktestingEngine, BacktestMetrics, BacktestResult
 from app.core.backtesting.portfolio_engine import (
     PortfolioBacktestEngine,
     PortfolioBacktestResult,
     PortfolioSlot,
 )
+from app.core.risk.costs import PLANS, CostModel
 from app.core.risk.manager import RiskManager
 from app.core.strategy_engine.registry import registry
 from app.db.repositories.ohlcv_repo import OHLCVRepo
@@ -52,6 +54,10 @@ class _Job:
     def __init__(self, job_id: uuid.UUID, request: Any) -> None:
         self.job_id = job_id
         self.request = request
+        # (RiskManager, engine kwargs) from _build_costs; None keeps the legacy engines.
+        self.costs: tuple[RiskManager, dict] | None = None
+        # Extra-symbol bars: a dict for a single run, one dict per slot for a portfolio run.
+        self.extra_bars: Any = None
         self.status: str = "pending"
         self.error: str | None = None
         self.result: BacktestResult | None = None
@@ -74,6 +80,9 @@ class BacktestRunRequest(BaseModel):
     strategy_type: str
     strategy_config: dict[str, Any] = {}
     account_balance: str = "100000"
+    commission_plan: Literal["legacy", "ibkr_fixed", "ibkr_tiered", "zero"] = "legacy"
+    slippage_bps: str = "5"
+    compound: bool = False
 
 
 class PortfolioSlotRequest(BaseModel):
@@ -93,6 +102,66 @@ class PortfolioBacktestRunRequest(BaseModel):
     slots: list[PortfolioSlotRequest]
     account_balance: str = "100000"
     range: str = "5y"
+    commission_plan: Literal["legacy", "ibkr_fixed", "ibkr_tiered", "zero"] = "legacy"
+    slippage_bps: str = "5"
+    compound: bool = False
+
+
+def _build_costs(body: BacktestRunRequest | PortfolioBacktestRunRequest) -> tuple[RiskManager, dict]:
+    """
+    Risk manager and engine kwargs for the requested fee schedule.
+
+    "legacy" keeps today's engines exactly (flat $1 per leg, default RiskManager). Anything else
+    uses the broker's real schedule, and the fee gate rejects in backtests as it would live.
+    Growth-mode universe and position limits are not applied in backtests.
+    """
+    if body.commission_plan == "legacy":
+        return RiskManager(), {"compound": body.compound}
+    settings = get_settings()
+    cost_model = CostModel(PLANS[body.commission_plan], Decimal(body.slippage_bps))
+    risk_manager = RiskManager(
+        min_reward_to_risk=settings.min_reward_to_risk,
+        cost_model=cost_model,
+        max_breakeven_win_rate=settings.max_breakeven_win_rate,
+    )
+    return risk_manager, {
+        "slippage_pct": cost_model.slippage_bps / Decimal("10000"),
+        "cost_model": cost_model,
+        "compound": body.compound,
+    }
+
+
+def _to_price_bars(db_bars) -> list[PriceBar]:
+    return [
+        PriceBar(
+            timestamp=b.time, open=b.open, high=b.high, low=b.low, close=b.close,
+            volume=b.volume, bar_size=b.bar_size,
+        )
+        for b in db_bars
+    ]
+
+
+async def _load_extra_bars(
+    repo: OHLCVRepo, strategy, start: datetime, end: datetime
+) -> tuple[dict[str, list[PriceBar]], str | None]:
+    """Bars for the strategy's extra symbols (e.g. SPY); the second item names a symbol with no data."""
+    extra: dict[str, list[PriceBar]] = {}
+    for symbol in strategy.required_extra_symbols():
+        symbol = symbol.upper()
+        rows = await repo.get_bars(symbol, start=start, end=end)
+        if not rows:
+            return extra, symbol
+        extra[symbol] = _to_price_bars(rows)
+    return extra, None
+
+
+def _require_daily_only(strategies) -> None:
+    if any(s.needs_intraday for s in strategies):
+        raise ValueError("day-trade strategies need 5-minute bars; backtests only have daily bars")
+
+
+def _bad_request(code: str, message: str) -> JSONResponse:
+    return JSONResponse(status_code=422, content=err(code, message))
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +193,13 @@ async def run_backtest(
             ),
         )
 
+    try:
+        strategy = registry.build(body.strategy_type, body.strategy_config)
+        costs = _build_costs(body)
+        _require_daily_only([strategy])
+    except (ValueError, TypeError, KeyError, ArithmeticError) as exc:
+        return _bad_request("INVALID_CONFIG", str(exc))
+
     # Check historical data exists
     end = datetime.now(UTC)
     start = end - timedelta(days=365 * 5)
@@ -139,18 +215,14 @@ async def run_backtest(
             ),
         )
 
-    bars = [
-        PriceBar(
-            timestamp=bar.time,
-            open=bar.open,
-            high=bar.high,
-            low=bar.low,
-            close=bar.close,
-            volume=bar.volume,
-            bar_size=bar.bar_size,
+    bars = _to_price_bars(db_bars)
+    extra_bars, missing_extra = await _load_extra_bars(ohlcv_repo, strategy, start, end)
+    if missing_extra:
+        return _bad_request(
+            "NO_HISTORICAL_DATA",
+            f"No historical OHLCV bars found for {missing_extra}, which {body.strategy_type} needs. "
+            "Fetch historical data first via HistoricalDataFetcher.",
         )
-        for bar in db_bars
-    ]
 
     # Evict oldest job if at capacity
     if len(_jobs) >= MAX_JOBS:
@@ -159,6 +231,7 @@ async def run_backtest(
 
     job_id = uuid.uuid4()
     job = _Job(job_id=job_id, request=body)
+    job.costs, job.extra_bars = costs, extra_bars
     _jobs[job_id] = job
 
     asyncio.create_task(_run_job(job, bars), name=f"backtest-{job_id}")
@@ -213,28 +286,30 @@ async def run_portfolio_backtest(
             ),
         )
 
+    try:
+        strategies = [registry.build(s.strategy_type, s.config) for s in body.slots]
+        costs = _build_costs(body)
+        _require_daily_only(strategies)
+    except (ValueError, TypeError, KeyError, ArithmeticError) as exc:
+        return _bad_request("INVALID_CONFIG", str(exc))
+
     # Fetch and validate OHLCV data for all symbols
     bars_by_slot: list[list[PriceBar]] = []
+    extras_by_slot: list[dict[str, list[PriceBar]]] = []
     missing: list[str] = []
 
-    for slot_req in body.slots:
+    for slot_req, strategy in zip(body.slots, strategies, strict=True):
         ticker = slot_req.symbol.upper()
         db_bars = await ohlcv_repo.get_bars(ticker, start=start, end=end)
         if not db_bars:
             missing.append(ticker)
             continue
-        bars_by_slot.append([
-            PriceBar(
-                timestamp=b.time,
-                open=b.open,
-                high=b.high,
-                low=b.low,
-                close=b.close,
-                volume=b.volume,
-                bar_size=b.bar_size,
-            )
-            for b in db_bars
-        ])
+        extra_bars, missing_extra = await _load_extra_bars(ohlcv_repo, strategy, start, end)
+        if missing_extra:
+            missing.append(missing_extra)
+            continue
+        bars_by_slot.append(_to_price_bars(db_bars))
+        extras_by_slot.append(extra_bars)
 
     if missing:
         return JSONResponse(
@@ -253,6 +328,7 @@ async def run_portfolio_backtest(
 
     job_id = uuid.uuid4()
     job = _Job(job_id=job_id, request=body)
+    job.costs, job.extra_bars = costs, extras_by_slot
     _jobs[job_id] = job
 
     asyncio.create_task(
@@ -333,8 +409,8 @@ async def _run_job_locked(job: _Job, bars) -> None:
         strategy = registry.build(
             job.request.strategy_type, job.request.strategy_config
         )
-        risk_manager = RiskManager()
-        engine = BacktestingEngine(strategy, risk_manager)
+        risk_manager, engine_kwargs = job.costs or (RiskManager(), {})
+        engine = BacktestingEngine(strategy, risk_manager, **engine_kwargs)
 
         result = await asyncio.to_thread(
             asyncio.run,
@@ -344,6 +420,7 @@ async def _run_job_locked(job: _Job, bars) -> None:
                 account_balance=Decimal(job.request.account_balance),
                 strategy_type=job.request.strategy_type,
                 strategy_config=job.request.strategy_config,
+                extra_bars=job.extra_bars,
             ),
         )
         job.result = result
@@ -382,10 +459,12 @@ async def _run_portfolio_job_locked(
                 bars=bars,
                 strategy_type=sr.strategy_type,
                 strategy_config=sr.config,
+                extra_bars=extra,
             )
-            for sr, bars in zip(slot_requests, bars_by_slot, strict=False)
+            for sr, bars, extra in zip(slot_requests, bars_by_slot, job.extra_bars, strict=True)
         ]
-        engine = PortfolioBacktestEngine(RiskManager())
+        risk_manager, engine_kwargs = job.costs or (RiskManager(), {})
+        engine = PortfolioBacktestEngine(risk_manager, **engine_kwargs)
         result = await asyncio.to_thread(
             asyncio.run,
             engine.run(slots, account_balance=Decimal(account_balance_str)),
@@ -451,6 +530,8 @@ def _serialise_metrics(m: BacktestMetrics) -> dict:
         "bars_tested": m.bars_tested,
         "signals_generated": m.signals_generated,
         "signals_rejected": m.signals_rejected,
+        "ending_balance": str(m.ending_balance),
+        "total_commission_paid": str(m.total_commission_paid),
     }
 
 

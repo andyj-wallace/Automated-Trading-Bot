@@ -20,7 +20,7 @@ class SystemLog(Base):
     """
     Structured log entry persisted to the database for the logs viewer UI.
 
-    Uses BIGSERIAL PK (not UUID) per design.md § system_logs.
+    Uses BIGSERIAL PK (not UUID).
     Note: This table supplements (does not replace) the file-based log streams.
     """
 

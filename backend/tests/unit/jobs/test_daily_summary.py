@@ -103,3 +103,45 @@ async def test_redis_failure_skips_instead_of_duplicating(monkeypatch):
     job._cache.get = AsyncMock(side_effect=ConnectionError("down"))
     await job.tick()
     dispatcher.notify_daily_summary.assert_not_awaited()
+
+
+async def test_summary_reports_fees_and_growth_mode(monkeypatch):
+    from app.core.risk.costs import PLANS, CostModel
+    from app.core.risk.growth import GrowthPolicy
+
+    job, _clock, _collector, dispatcher = _job(monkeypatch, _at(2026, 10, 19, 16, 50))
+    opened = SimpleNamespace(
+        entry_commission=Decimal("0.36"), entry_fill_price=Decimal("25"), entry_price=Decimal("25"),
+        filled_quantity=Decimal("2"), quantity=Decimal("2"), exit_commission=None, exit_price=None,
+    )
+    closed = SimpleNamespace(
+        pnl=Decimal("1.28"), exit_commission=Decimal("0.36"), exit_price=Decimal("25"),
+        entry_commission=None, filled_quantity=Decimal("2"), quantity=Decimal("2"),
+        entry_fill_price=None, entry_price=None,
+    )
+    job._cost_model = CostModel(PLANS["ibkr_fixed"], Decimal("5"))
+    job._growth = GrowthPolicy(True, Decimal("2000"), 2, frozenset())
+    job._broker = SimpleNamespace(
+        get_account_summary=AsyncMock(return_value=SimpleNamespace(net_liquidation=Decimal("101.28")))
+    )
+
+    class Repo:
+        def __init__(self, _s):
+            pass
+
+        async def closed_since(self, _start):
+            return [closed]
+
+        async def opened_since(self, _start):
+            return [opened]
+
+        async def get_open_trades(self):
+            return []
+
+    monkeypatch.setattr(daily_summary, "TradeRepo", Repo)
+    body = await job.run(_at(2026, 10, 19, 16, 50).date())
+    assert "Realized P&L today (after fees): $1.28" in body
+    assert "Fees today: $0.72 actual vs $1.00 estimated (COMMISSION_PLAN=ibkr_fixed)" in body
+    assert "Fees differ from the COMMISSION_PLAN estimate by more than 25%" in body
+    assert "Growth mode: ON, equity $101.28 (5.1% of the $2000 exit level)" in body
+    dispatcher.notify_daily_summary.assert_awaited_once()

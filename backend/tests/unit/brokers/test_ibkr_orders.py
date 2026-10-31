@@ -57,6 +57,22 @@ def _fill(ref, shares, price, order_id=5):
     )
 
 
+def _commission_fill(commission):
+    return SimpleNamespace(commissionReport=SimpleNamespace(commission=commission))
+
+
+def test_fills_commission_ignores_unset_and_zero():
+    fills = [_commission_fill(0.36), _commission_fill(0.0), _commission_fill(1.7976931348623157e308)]
+    assert mapper.fills_commission(fills) == Decimal("0.36")
+
+
+def test_summarize_fills_carries_commission():
+    ref = f"{TID}:exit"
+    fill = _fill(ref, 2, 25.0)
+    fill.commissionReport = SimpleNamespace(commission=0.36)
+    assert mapper.summarize_fills(ref, [fill]).commission == Decimal("0.36")
+
+
 def test_summarize_fills_volume_weighted():
     ref = f"{TID}:exit"
     fills = [_fill(ref, 4, 10.0), _fill(ref, 6, 20.0), _fill("other:exit", 99, 1.0)]
@@ -107,6 +123,7 @@ class _LiveTrade:
         self.order = SimpleNamespace(orderId=11, orderRef=ref)
         self.orderStatus = SimpleNamespace(status=status, filled=0, avgFillPrice=0.0)
         self.log = []
+        self.fills = []
         self.cancel_to = "Cancelled"
 
     def isDone(self):

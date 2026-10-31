@@ -17,12 +17,15 @@ NOTE on SELL/short: extending this strategy to short when price crosses
 above the upper band (mean + z × std) is a natural complement, but short
 selling requires risk-engine support for stop_loss_price > entry_price.
 That gate is not yet open; the SELL direction is omitted here and noted
-for a future extension (see STR-04 in requirements.md).
+for a future extension.
 
 Config keys:
     lookback           int   Rolling window in bars for mean/std (default 20)
     z_score_threshold  str   Band width in standard deviations (default "2.0")
     stop_loss_pct      str   Stop-loss distance below entry as a fraction (default "0.02")
+    max_trend_pct      str   Range-bound filter: HOLD when the rolling mean moved more than this
+                             fraction over trend_lookback bars; "0" disables (default "0")
+    trend_lookback     int   Bars over which the mean's drift is measured (default 10)
     symbols            list  Ticker symbols this strategy trades (default [])
 
 Registration:
@@ -66,6 +69,8 @@ class MeanReversionStrategy(BaseStrategy):
             str(config.get("z_score_threshold", "2.0"))
         )
         self.stop_loss_pct: Decimal = Decimal(str(config.get("stop_loss_pct", "0.02")))
+        self.max_trend_pct: Decimal = Decimal(str(config.get("max_trend_pct", "0")))
+        self.trend_lookback: int = int(config.get("trend_lookback", 10))
         self._calculator = RiskCalculator()
 
         if self.lookback < 2:
@@ -76,6 +81,10 @@ class MeanReversionStrategy(BaseStrategy):
             raise ValueError(
                 f"z_score_threshold must be > 0, got {self.z_score_threshold}"
             )
+        if self.max_trend_pct < Decimal("0"):
+            raise ValueError(f"max_trend_pct must be >= 0, got {self.max_trend_pct}")
+        if self.trend_lookback < 1:
+            raise ValueError(f"trend_lookback must be >= 1, got {self.trend_lookback}")
         if self.stop_loss_pct <= Decimal("0") or self.stop_loss_pct >= Decimal("1"):
             raise ValueError(
                 f"stop_loss_pct must be between 0 and 1, got {self.stop_loss_pct}"
@@ -107,6 +116,14 @@ class MeanReversionStrategy(BaseStrategy):
         window_now = closes[-self.lookback:]
         mean_now = _mean(window_now)
         std_now = _pstdev(window_now)
+
+        # Range filter: a drifting mean means a trend, where dips keep falling.
+        if self.max_trend_pct > 0:
+            if len(closes) < self.lookback + self.trend_lookback:
+                return self._hold(market_data.symbol)
+            mean_then = _mean(closes[-self.lookback - self.trend_lookback:-self.trend_lookback])
+            if abs(mean_now - mean_then) / mean_then > self.max_trend_pct:
+                return self._hold(market_data.symbol)
 
         # Previous bar window (one bar earlier)
         window_prev = closes[-self.lookback - 1:-1]
@@ -184,6 +201,20 @@ class MeanReversionStrategy(BaseStrategy):
                         "Stop-loss distance below entry as a decimal fraction "
                         "(e.g. '0.02' = 2%)"
                     ),
+                },
+                "max_trend_pct": {
+                    "type": "string",
+                    "default": "0",
+                    "description": (
+                        "Only buy in a range: HOLD when the rolling mean moved more than this "
+                        "fraction over trend_lookback bars. '0' disables; '0.03' is a good start."
+                    ),
+                },
+                "trend_lookback": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 10,
+                    "description": "Bars over which the mean's drift is measured",
                 },
                 "symbols": {
                     "type": "array",

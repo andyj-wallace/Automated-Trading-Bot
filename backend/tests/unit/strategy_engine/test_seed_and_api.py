@@ -67,7 +67,7 @@ def _mem(monkeypatch):
 async def test_seed_twice_creates_each_type_once_all_disabled():
     first = await seed_strategies(registry, _factory)
     second = await seed_strategies(registry, _factory)
-    assert first == 5 and second == 0
+    assert first == 8 and second == 0
     assert {r.type for r in MemRepo.rows} == set(registry.registered_types()) - {"composite"}
     assert all(r.is_enabled is False for r in MemRepo.rows)
 
@@ -86,9 +86,9 @@ def client():
     app.dependency_overrides.clear()
 
 
-def test_types_lists_all_six(client):
+def test_types_lists_all_nine(client):
     data = client.get("/api/v1/strategies/types").json()["data"]
-    assert len(data) == 6
+    assert len(data) == 9
     assert all(item["config_schema"]["properties"] for item in data)
 
 

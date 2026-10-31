@@ -43,6 +43,7 @@ class MockBroker(BaseBroker):
         self._next_order_id = 1
         self._price_callbacks: list[PriceFeedCallback] = []
         self.last_prices: dict[str, Decimal] = {}
+        self.intraday_bars: dict[str, list[PriceBar]] = {}  # tests fill this
         self.positions: dict[str, Position] = {}
         self.orders: dict[str, OrderRequest] = {}
         self.order_results: dict[str, OrderResult] = {}
@@ -83,6 +84,9 @@ class MockBroker(BaseBroker):
             unrealized_pnl=Decimal("0.00"),
             realized_pnl=Decimal("0.00"),
             currency="USD",
+            settled_cash=_MOCK_BALANCE,
+            available_funds=_MOCK_BUYING_POWER,
+            day_trades_remaining=-1,
         )
 
     async def get_positions(self) -> list[Position]:
@@ -104,7 +108,9 @@ class MockBroker(BaseBroker):
         # No ticks are pushed here — tests drive callbacks directly via
         # simulate_price_tick() or the MarketDataFeed layer.
 
-    async def simulate_price_tick(self, ticker: str, price: Decimal) -> None:
+    async def simulate_price_tick(
+        self, ticker: str, price: Decimal, bid: Decimal | None = None, ask: Decimal | None = None
+    ) -> None:
         """
         Test helper: push a synthetic PriceUpdate to all registered callbacks.
         Not part of BaseBroker — only available on MockBroker.
@@ -114,6 +120,8 @@ class MockBroker(BaseBroker):
         update = PriceUpdate(
             ticker=ticker,
             price=price,
+            bid=bid,
+            ask=ask,
             timestamp=datetime.now(UTC),
         )
         for cb in self._price_callbacks:
@@ -321,6 +329,9 @@ class MockBroker(BaseBroker):
     # ------------------------------------------------------------------
     # Historical data
     # ------------------------------------------------------------------
+
+    async def get_intraday_bars(self, symbol: str) -> list[PriceBar]:
+        return self.intraday_bars.get(symbol, [])
 
     async def get_historical_data(
         self,

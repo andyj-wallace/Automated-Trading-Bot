@@ -28,7 +28,7 @@ close_position() handles the full exit flow (market hours only):
      breaker, trade_closed event (only if this call won the CLOSED transition)
 
 Audit entries are append-only. No path in this codebase may modify or delete
-them after writing. See design.md § Audit Trail.
+them after writing.
 
 Depends on: RiskManager (6.3), BaseBroker (Layer 4), TradeRepo (3.7),
             RedisCache (5.1), audit_logger (Layer 2.2)
@@ -39,7 +39,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
 
@@ -48,6 +48,8 @@ from app.core import market_calendar
 from app.core.events import envelope, publish_system_alert
 from app.core.risk.calculator import RiskCalculator
 from app.core.risk.circuit_breaker import CircuitBreaker
+from app.core.risk.costs import CostModel
+from app.core.risk.growth import GrowthPolicy
 from app.core.risk.manager import (
     RiskManager,
     RiskRejectionError,
@@ -117,7 +119,14 @@ class OrderManager:
         is_market_open: Callable[[], bool] = market_calendar.is_market_open,
         protective_stops: bool = False,
         stop_cancel_wait_seconds: float = 5.0,
+        *,
+        growth: GrowthPolicy | None = None,
+        account_type: str | None = None,
+        cost_model: CostModel | None = None,
     ) -> None:
+        self._growth = growth
+        self._account_type = account_type  # None skips the settled-cash / day-trade checks
+        self._cost_model = cost_model
         self._broker = broker
         self._risk_manager = risk_manager
         self._session_factory = session_factory
@@ -191,6 +200,19 @@ class OrderManager:
                            "position_value": str(position_value)},
                 )
                 raise RiskRejectionError(reason=reason, request=request)
+
+            if (
+                self._growth is not None
+                and self._growth.is_active(request.account_balance)
+                and len(active_trades) >= self._growth.max_open_positions
+            ):
+                self._reject_entry(
+                    request, "GROWTH_MAX_POSITIONS",
+                    f"growth mode allows {self._growth.max_open_positions} active trades; "
+                    f"{len(active_trades)} already active",
+                )
+            if self._account_type is not None:
+                await self._check_account_rules(request, active_trades)
 
             if self._session_factory:
                 await self._create_pending(request, validation)
@@ -418,7 +440,7 @@ class OrderManager:
     async def close_position(
         self,
         trade_id: uuid.UUID,
-        reason: str,  # an ExitReason value: "STOP_LOSS" | "TAKE_PROFIT" | "MANUAL" | "STALE_TIMEOUT" | "EXTERNAL"
+        reason: str,  # an ExitReason value: "STOP_LOSS" | "TAKE_PROFIT" | "MANUAL" | "STALE_TIMEOUT" | "EXTERNAL" | "TIME_EXIT"
         *,
         allow_from_closing: bool = False,
     ) -> CloseOutcome:
@@ -574,7 +596,7 @@ class OrderManager:
 
     async def place_protective_stop(self, trade_id: uuid.UUID, *, force: bool = False) -> bool:
         """
-        Rest a GTC stop order at the broker at the risk-approved stop price (RSK-07).
+        Rest a GTC stop order at the broker at the risk-approved stop price.
 
         Idempotent: does nothing unless the trade is OPEN with no stop recorded.
         The internal monitor stays the primary exit; this is the outage backstop.
@@ -662,7 +684,8 @@ class OrderManager:
 
         async with self._session_factory() as session:
             trade = await TradeRepo(session).open_from_fill(
-                trade_id, fill.broker_order_id, fill.avg_fill_price, fill.filled_quantity
+                trade_id, fill.broker_order_id, fill.avg_fill_price, fill.filled_quantity,
+                commission=fill.commission,
             )
             await session.commit()
         if trade is None:
@@ -727,10 +750,12 @@ class OrderManager:
                 shares = trade.filled_quantity if trade.filled_quantity else trade.quantity
                 exit_price = fallback_price
             entry = trade.entry_fill_price if trade.entry_fill_price else trade.entry_price
+            exit_commission = fill.commission if fill is not None else Decimal("0")
+            fees = (trade.entry_commission or Decimal("0")) + exit_commission
             if trade.direction == TradeDirection.BUY:
-                pnl = (exit_price - entry) * shares
+                pnl = (exit_price - entry) * shares - fees
             else:
-                pnl = (entry - exit_price) * shares
+                pnl = (entry - exit_price) * shares - fees
 
             closed = await repo.finish_close(
                 trade_id,
@@ -738,6 +763,7 @@ class OrderManager:
                 pnl,
                 fill.broker_order_id if fill else None,
                 exit_reason=exit_reason,
+                exit_commission=exit_commission,
             )
             await session.commit()
         if closed is None:
@@ -849,15 +875,59 @@ class OrderManager:
                 risk_amount=validation.risk_amount,
                 account_balance_at_entry=validation.account_balance_at_entry,
                 strategy_id=request.strategy_id,
+                exit_deadline=request.exit_deadline,
             )
             await session.commit()
+
+    async def _check_account_rules(self, request: TradeRequest, active_trades: list) -> None:
+        """Cash accounts pay only with settled cash; margin accounts keep a day trade in reserve."""
+        from app.db.models.trade import TradeStatus
+
+        try:
+            summary = await self._broker.get_account_summary()
+        except Exception as exc:
+            self._reject_entry(request, "ACCOUNT_UNAVAILABLE", f"could not read the account: {exc}")
+        if self._account_type == "margin":
+            if summary.day_trades_remaining == 0:  # -1 means unlimited
+                self._reject_entry(
+                    request, "NO_DAY_TRADES_LEFT",
+                    "IBKR reports 0 day trades left; a same-day stop-out would flag the account",
+                )
+            return
+        settled = summary.settled_cash if summary.settled_cash is not None else summary.cash_balance
+        # IBKR refreshes account values about every 3 minutes, so reserve orders it may not have counted yet.
+        cutoff = datetime.now(UTC) - timedelta(minutes=5)
+        reserved = sum(
+            (
+                (t.filled_quantity or t.quantity) * (t.entry_fill_price or t.entry_price)
+                for t in active_trades
+                if t.status in (TradeStatus.PENDING, TradeStatus.SUBMITTED) or t.executed_at >= cutoff
+            ),
+            Decimal("0"),
+        )
+        fee = self._cost_model.commission(request.quantity, request.entry_price) if self._cost_model else Decimal("0")
+        needed = request.quantity * request.entry_price + fee
+        if needed > settled - reserved:
+            self._reject_entry(
+                request, "INSUFFICIENT_SETTLED_CASH",
+                f"needs {needed:.2f}; settled cash {settled:.2f} minus {reserved:.2f} reserved",
+            )
+
+    @staticmethod
+    def _reject_entry(request: TradeRequest, code: str, detail: str) -> None:
+        risk_logger.warning(
+            "OrderManager: entry rejected",
+            extra={"trade_id": str(request.trade_id), "symbol": request.symbol, "reason": code, "detail": detail},
+        )
+        raise RiskRejectionError(reason=f"{code}: {detail}", request=request)
 
     async def _record_entry_fill(self, trade_id: uuid.UUID, result: OrderResult) -> None:
         from app.db.repositories.trade_repo import TradeRepo
 
         async with self._session_factory() as session:
             await TradeRepo(session).record_entry_fill(
-                trade_id, result.broker_order_id, result.avg_fill_price, result.filled_quantity
+                trade_id, result.broker_order_id, result.avg_fill_price, result.filled_quantity,
+                commission=result.commission,
             )
             await session.commit()
 
@@ -947,7 +1017,7 @@ class OrderManager:
         order_result: OrderResult,
     ) -> None:
         """Write the mandatory post-confirmation audit entry to audit.log."""
-        # Recalculate risk based on actual fill price per design.md spec
+        # Recalculate risk based on actual fill price
         final_risk_amount = Decimal("0")
         if (
             order_result.avg_fill_price > 0

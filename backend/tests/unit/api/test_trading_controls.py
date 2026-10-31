@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from app.api.v1 import signals, symbols, trades, trading
 from app.brokers.base import BrokerConnectionInfo
 from app.core.execution.order_manager import CloseOutcome
+from app.core.risk.growth import GrowthPolicy
 from app.core.risk.manager import RiskRejectionError
 from app.core.trading_state import TradingState
 from app.dependencies import get_db, get_engine
@@ -68,6 +69,11 @@ def env(monkeypatch):
                 return_value=SimpleNamespace(net_liquidation=Decimal("100000"))
             ),
         ),
+        settings=SimpleNamespace(
+            trading_capital_limit=None, commission_plan="ibkr_fixed", account_type="cash"
+        ),
+        growth=GrowthPolicy(True, Decimal("2000"), 2, frozenset({"SCHB"})),
+        get_equity=AsyncMock(return_value=Decimal("100")),
         is_leader=True,
         market_open=lambda: True,
         in_eval_window=lambda: False,
@@ -109,6 +115,11 @@ def test_status_shape(env):
             "state": "connected", "down_since": None, "last_connected_at": None,
             "last_error": None, "hint": None,
         },
+        "growth_mode": {
+            "enabled": True, "active": True, "equity": "100", "exit_equity": "2000",
+            "progress_pct": "5.0", "max_open_positions": 2, "universe": ["SCHB"],
+            "commission_plan": "ibkr_fixed", "account_type": "cash", "capital_limit": None,
+        },
     }
 
 
@@ -118,7 +129,9 @@ def test_status_reports_broker_outage_and_hint(env):
     env.engine.broker.connection_info = lambda: BrokerConnectionInfo(
         state="down", down_since=NOW, last_error="Connect call failed", hint="Check IBKR Mobile"
     )
+    env.engine.get_equity = AsyncMock(return_value=Decimal("0"))
     data = env.client.get("/api/v1/trading/status").json()["data"]
+    assert data["growth_mode"]["active"] is None
     assert data["broker_connected"] is False
     assert data["broker"]["state"] == "down"
     assert data["broker"]["down_since"].startswith("2026-10-19T15:00:00")

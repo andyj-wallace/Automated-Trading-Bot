@@ -11,6 +11,9 @@
 import { useState, useEffect, useRef } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { api } from "../api/client";
+import { SchemaForm } from "../components/strategies/SchemaForm";
+import { defaultsFromSchema } from "../components/strategies/schemaDefaults";
+import { useStrategyTypes } from "../components/strategies/useStrategyTypes";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -79,6 +82,8 @@ interface BacktestMetrics {
   bars_tested: number;
   signals_generated: number;
   signals_rejected: number;
+  ending_balance: string;
+  total_commission_paid: string;
 }
 
 // Portfolio slot row state
@@ -94,6 +99,14 @@ const STRATEGY_OPTIONS = [
   { value: "stock_trend",        label: "Stock Trend" },
   { value: "bull_bear",          label: "Bull/Bear Regime" },
   { value: "intra_week_reversion", label: "Intra-Week Reversion" },
+  { value: "trend_pullback",     label: "Trend Pullback" },
+];
+
+const FEE_OPTIONS = [
+  { value: "legacy",      label: "Legacy ($1 per order)" },
+  { value: "ibkr_fixed",  label: "IBKR Fixed" },
+  { value: "ibkr_tiered", label: "IBKR Tiered" },
+  { value: "zero",        label: "None" },
 ];
 
 const RANGE_OPTIONS = [
@@ -111,10 +124,15 @@ export function Backtesting() {
 
   // ---- Single-strategy state ----
   const [symbol, setSymbol] = useState("AAPL");
-  const [fastPeriod, setFastPeriod] = useState(50);
-  const [slowPeriod, setSlowPeriod] = useState(200);
-  const [stopPct, setStopPct] = useState("0.03");
+  const { data: strategyTypes = [] } = useStrategyTypes();
+  const [strategyType, setStrategyType] = useState("moving_average");
+  // Edits on top of the selected type's schema defaults; reset when the type changes.
+  const [configEdits, setConfigEdits] = useState<Record<string, unknown>>({});
+  const selectedType = strategyTypes.find((t) => t.type === strategyType);
+  const config = { ...(selectedType ? defaultsFromSchema(selectedType.config_schema) : {}), ...configEdits };
   const [balance, setBalance] = useState("100000");
+  const [commissionPlan, setCommissionPlan] = useState("legacy");
+  const [compound, setCompound] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitErrorCode, setSubmitErrorCode] = useState<string | null>(null);
@@ -130,6 +148,8 @@ export function Backtesting() {
   const [nextSlotId, setNextSlotId] = useState(3);
   const [portBalance, setPortBalance] = useState("100000");
   const [portRange, setPortRange] = useState("5y");
+  const [portCommissionPlan, setPortCommissionPlan] = useState("legacy");
+  const [portCompound, setPortCompound] = useState(false);
   const [portSubmitting, setPortSubmitting] = useState(false);
   const [portError, setPortError] = useState<string | null>(null);
   const [portJob, setPortJob] = useState<BacktestJob | null>(null);
@@ -173,9 +193,11 @@ export function Backtesting() {
     try {
       const res = await api.post<BacktestJob>("/backtesting/run", {
         symbol: symbol.toUpperCase(),
-        strategy_type: "moving_average",
-        strategy_config: { fast_period: fastPeriod, slow_period: slowPeriod, stop_loss_pct: stopPct },
+        strategy_type: strategyType,
+        strategy_config: config,
         account_balance: balance,
+        commission_plan: commissionPlan,
+        compound,
       });
       if (res.error) { setSubmitError(res.error.message); setSubmitErrorCode(res.error.code); return; }
       if (res.data) setJob(res.data);
@@ -200,6 +222,8 @@ export function Backtesting() {
         })),
         account_balance: portBalance,
         range: portRange,
+        commission_plan: portCommissionPlan,
+        compound: portCompound,
       });
       if (res.error) { setPortError(res.error.message); return; }
       if (res.data) setPortJob(res.data);
@@ -278,43 +302,52 @@ export function Backtesting() {
                   value={balance}
                   onChange={(e) => setBalance(e.target.value)}
                   className={inputCls}
-                  min={1000}
-                  required
-                />
-              </Field>
-              <Field label="Fast MA Period">
-                <input
-                  type="number"
-                  value={fastPeriod}
-                  onChange={(e) => setFastPeriod(parseInt(e.target.value, 10))}
-                  className={inputCls}
                   min={1}
-                  max={slowPeriod - 1}
                   required
                 />
               </Field>
-              <Field label="Slow MA Period">
-                <input
-                  type="number"
-                  value={slowPeriod}
-                  onChange={(e) => setSlowPeriod(parseInt(e.target.value, 10))}
+              <Field label="Strategy">
+                <select
+                  value={strategyType}
+                  onChange={(e) => { setStrategyType(e.target.value); setConfigEdits({}); }}
                   className={inputCls}
-                  min={fastPeriod + 1}
-                  required
-                />
+                >
+                  {(strategyTypes.length ? strategyTypes.map((t) => t.type) : STRATEGY_OPTIONS.map((o) => o.value)).map((t) => (
+                    <option key={t} value={t}>{t}</option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="Fees">
+                <select value={commissionPlan} onChange={(e) => setCommissionPlan(e.target.value)} className={inputCls}>
+                  {FEE_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>{o.label}</option>
+                  ))}
+                </select>
               </Field>
             </div>
+            {selectedType && (
+              <SchemaForm
+                schema={selectedType.config_schema}
+                value={config}
+                symbols={[]}
+                onChange={setConfigEdits}
+                disabled={submitting}
+              />
+            )}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-              <Field label='Stop Loss % (e.g. "0.03")'>
-                <input
-                  value={stopPct}
-                  onChange={(e) => setStopPct(e.target.value)}
-                  className={inputCls}
-                  placeholder="0.03"
-                  required
-                />
-              </Field>
-              <div className="flex items-end">
+              <label className="flex items-center gap-2 text-xs text-gray-400">
+                <input type="checkbox" checked={compound} onChange={(e) => setCompound(e.target.checked)} />
+                Compound gains
+              </label>
+              <button
+                type="button"
+                onClick={() => { setBalance("100"); setCommissionPlan("ibkr_fixed"); setCompound(true); }}
+                className="px-3 py-1 text-xs font-medium text-blue-400 hover:text-blue-300 border border-blue-800 hover:border-blue-600 rounded transition-colors"
+                title="$100 account, IBKR Fixed fees, gains compounded"
+              >
+                Small account preset
+              </button>
+              <div className="flex items-end md:col-start-4">
                 <button
                   type="submit"
                   disabled={submitting || isRunning(job)}
@@ -407,10 +440,21 @@ export function Backtesting() {
                   value={portBalance}
                   onChange={(e) => setPortBalance(e.target.value)}
                   className={inputCls}
-                  min={1000}
+                  min={1}
                   required
                 />
               </Field>
+              <Field label="Fees">
+                <select value={portCommissionPlan} onChange={(e) => setPortCommissionPlan(e.target.value)} className={inputCls}>
+                  {FEE_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>{o.label}</option>
+                  ))}
+                </select>
+              </Field>
+              <label className="flex items-end gap-2 pb-2 text-xs text-gray-400">
+                <input type="checkbox" checked={portCompound} onChange={(e) => setPortCompound(e.target.checked)} />
+                Compound gains
+              </label>
               <Field label="Historical Range">
                 <select
                   value={portRange}
@@ -422,7 +466,7 @@ export function Backtesting() {
                   ))}
                 </select>
               </Field>
-              <div className="flex items-end md:col-span-2">
+              <div className="flex items-end md:col-span-4">
                 <button
                   type="submit"
                   disabled={portSubmitting || isRunning(portJob) || slots.some((s) => !s.symbol)}
@@ -532,6 +576,8 @@ function PortfolioResults({ result }: { result: PortfolioBacktestResult }) {
           <MetricCard label="Trades" value={`${m.win_count}W / ${m.loss_count}L`} />
           <MetricCard label="Max Drawdown" value={`${m.max_drawdown_pct.toFixed(2)}%`} valueClass="text-red-400" />
           <MetricCard label="Sharpe Ratio" value={m.sharpe_ratio.toFixed(3)} />
+          <MetricCard label="Ending Balance" value={`$${parseFloat(m.ending_balance).toLocaleString("en-US", { minimumFractionDigits: 2 })}`} />
+          <MetricCard label="Fees Paid" value={`$${parseFloat(m.total_commission_paid).toFixed(2)}`} />
           <MetricCard label="Signals" value={`${m.signals_generated} generated`} />
           <MetricCard label="Rejected" value={`${m.signals_rejected} by risk`} valueClass={m.signals_rejected > 0 ? "text-amber-400" : "text-gray-200"} />
         </div>
@@ -669,6 +715,8 @@ function BacktestResults({ result }: { result: BacktestResult }) {
           <MetricCard label="Win Rate" value={`${m.win_rate_pct.toFixed(1)}%`} valueClass={m.win_rate_pct >= 50 ? "text-emerald-400" : "text-amber-400"} />
           <MetricCard label="Trades" value={`${m.win_count}W / ${m.loss_count}L`} />
           <MetricCard label="Avg Trade P&L" value={`$${parseFloat(m.avg_trade_pnl).toFixed(2)}`} />
+          <MetricCard label="Ending Balance" value={`$${parseFloat(m.ending_balance).toLocaleString("en-US", { minimumFractionDigits: 2 })}`} />
+          <MetricCard label="Fees Paid" value={`$${parseFloat(m.total_commission_paid).toFixed(2)}`} />
           <MetricCard label="Max Drawdown" value={`${m.max_drawdown_pct.toFixed(2)}%`} valueClass="text-red-400" />
           <MetricCard label="Sharpe Ratio" value={m.sharpe_ratio.toFixed(3)} />
           <MetricCard label="Bars Tested" value={String(m.bars_tested)} />

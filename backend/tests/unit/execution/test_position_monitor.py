@@ -45,6 +45,7 @@ def _track(
     stop="190",
     tp="220",
     opened_at: datetime | None = None,
+    exit_deadline: datetime | None = None,
 ) -> uuid.UUID:
     trade_id = uuid.uuid4()
     monitor._tracked[trade_id] = _TrackedTrade(
@@ -56,6 +57,7 @@ def _track(
         initial_stop_loss_price=Decimal(stop),
         take_profit_price=Decimal(tp),
         opened_at=opened_at or datetime.now(UTC),
+        exit_deadline=exit_deadline,
     )
     return trade_id
 
@@ -205,11 +207,47 @@ async def test_sweep_gated_by_market_open() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Time exit (day trades)
+# ---------------------------------------------------------------------------
+
+
+async def test_time_exit_closes_trade_past_its_deadline(monitor: PositionMonitor) -> None:
+    trade_id = _track(monitor, exit_deadline=datetime.now(UTC) - timedelta(minutes=1))
+    await monitor._sweep_time_exits()
+    await _settle(monitor)
+    monitor._order_manager.close_position.assert_awaited_once_with(trade_id, "TIME_EXIT")
+
+
+async def test_time_exit_leaves_future_and_no_deadline_trades(monitor: PositionMonitor) -> None:
+    _track(monitor, exit_deadline=datetime.now(UTC) + timedelta(hours=1))
+    _track(monitor)
+    await monitor._sweep_time_exits()
+    assert not monitor._tasks
+
+
+async def test_time_exit_waits_for_market_open() -> None:
+    closed = _monitor(is_market_open=lambda: False)
+    _track(closed, exit_deadline=datetime.now(UTC) - timedelta(minutes=1))
+    await closed._sweep_time_exits()
+    assert not closed._tasks
+
+
+async def test_resync_tracks_the_exit_deadline(monkeypatch) -> None:
+    monitor = _monitor()
+    monitor._session_factory = _Session
+    deadline = datetime.now(UTC)
+    trade = _db_trade(exit_deadline=deadline)
+    _patch_open_trades(monkeypatch, [trade])
+    await monitor._resync()
+    assert monitor._tracked[trade.id].exit_deadline == deadline
+
+
+# ---------------------------------------------------------------------------
 # DB resync
 # ---------------------------------------------------------------------------
 
 
-def _db_trade(trade_id=None, symbol="AAPL", entry="200", stop="190", tp="220"):
+def _db_trade(trade_id=None, symbol="AAPL", entry="200", stop="190", tp="220", exit_deadline=None):
     return SimpleNamespace(
         id=trade_id or uuid.uuid4(),
         symbol=symbol,
@@ -218,6 +256,7 @@ def _db_trade(trade_id=None, symbol="AAPL", entry="200", stop="190", tp="220"):
         stop_loss_price=Decimal(stop),
         take_profit_price=Decimal(tp),
         executed_at=datetime.now(UTC),
+        exit_deadline=exit_deadline,
     )
 
 

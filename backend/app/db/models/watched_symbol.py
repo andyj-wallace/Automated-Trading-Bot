@@ -11,8 +11,6 @@ from app.db.base import Base
 class WatchedSymbol(Base):
     """
     A ticker symbol the system actively tracks and may trade.
-
-    Columns match design.md § watched_symbols.
     """
 
     __tablename__ = "watched_symbols"

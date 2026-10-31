@@ -32,6 +32,9 @@ Stale-trade timeout:
   (reason "STALE_TIMEOUT", stored as exit_reason=STALE_TIMEOUT). Set
   stale_trade_max_days=None to disable.
 
+Time exit (day trades): a trade with an exit_deadline is closed with reason "TIME_EXIT" once
+the deadline passes while the market is open. Checked every 30 seconds.
+
 Price-feed watchdog: while the market is open, a tracked symbol with no recent
 tick raises a PRICE_FEED_STALE system alert (once per symbol per day).
 
@@ -74,6 +77,7 @@ class _TrackedTrade:
     initial_stop_loss_price: Decimal
     take_profit_price: Decimal
     opened_at: datetime
+    exit_deadline: datetime | None = None
 
 
 class PositionMonitor:
@@ -105,6 +109,7 @@ class PositionMonitor:
         resync_interval_seconds: float = 5.0,
         watchdog_interval_seconds: float = 30.0,
         price_stale_seconds: int = 120,
+        time_exit_interval_seconds: float = 30.0,
     ) -> None:
         self._cache = cache
         self._session_factory = session_factory
@@ -125,6 +130,7 @@ class PositionMonitor:
         self._resync_interval_seconds = resync_interval_seconds
         self._watchdog_interval_seconds = watchdog_interval_seconds
         self._price_stale_seconds = price_stale_seconds
+        self._time_exit_interval_seconds = time_exit_interval_seconds
         self._started_at: datetime | None = None
         self._stale_alerted: set[tuple[str, date]] = set()
 
@@ -158,6 +164,12 @@ class PositionMonitor:
                 self._watchdog_interval_seconds,
                 self._check_price_feed,
                 initial_delay=self._watchdog_interval_seconds,
+            ),
+            PeriodicTask(
+                "monitor_time_exit",
+                self._time_exit_interval_seconds,
+                self._sweep_time_exits,
+                initial_delay=self._time_exit_interval_seconds,
             ),
         ]
         if self._stale_trade_max_days is not None:
@@ -215,6 +227,7 @@ class PositionMonitor:
             initial_stop_loss_price=trade.stop_loss_price,
             take_profit_price=trade.take_profit_price,
             opened_at=trade.executed_at,
+            exit_deadline=trade.exit_deadline,
         )
 
     # ------------------------------------------------------------------
@@ -318,6 +331,29 @@ class PositionMonitor:
             )
             spawn(
                 self._close(tracked.trade_id, "STALE_TIMEOUT"),
+                name=f"close-{tracked.trade_id}",
+                registry=self._tasks,
+            )
+
+    async def _sweep_time_exits(self) -> None:
+        """Close day trades whose exit_deadline has passed; only while the market is open."""
+        if not self._is_market_open():
+            return
+        now = self._clock()
+        for tracked in list(self._tracked.values()):
+            if tracked.exit_deadline is None or tracked.exit_deadline > now:
+                continue
+            if tracked.trade_id in self._closing:
+                continue
+            self._closing.add(tracked.trade_id)
+            self._tracked.pop(tracked.trade_id, None)
+            system_logger.info(
+                "PositionMonitor: exit deadline reached — closing day trade",
+                extra={"trade_id": str(tracked.trade_id), "symbol": tracked.symbol,
+                       "exit_deadline": tracked.exit_deadline.isoformat()},
+            )
+            spawn(
+                self._close(tracked.trade_id, "TIME_EXIT"),
                 name=f"close-{tracked.trade_id}",
                 registry=self._tasks,
             )

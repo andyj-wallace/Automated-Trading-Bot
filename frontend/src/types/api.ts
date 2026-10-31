@@ -57,7 +57,8 @@ export type ExitReason =
   | "TAKE_PROFIT"
   | "MANUAL"
   | "STALE_TIMEOUT"
-  | "EXTERNAL";
+  | "EXTERNAL"
+  | "TIME_EXIT";
 
 export interface Trade {
   id: string;
@@ -76,6 +77,8 @@ export interface Trade {
   exit_reason: ExitReason | null;
   entry_fill_price: string | null;
   filled_quantity: string | null;
+  entry_commission: string | null;
+  exit_commission: string | null;
   current_stop_price: string | null;
   close_attempts: number;
   pnl: string | null;
@@ -180,6 +183,19 @@ export interface BrokerConnection {
   hint: string | null;
 }
 
+export interface GrowthModeStatus {
+  enabled: boolean;
+  active: boolean | null;
+  equity: string | null;
+  exit_equity: string;
+  progress_pct: string | null;
+  max_open_positions: number;
+  universe: string[];
+  commission_plan: string;
+  account_type: string;
+  capital_limit: string | null;
+}
+
 export interface TradingStatus {
   paused: boolean;
   market_open: boolean;
@@ -190,6 +206,7 @@ export interface TradingStatus {
   open_trade_count: number;
   circuit_breaker_halted: boolean;
   broker: BrokerConnection;
+  growth_mode: GrowthModeStatus;
 }
 
 export interface FlattenResult {

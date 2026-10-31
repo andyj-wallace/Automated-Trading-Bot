@@ -22,10 +22,12 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Override sqlalchemy.url with DATABASE_URL from the environment.
-database_url = os.environ.get("DATABASE_URL")
-if database_url:
-    config.set_main_option("sqlalchemy.url", database_url)
+# DATABASE_URL from the environment wins (CI, Docker); otherwise use the app's settings (backend/.env).
+if not (database_url := os.environ.get("DATABASE_URL")):
+    from app.config import get_settings  # noqa: E402
+
+    database_url = get_settings().database_url
+config.set_main_option("sqlalchemy.url", database_url)
 
 target_metadata = Base.metadata
 

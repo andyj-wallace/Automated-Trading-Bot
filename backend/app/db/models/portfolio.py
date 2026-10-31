@@ -13,8 +13,6 @@ class PortfolioSnapshot(Base):
 
     Stored in a TimescaleDB hypertable partitioned on `time`.
     The `time` column is the primary key — each snapshot is at a unique instant.
-
-    Columns match design.md § portfolio_snapshots.
     """
 
     __tablename__ = "portfolio_snapshots"

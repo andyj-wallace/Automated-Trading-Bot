@@ -27,6 +27,9 @@ _TAG_BUYING_POWER = "BuyingPower"
 _TAG_GROSS_POSITION_VALUE = "GrossPositionValue"
 _TAG_UNREALIZED_PNL = "UnrealizedPnL"
 _TAG_REALIZED_PNL = "RealizedPnL"
+_TAG_SETTLED_CASH = "SettledCash"
+_TAG_AVAILABLE_FUNDS = "AvailableFunds"
+_TAG_DAY_TRADES_REMAINING = "DayTradesRemaining"
 
 
 def _to_decimal(value: str | None) -> Decimal:
@@ -37,6 +40,15 @@ def _to_decimal(value: str | None) -> Decimal:
         return Decimal(str(value))
     except InvalidOperation:
         return Decimal("0")
+
+
+def _optional_decimal(value: str | None) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except InvalidOperation:
+        return None
 
 
 def map_account_summary(account_values: list[AccountValue]) -> AccountSummary:
@@ -62,6 +74,11 @@ def map_account_summary(account_values: list[AccountValue]) -> AccountSummary:
         unrealized_pnl=_to_decimal(tag_map.get(_TAG_UNREALIZED_PNL)),
         realized_pnl=_to_decimal(tag_map.get(_TAG_REALIZED_PNL)),
         currency="USD",
+        settled_cash=_optional_decimal(tag_map.get(_TAG_SETTLED_CASH)),
+        available_funds=_optional_decimal(tag_map.get(_TAG_AVAILABLE_FUNDS)),
+        day_trades_remaining=(
+            int(v) if (v := _optional_decimal(tag_map.get(_TAG_DAY_TRADES_REMAINING))) is not None else None
+        ),
     )
 
 
@@ -134,7 +151,21 @@ def map_price_bar(bar: BarData, bar_size: str) -> PriceBar:
         close=_to_decimal(str(bar.close)),
         volume=max(0, int(bar.volume)),  # IBKR returns -1 if unavailable
         bar_size=bar_size,
+        wap=_to_decimal(str(bar.average)) if (getattr(bar, "average", 0) or 0) > 0 else None,
     )
+
+
+_UNSET_FLOOR = 1e300  # IB's "unset" sentinel is 1.797e308
+
+
+def fills_commission(fills) -> Decimal:
+    """Sum of reported commissions; fills whose report hasn't arrived count as 0."""
+    total = Decimal("0")
+    for fill in fills:
+        value = getattr(getattr(fill, "commissionReport", None), "commission", 0) or 0
+        if 0 < value < _UNSET_FLOOR:
+            total += Decimal(str(value))
+    return total
 
 
 def map_order_result(trade_id: UUID, trade: Trade) -> OrderResult:
@@ -171,6 +202,7 @@ def map_order_result(trade_id: UUID, trade: Trade) -> OrderResult:
         avg_fill_price=avg_price,
         order_ref=trade.order.orderRef or "",
         error_message=error_message,
+        commission=fills_commission(getattr(trade, "fills", ())),
         timestamp=datetime.now(dt.UTC),
     )
 
@@ -199,5 +231,6 @@ def summarize_fills(order_ref: str, fills: list) -> OrderResult | None:
         filled_quantity=total,
         avg_fill_price=notional / total,
         order_ref=order_ref,
+        commission=fills_commission(matching),
         timestamp=datetime.now(dt.UTC),
     )

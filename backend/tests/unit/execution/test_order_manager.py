@@ -410,3 +410,42 @@ class TestOrderRetry:
     # the trade row directly), so its retry behavior is covered by the
     # integration suite instead: see TestOrderRetry in
     # tests/integration/test_layer17_e2e.py.
+
+
+# ---------------------------------------------------------------------------
+# P&L after commissions
+# ---------------------------------------------------------------------------
+
+
+async def test_finalize_close_subtracts_commissions_from_pnl():
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.brokers.base import OrderResult
+    from app.db.models.trade import ExitReason, TradeDirection, TradeStatus
+
+    trade = SimpleNamespace(
+        status=TradeStatus.CLOSING, direction=TradeDirection.BUY, entry_fill_price=Decimal("25.00"),
+        entry_price=Decimal("25.00"), filled_quantity=Decimal("2"), quantity=Decimal("2"),
+        entry_commission=Decimal("0.36"),
+    )
+    repo = MagicMock()
+    repo.get_by_id = AsyncMock(return_value=trade)
+    repo.finish_close = AsyncMock(return_value=SimpleNamespace(
+        symbol="SCHB", strategy_id=None, account_balance_at_entry=Decimal("100"),
+    ))
+    session = MagicMock()
+    session.commit = AsyncMock()
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+    fill = OrderResult(
+        trade_id=uuid.uuid4(), broker_order_id="9", status="FILLED", filled_quantity=Decimal("2"),
+        avg_fill_price=Decimal("26.00"), commission=Decimal("0.36"), timestamp=datetime.now(UTC),
+    )
+    om = OrderManager(MockBroker(), RiskManager(), session_factory=lambda: session)
+    with patch("app.db.repositories.trade_repo.TradeRepo", return_value=repo):
+        assert await om.finalize_close(uuid.uuid4(), ExitReason.TAKE_PROFIT, fill, Decimal("26"))
+    args, kwargs = repo.finish_close.call_args
+    assert args[2] == Decimal("1.28")  # (26 - 25) * 2 - 0.36 - 0.36
+    assert kwargs["exit_commission"] == Decimal("0.36")

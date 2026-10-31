@@ -12,6 +12,7 @@ import pytest
 
 from app.brokers.base import PriceBar
 from app.core.market_calendar import ET
+from app.core.risk.growth import GrowthPolicy
 from app.core.risk.manager import RiskRejectionError
 from app.core.strategy_engine.base import Signal
 from app.core.strategy_engine.scheduler import (
@@ -70,9 +71,12 @@ class FakeTradeRepo:
         return FakeTradeRepo.active
 
 
-def _price_json(price="150", age=0) -> str:
+def _price_json(price="150", age=0, bid=None, ask=None) -> str:
     stamp = datetime.now(UTC) - timedelta(seconds=age)
-    return json.dumps({"price": price, "timestamp": stamp.isoformat()})
+    payload = {"price": price, "timestamp": stamp.isoformat()}
+    if bid is not None:
+        payload.update(bid=bid, ask=ask)
+    return json.dumps(payload)
 
 
 def _make(clock_now=MONDAY_11AM, **kwargs):
@@ -104,6 +108,7 @@ def _make(clock_now=MONDAY_11AM, **kwargs):
 def _buy_strategy(quantity=10):
     strategy = AsyncMock()
     strategy.required_extra_symbols = lambda: []
+    strategy.needs_intraday = False
     strategy.generate_signal = AsyncMock(
         return_value=Signal(
             symbol="AAPL",
@@ -361,3 +366,111 @@ async def test_three_consecutive_failed_cycles_publish_scheduler_failing():
     await sched.stop()
     alerts = [m for m in published if m["payload"]["alert_type"] == "SCHEDULER_FAILING"]
     assert len(alerts) == 1
+
+
+# --- growth mode: spread, liquidity, effective equity (I2) -----------------
+
+
+@pytest.mark.parametrize(
+    ("bid", "ask", "claimed"),
+    [("100.00", "100.50", False), ("100.00", "100.01", True), (None, None, True)],
+)
+async def test_spread_gate(bid, ask, claimed):
+    sched = _make(max_spread_bps=Decimal("20"))
+    sched._cache.get = AsyncMock(return_value=_price_json(bid=bid, ask=ask))
+    await _run(sched, _buy_strategy())
+    assert bool(sched._signals.claims) is claimed
+
+
+async def test_low_liquidity_is_ineligible():
+    sched = _make(min_avg_dollar_volume=Decimal(10**9))
+    await _run(sched, _buy_strategy())
+    assert sched._signals.outcomes[0][0] == "INELIGIBLE"
+    sched._order_manager.submit_order.assert_not_awaited()
+
+
+async def test_growth_mode_alert_only_on_change():
+    growth = GrowthPolicy(True, Decimal("2000"), 2, frozenset())
+    sched = _make(growth=growth)
+    sched._load_enabled_strategies = AsyncMock(return_value=[])
+    with patch("app.core.strategy_engine.scheduler.publish_system_alert", new=AsyncMock()) as alert:
+        for equity in ("100", "100", "3000"):
+            sched._broker.get_account_summary = AsyncMock(
+                return_value=SimpleNamespace(net_liquidation=Decimal(equity))
+            )
+            await sched._run_cycle()
+    alert.assert_awaited_once()
+    assert alert.await_args.args[1] == "GROWTH_MODE_CHANGED"
+
+
+async def test_capital_limit_sizes_from_limit():
+    sched = _make(capital_limit=Decimal("100"))
+    sched._broker.get_account_summary = AsyncMock(
+        return_value=SimpleNamespace(net_liquidation=Decimal("100000"))
+    )
+    strategy = _buy_strategy(quantity=None)
+    sched._registry = SimpleNamespace(is_registered=lambda _t: True, build=lambda _t, _c: strategy)
+    sched._load_enabled_strategies = AsyncMock(
+        return_value=[SimpleNamespace(id=STRATEGY_ID, type="x", config={"symbols": ["AAPL"]})]
+    )
+    await sched._run_cycle()
+    assert strategy.calculate_position_size.await_args.args[0].account_balance == Decimal("100")
+
+
+# --- intraday bars -----------------------------------------------------------
+
+
+def _intraday_bar(hour: int, minute: int) -> PriceBar:
+    return PriceBar(
+        timestamp=datetime(2026, 10, 19, hour, minute, tzinfo=ET).astimezone(UTC),
+        open=Decimal("100"), high=Decimal("101"), low=Decimal("99"), close=Decimal("100"),
+        volume=1000, bar_size="5 mins",
+    )
+
+
+async def test_intraday_bars_reach_strategy_and_cache_per_bucket():
+    sched = _make()
+    strategy = _buy_strategy()
+    strategy.needs_intraday = True
+    # one bar from today, one stale bar from the previous session (dropped)
+    stale = _intraday_bar(10, 0).model_copy(update={"timestamp": datetime(2026, 10, 16, 15, 0, tzinfo=UTC)})
+    sched._broker.get_intraday_bars = AsyncMock(return_value=[stale, _intraday_bar(10, 0)])
+
+    await _run(sched, strategy)
+    await _run(sched, strategy)  # same 5-minute bucket: no second broker call
+
+    sched._broker.get_intraday_bars.assert_awaited_once_with("AAPL")
+    seen = strategy.generate_signal.await_args.args[0]
+    assert [b.timestamp for b in seen.intraday_bars] == [_intraday_bar(10, 0).timestamp]
+
+
+async def test_new_bucket_fetches_again():
+    clock = {"now": MONDAY_11AM}
+    sched = _make()
+    sched._clock = lambda: clock["now"]
+    sched._broker.get_intraday_bars = AsyncMock(return_value=[_intraday_bar(10, 0)])
+    await sched._get_intraday_bars("AAPL")
+    clock["now"] = MONDAY_11AM + timedelta(minutes=5)
+    await sched._get_intraday_bars("AAPL")
+    assert sched._broker.get_intraday_bars.await_count == 2
+
+
+async def test_no_intraday_bars_skips_strategy():
+    sched = _make()
+    strategy = _buy_strategy()
+    strategy.needs_intraday = True
+    sched._broker.get_intraday_bars = AsyncMock(return_value=[])
+    await _run(sched, strategy)
+    strategy.generate_signal.assert_not_awaited()
+
+
+async def test_exit_deadline_flows_into_trade_request():
+    sched = _make()
+    strategy = _buy_strategy()
+    deadline = datetime(2026, 10, 19, 15, 55, tzinfo=ET)
+    strategy.generate_signal.return_value = strategy.generate_signal.return_value.model_copy(
+        update={"exit_deadline": deadline}
+    )
+    await _run(sched, strategy)
+    request = sched._order_manager.submit_order.await_args.args[0]
+    assert request.exit_deadline == deadline

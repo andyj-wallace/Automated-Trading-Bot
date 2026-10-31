@@ -539,3 +539,44 @@ class TestRegistration:
     def test_registered_class_is_composite_strategy(self):
         from app.core.strategy_engine.registry import registry
         assert registry._classes["composite"] is CompositeStrategy
+
+
+def test_required_extra_symbols_union():
+    import app.core.strategy_engine.bull_bear  # noqa: F401
+    import app.core.strategy_engine.trend_pullback  # noqa: F401
+
+    composite = CompositeStrategy({"strategies": [
+        {"type": "bull_bear", "config": {}},
+        {"type": "trend_pullback", "config": {"regime_symbol": "QQQ"}},
+    ]})
+    assert composite.required_extra_symbols() == ["SPY", "QQQ"]
+
+
+def test_required_extra_symbols_empty_without_regime_subs():
+    composite = CompositeStrategy({"strategies": [
+        {"type": "mean_reversion", "config": {}}, {"type": "mean_reversion", "config": {}},
+    ]})
+    assert composite.required_extra_symbols() == []
+
+
+def test_composite_carries_intraday_flag_and_earliest_deadline():
+    from datetime import timedelta
+
+    import app.core.strategy_engine.vwap_reclaim  # noqa: F401
+    from app.core.strategy_engine.base import Signal
+
+    composite = CompositeStrategy({"strategies": [
+        {"type": "mean_reversion", "config": {}}, {"type": "vwap_reclaim", "config": {}},
+    ]})
+    assert composite.needs_intraday is True
+    assert CompositeStrategy({"strategies": [{"type": "mean_reversion", "config": {}}]}).needs_intraday is False
+
+    now = datetime.now(UTC)
+    late, early = now + timedelta(hours=2), now + timedelta(hours=1)
+    signals = [
+        Signal(symbol="X", action="BUY", entry_price=Decimal("10"), stop_loss_price=Decimal("9"),
+               timestamp=now, exit_deadline=late),
+        Signal(symbol="X", action="BUY", entry_price=Decimal("10"), stop_loss_price=Decimal("9"),
+               timestamp=now, exit_deadline=early),
+    ]
+    assert CompositeStrategy._combine_agreeing_signals(signals).exit_deadline == early

@@ -10,6 +10,8 @@ from decimal import Decimal
 
 from app.core import market_calendar
 from app.core.metrics.collector import MetricsCollector
+from app.core.risk.costs import PLANS, CostModel
+from app.core.risk.growth import GrowthPolicy, effective_equity
 from app.db.repositories.trade_repo import TradeRepo
 from app.monitoring.logger import system_logger
 
@@ -30,7 +32,13 @@ class DailySummaryJob:
         run_at: time,
         clock: Callable[[], datetime] = market_calendar.now_et,
         collector: MetricsCollector | None = None,
+        cost_model: CostModel | None = None,
+        growth: GrowthPolicy | None = None,
+        capital_limit: Decimal | None = None,
     ) -> None:
+        self._cost_model = cost_model
+        self._growth = growth
+        self._capital_limit = capital_limit
         self._broker = broker
         self._session_factory = session_factory
         self._cache = cache
@@ -80,9 +88,11 @@ class DailySummaryJob:
         lines = [
             f"Daily summary for {today.isoformat()}",
             "",
-            f"Realized P&L today: ${realized:.2f}",
+            f"Realized P&L today (after fees): ${realized:.2f}",
+            *self._fee_lines(opened, closed),
             f"Trades opened today: {len(opened)}",
             f"Trades closed today: {len(closed)}",
+            *await self._growth_lines(),
             "",
             f"Open positions: {len(open_trades)}",
         ]
@@ -111,6 +121,42 @@ class DailySummaryJob:
         self._alert_counts.clear()
         system_logger.info("DailySummaryJob: summary sent", extra={"date": today.isoformat()})
         return body
+
+    def _fee_lines(self, opened, closed) -> list[str]:
+        """Actual vs estimated fees; flags a COMMISSION_PLAN that does not match the real pricing."""
+        model = self._cost_model
+        if model is None:
+            return []
+        actual = sum((t.entry_commission or Decimal("0") for t in opened), Decimal("0")) + sum(
+            (t.exit_commission or Decimal("0") for t in closed), Decimal("0")
+        )
+        estimate = sum(
+            (model.commission(t.filled_quantity or t.quantity, t.entry_fill_price or t.entry_price)
+             for t in opened),
+            Decimal("0"),
+        ) + sum(
+            (model.commission(t.filled_quantity or t.quantity, t.exit_price) for t in closed),
+            Decimal("0"),
+        )
+        plan = next((name for name, p in PLANS.items() if p is model.plan), "custom")
+        lines = [f"Fees today: ${actual:.2f} actual vs ${estimate:.2f} estimated (COMMISSION_PLAN={plan})"]
+        if actual > 0 and abs(actual - estimate) > estimate * Decimal("0.25"):
+            lines.append(
+                "Fees differ from the COMMISSION_PLAN estimate by more than 25%: "
+                "check your IBKR pricing plan (Fixed or Tiered) and set COMMISSION_PLAN."
+            )
+        return lines
+
+    async def _growth_lines(self) -> list[str]:
+        if self._growth is None:
+            return []
+        try:
+            equity = effective_equity(await self._broker.get_account_summary(), self._capital_limit)
+        except Exception:
+            return []
+        state = "ON" if self._growth.is_active(equity) else "OFF"
+        pct = equity / self._growth.exit_equity * 100
+        return [f"Growth mode: {state}, equity ${equity:.2f} ({pct:.1f}% of the ${self._growth.exit_equity} exit level)"]
 
     async def _price(self, symbol: str) -> Decimal | None:
         try:

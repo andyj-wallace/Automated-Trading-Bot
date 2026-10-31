@@ -98,6 +98,7 @@ class CompositeStrategy(BaseStrategy):
                     f"Sub-strategy type {type_name!r} is not registered. "
                     "Ensure its module is imported before building a CompositeStrategy."
                 ) from exc
+        self.needs_intraday = any(s.needs_intraday for s in self._strategies)
 
     # ------------------------------------------------------------------
     # BaseStrategy interface
@@ -142,6 +143,14 @@ class CompositeStrategy(BaseStrategy):
             agreeing = [sig for sig in non_hold if sig.action == majority_action]
             return self._combine_agreeing_signals(agreeing)
         return self._hold(market_data.symbol)
+
+    def required_extra_symbols(self) -> list[str]:
+        """Union of every sub-strategy's extra symbols, first-seen order."""
+        seen: dict[str, None] = {}
+        for strategy in self._strategies:
+            for symbol in strategy.required_extra_symbols():
+                seen.setdefault(symbol.upper(), None)
+        return list(seen)
 
     async def calculate_position_size(self, risk_params: RiskParams) -> int:
         """Delegates to the first (primary) sub-strategy."""
@@ -229,6 +238,7 @@ class CompositeStrategy(BaseStrategy):
             tightest_stop = max(stops) if direction == "BUY" else min(stops)
 
         stop_was_overridden = tightest_stop != primary.stop_loss_price
+        deadlines = [sig.exit_deadline for sig in agreeing if sig.exit_deadline is not None]
 
         return Signal(
             symbol=primary.symbol,
@@ -240,6 +250,7 @@ class CompositeStrategy(BaseStrategy):
             timestamp=primary.timestamp,
             take_profit_price=None if stop_was_overridden else primary.take_profit_price,
             submit_stop_to_broker=primary.submit_stop_to_broker,
+            exit_deadline=min(deadlines) if deadlines else None,
         )
 
 

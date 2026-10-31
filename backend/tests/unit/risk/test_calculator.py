@@ -1,7 +1,7 @@
 """
 Unit tests for RiskCalculator (Layer 6.2).
 
-Covers the required cases per tasks.md:
+Covers:
   - Normal case
   - Tiny stop distance
   - Large account

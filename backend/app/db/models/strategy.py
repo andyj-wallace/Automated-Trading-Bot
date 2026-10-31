@@ -14,8 +14,6 @@ class TradingStrategy(Base):
 
     config (JSONB) holds strategy-specific parameters plus the `symbols` array,
     e.g. {"fast_period": 50, "slow_period": 200, "symbols": ["AAPL", "MSFT"]}.
-
-    Columns match design.md § trading_strategies.
     """
 
     __tablename__ = "trading_strategies"

@@ -14,6 +14,9 @@ noise.
 
 from decimal import Decimal
 
+from app.brokers.base import PriceBar
+from app.core.strategy_engine.indicators import atr, sma
+
 
 def min_separation_ok(faster: Decimal, slower: Decimal, min_separation_pct: Decimal) -> bool:
     """
@@ -31,3 +34,18 @@ def min_separation_ok(faster: Decimal, slower: Decimal, min_separation_pct: Deci
     if slower <= 0:
         return True
     return (faster - slower) / slower >= min_separation_pct
+
+
+def regime_ok(regime_bars: list[PriceBar], period: int) -> bool:
+    """True when the market barometer's last close is above its `period`-day SMA."""
+    if len(regime_bars) < period:
+        return False
+    closes = [b.close for b in regime_bars]
+    return closes[-1] > sma(closes, period)
+
+
+def volatility_ok(bars: list[PriceBar], period: int, min_pct: Decimal, max_pct: Decimal) -> bool:
+    """True when ATR as a fraction of the last close lies within [min_pct, max_pct]."""
+    if len(bars) < period + 1 or bars[-1].close <= 0:
+        return False
+    return min_pct <= atr(bars, period) / bars[-1].close <= max_pct

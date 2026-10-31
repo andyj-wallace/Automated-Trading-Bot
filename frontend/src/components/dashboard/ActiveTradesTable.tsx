@@ -23,7 +23,7 @@ const STATUS_STYLE: Record<TradeStatus, string> = {
   CANCELLED: "bg-gray-800 text-gray-500",
 };
 
-export function ActiveTradesTable() {
+export function ActiveTradesTable({ compact = false }: { compact?: boolean }) {
   const queryClient = useQueryClient();
   const tradesVersion = useLiveStore((s) => s.tradesVersion);
   const [closing, setClosing] = useState<Trade | null>(null);
@@ -66,7 +66,7 @@ export function ActiveTradesTable() {
     <div className="rounded-lg border border-gray-800 bg-gray-900 p-5 flex flex-col gap-4">
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">
-          Active Trades
+          {compact ? "Open positions" : "Active Trades"}
         </h2>
         <span className="text-xs text-gray-500">{trades.length} active</span>
       </div>
@@ -87,21 +87,21 @@ export function ActiveTradesTable() {
             <thead>
               <tr className="text-gray-500 border-b border-gray-800">
                 <th className="text-left pb-2 font-medium">Symbol</th>
-                <th className="text-left pb-2 font-medium">Status</th>
-                <th className="text-right pb-2 font-medium">Qty</th>
+                {!compact && <th className="text-left pb-2 font-medium">Status</th>}
+                {!compact && <th className="text-right pb-2 font-medium">Qty</th>}
                 <th className="text-right pb-2 font-medium">Entry</th>
-                <th className="text-right pb-2 font-medium">Stop</th>
-                <th className="text-right pb-2 font-medium">Target</th>
+                {!compact && <th className="text-right pb-2 font-medium">Stop</th>}
+                {!compact && <th className="text-right pb-2 font-medium">Target</th>}
                 <th className="text-right pb-2 font-medium">Last</th>
                 <th className="text-right pb-2 font-medium">Unrealized</th>
-                <th className="text-right pb-2 font-medium">Risk $</th>
-                <th className="text-right pb-2 font-medium">Opened</th>
+                {!compact && <th className="text-right pb-2 font-medium">Risk $</th>}
+                {!compact && <th className="text-right pb-2 font-medium">Opened</th>}
                 <th className="pb-2" />
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-800/50">
               {trades.map((trade) => (
-                <TradeRow key={trade.id} trade={trade} onClose={setClosing} />
+                <TradeRow key={trade.id} trade={trade} onClose={setClosing} compact={compact} />
               ))}
             </tbody>
           </table>
@@ -134,9 +134,11 @@ function money(v: string | number): string {
 function TradeRow({
   trade,
   onClose,
+  compact,
 }: {
   trade: Trade;
   onClose: (t: Trade) => void;
+  compact: boolean;
 }) {
   const last = useLiveStore((s) => s.prices[trade.symbol.toUpperCase()]?.price);
   const entry = Number(trade.entry_fill_price ?? trade.entry_price);
@@ -150,17 +152,23 @@ function TradeRow({
   return (
     <tr className="hover:bg-gray-800/30 transition-colors">
       <td className="py-2 font-medium text-gray-200">{trade.symbol}</td>
+      {!compact && (
       <td className="py-2">
         <span className={`px-1.5 py-0.5 rounded ${STATUS_STYLE[trade.status]}`}>
           {trade.status}
         </span>
       </td>
-      <td className="py-2 text-right text-gray-300">{qty}</td>
+      )}
+      {!compact && <td className="py-2 text-right text-gray-300">{qty}</td>}
       <td className="py-2 text-right text-gray-300">{money(entry)}</td>
-      <td className="py-2 text-right text-gray-400">
-        {money(trade.current_stop_price ?? trade.stop_loss_price)}
-      </td>
-      <td className="py-2 text-right text-gray-400">{money(trade.take_profit_price)}</td>
+      {!compact && (
+        <>
+          <td className="py-2 text-right text-gray-400">
+            {money(trade.current_stop_price ?? trade.stop_loss_price)}
+          </td>
+          <td className="py-2 text-right text-gray-400">{money(trade.take_profit_price)}</td>
+        </>
+      )}
       <td className="py-2 text-right text-gray-300">
         {last !== undefined ? money(last) : "—"}
       </td>
@@ -177,8 +185,12 @@ function TradeRow({
           ? "—"
           : `${unrealized >= 0 ? "+" : "-"}${money(Math.abs(unrealized))}`}
       </td>
-      <td className="py-2 text-right text-amber-400">{money(trade.risk_amount)}</td>
-      <td className="py-2 text-right text-gray-500">{formatDuration(trade.executed_at)}</td>
+      {!compact && (
+        <>
+          <td className="py-2 text-right text-amber-400">{money(trade.risk_amount)}</td>
+          <td className="py-2 text-right text-gray-500">{formatDuration(trade.executed_at)}</td>
+        </>
+      )}
       <td className="py-2 pl-2 text-right">
         {trade.status === "OPEN" && (
           <button

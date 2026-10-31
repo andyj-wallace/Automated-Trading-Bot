@@ -439,3 +439,21 @@ class TestUtilityFunctions:
         expected = Decimal(str(math.sqrt(6.75)))
         # Allow ±0.0001 tolerance
         assert abs(result - expected) < Decimal("0.0001")
+
+
+# ---------------------------------------------------------------------------
+# Range-only filter (J4)
+# ---------------------------------------------------------------------------
+
+
+async def test_max_trend_pct_holds_when_mean_drifted():
+    # Mean of the last 4 closes is 8.5, three bars ago it was 10: a 15% drift.
+    data = _market(_buy_cross_closes())
+    assert (await _strategy().generate_signal(data)).action == "BUY"
+    assert (await _strategy(max_trend_pct="0.01", trend_lookback=3).generate_signal(data)).action == "HOLD"
+    assert (await _strategy(max_trend_pct="0.5", trend_lookback=3).generate_signal(data)).action == "BUY"
+
+
+async def test_max_trend_pct_holds_without_enough_bars():
+    data = _market(_buy_cross_closes())
+    assert (await _strategy(max_trend_pct="0.5", trend_lookback=10).generate_signal(data)).action == "HOLD"

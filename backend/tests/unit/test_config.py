@@ -71,3 +71,23 @@ def test_gateway_restart_time_rejects_garbage(monkeypatch):
     monkeypatch.setenv("IB_AUTO_RESTART_TIME", "7pm")
     with pytest.raises(ValidationError):
         _settings()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("COMMISSION_PLAN", "bogus"),
+        ("ACCOUNT_TYPE", "bogus"),
+        ("MAX_BREAKEVEN_WIN_RATE", "1"),
+        ("GROWTH_MAX_OPEN_POSITIONS", "0"),
+    ],
+)
+def test_growth_settings_reject_bad_values(monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValidationError):
+        _settings()
+
+
+def test_growth_universe_is_normalized(monkeypatch):
+    monkeypatch.setenv("GROWTH_UNIVERSE", '[" schb"]')
+    assert _settings().growth_universe == ["SCHB"]

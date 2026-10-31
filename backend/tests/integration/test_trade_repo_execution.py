@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest_asyncio
@@ -100,3 +101,35 @@ async def test_finish_close_is_atomic(factory):
     assert done is not None and done.status == TradeStatus.CLOSED
     assert done.exit_order_id == "9" and done.closed_at is not None
     assert again is None
+
+
+async def test_commissions_persist(factory):
+    tid = await _make_open(factory)
+    async with factory() as s:
+        repo = TradeRepo(s)
+        await repo.record_entry_fill(tid, "1", Decimal("200.5"), Decimal("4"), commission=Decimal("0.36"))
+        await repo.begin_close(tid, ExitReason.TAKE_PROFIT)
+        await repo.finish_close(tid, Decimal("210"), Decimal("1"), "2", exit_commission=Decimal("0.4"))
+        await s.commit()
+    async with factory() as s:
+        t = await TradeRepo(s).get_by_id(tid)
+    assert (t.entry_commission, t.exit_commission) == (Decimal("0.36"), Decimal("0.4"))
+
+
+async def test_exit_deadline_and_time_exit_persist(factory):
+    tid = uuid.uuid4()
+    deadline = datetime(2026, 10, 19, 19, 55, tzinfo=UTC)
+    async with factory() as s:
+        repo = TradeRepo(s)
+        await repo.create(
+            trade_id=tid, symbol="SCHB", direction=TradeDirection.BUY, quantity=Decimal("1"),
+            entry_price=Decimal("50"), stop_loss_price=Decimal("49"), take_profit_price=Decimal("52"),
+            reward_to_risk_ratio=Decimal("2"), risk_amount=Decimal("1"),
+            account_balance_at_entry=Decimal("100"), exit_deadline=deadline,
+        )
+        await repo.update_status(tid, TradeStatus.OPEN)
+        await repo.begin_close(tid, ExitReason.TIME_EXIT)
+        await s.commit()
+    async with factory() as s:
+        t = await TradeRepo(s).get_by_id(tid)
+    assert t.exit_deadline == deadline and t.exit_reason == ExitReason.TIME_EXIT

@@ -28,6 +28,9 @@ class AccountSummary(BaseModel):
     unrealized_pnl: Decimal
     realized_pnl: Decimal
     currency: str = "USD"
+    settled_cash: Decimal | None = None       # spendable without a good-faith violation (cash accounts)
+    available_funds: Decimal | None = None
+    day_trades_remaining: int | None = None   # IBKR: -1 means unlimited
 
 
 class Position(BaseModel):
@@ -61,6 +64,7 @@ class OrderResult(BaseModel):
     avg_fill_price: Decimal
     order_ref: str = ""
     error_message: str | None = None
+    commission: Decimal = Decimal("0")
     timestamp: datetime
 
 
@@ -84,6 +88,7 @@ class PriceBar(BaseModel):
     close: Decimal
     volume: int
     bar_size: str = "1 day"
+    wap: Decimal | None = None  # volume-weighted average price of the bar, when the broker gives it
 
 
 class BrokerConnectionInfo(BaseModel):
@@ -123,6 +128,10 @@ class BaseBroker(ABC):
     @abstractmethod
     def is_connected(self) -> bool:
         """Return True if currently connected."""
+
+    async def get_intraday_bars(self, symbol: str) -> list[PriceBar]:
+        """Today's completed 5-minute bars (regular hours); brokers without them return []."""
+        return []
 
     def connection_info(self) -> BrokerConnectionInfo:
         """Connection state for operators; brokers with richer state override this."""

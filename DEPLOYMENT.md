@@ -17,6 +17,7 @@ The `ib-gateway` container logs in by itself (IBC, inside the image, types the p
    # (the paper account's own login), VNC_PASSWORD, IB_AUTO_RESTART_TIME, notification settings
    chmod 600 .env.prod
    ```
+   The paper login differs from your main IBKR login. Find or reset it in Client Portal → Settings → Paper Trading Account.
 2. Create the UI password file (never commit it):
    ```bash
    mkdir -p deploy/nginx
@@ -109,7 +110,13 @@ The Gateway image is pinned (`ghcr.io/gnzsnz/ib-gateway:10.50.1f`). IBC, the aut
 - Backend unhealthy: `docker compose -f docker-compose.prod.yml logs backend`. Look for the broker connection, migration errors, or the single-instance lock (another instance running).
 - Broker `reconnecting` or `down` (dashboard banner, `scripts/bot.sh status`): follow the "What to do" line; usually the weekly approval (section 2).
 - Broker `account_mismatch`: the Gateway is logged into a non-paper account. Put the paper account's username in `IBKR_USERNAME`.
-- `Connection refused` to the Gateway: it is still logging in or waiting for the approval (section 2).
+- `Connection refused` to the Gateway: it is still logging in or waiting for the approval (section 2). `docker compose logs ib-gateway` shows where the login is; `nc -zv localhost 4002` checks the port in development.
+- "Port 4002 is already allocated": the native Gateway app is still running. Quit it.
+- Connected, then dropped straight away: another program is using the same `IBKR_CLIENT_ID`. Stop it or give it a different number.
+- Disconnected around 00:15-01:45 ET: IBKR's nightly maintenance. It reconnects by itself.
+- No approval request on your phone: check IBKR Mobile's notifications, or approve from the Client Portal website.
+- Orders rejected on the native Gateway: uncheck "Read-Only API" in Configure → Settings → API → Settings.
+- "No security definition has been found": the symbol doesn't exist on IBKR as a US stock.
 - Auto-login stops working (for example after a Gateway image bump; IBC is retired):
   1. Log in by hand over VNC (section 2).
   2. Run the native Gateway instead. Install it for the host OS from IBKR's **stable** channel (the `ibgateway-latest-*` installers in the repo folder are the "latest" channel and are gitignored). Log in, set the API socket port to `4002`, uncheck "Read-Only API" and "Allow connections from localhost only", and add `host.docker.internal` and `127.0.0.1` to Trusted IPs. In `docker-compose.prod.yml`, delete the `ib-gateway` service, set `IBKR_HOST: host.docker.internal` and `IBKR_PORT: "4002"` on `backend`, and drop `ib-gateway` from its `depends_on`.

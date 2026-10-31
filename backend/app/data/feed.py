@@ -132,7 +132,12 @@ class MarketDataFeed:
             await self._cache.set(
                 _PRICE_KEY.format(ticker=symbol),
                 json.dumps(
-                    {"price": str(update.price), "timestamp": update.timestamp.isoformat()}
+                    {
+                        "price": str(update.price),
+                        "bid": str(update.bid) if update.bid is not None else None,
+                        "ask": str(update.ask) if update.ask is not None else None,
+                        "timestamp": update.timestamp.isoformat(),
+                    }
                 ),
             )
             change = str(update.day_change_pct) if update.day_change_pct is not None else None

@@ -1,6 +1,7 @@
 from datetime import datetime, time
 from decimal import Decimal
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -84,6 +85,41 @@ class Settings(BaseSettings):
     broker_protective_stops: bool = True
     reconcile_interval_seconds: float = 120
     ibkr_market_data_type: int = 1  # 1 live, 3 delayed (paper only)
+
+    # Small-account growth mode
+    commission_plan: Literal["ibkr_fixed", "ibkr_tiered", "zero"] = "ibkr_fixed"
+    slippage_bps: Decimal = Decimal("5")
+    max_breakeven_win_rate: Decimal = Decimal("0.45")
+    account_type: Literal["cash", "margin"] = "cash"
+    trading_capital_limit: Decimal | None = None
+    growth_mode_enabled: bool = True
+    growth_mode_exit_equity: Decimal = Decimal("2000")
+    growth_max_open_positions: int = 2
+    growth_universe: list[str] = [
+        "SPY", "QQQ", "IWM", "DIA", "SCHB", "SCHX", "SCHG",
+        "SCHD", "SCHF", "SPDW", "SPEM", "XLF", "EEM", "VWO",
+    ]
+    max_spread_bps: Decimal = Decimal("20")
+    min_avg_dollar_volume: Decimal = Decimal("20000000")
+
+    @field_validator("max_breakeven_win_rate")
+    @classmethod
+    def _check_breakeven_rate(cls, value: Decimal) -> Decimal:
+        if not Decimal("0") < value < Decimal("1"):
+            raise ValueError("max_breakeven_win_rate must be between 0 and 1 (exclusive)")
+        return value
+
+    @field_validator("growth_max_open_positions")
+    @classmethod
+    def _check_growth_positions(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("growth_max_open_positions must be >= 1")
+        return value
+
+    @field_validator("growth_universe")
+    @classmethod
+    def _normalize_universe(cls, value: list[str]) -> list[str]:
+        return [s.strip().upper() for s in value]
 
     @field_validator("max_portfolio_risk_pct")
     @classmethod

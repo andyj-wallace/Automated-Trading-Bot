@@ -1,13 +1,15 @@
 """
 RiskManager — hard gate that every trade must pass before reaching the broker.
 
-validate() is the sole entry point. It runs five sequential gates:
+validate() is the sole entry point. It runs these sequential gates:
   0. Circuit breaker: daily loss halt / per-strategy kill switch, if configured
      (DAILY_CIRCUIT_BREAKER_TRIPPED / STRATEGY_KILL_SWITCH_ACTIVE)
   1. Stop-loss present and valid (MISSING_STOP_LOSS / INVALID_STOP_LOSS)
   2. Position size within 1% rule (RISK_LIMIT_EXCEEDED)
   3. Reward-to-risk ratio meets minimum (INSUFFICIENT_REWARD)
   4. Aggregate portfolio exposure within configured limit (PORTFOLIO_RISK_LIMIT_EXCEEDED)
+  5. Growth mode: symbol must be in the allowlist, if configured (GROWTH_SYMBOL_NOT_ALLOWED)
+  6. Fees and slippage leave the trade worth taking, if configured (COSTS_TOO_HIGH)
 
 All rejections are logged to risk.log before raising RiskRejectionError.
 Approved trades return a ValidationResult that includes the confirmed
@@ -21,6 +23,7 @@ carries the only mutable state involved in validate().
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 from uuid import UUID
@@ -29,6 +32,8 @@ from pydantic import BaseModel
 
 from app.core.risk.calculator import RiskCalculator, RiskValidationError
 from app.core.risk.circuit_breaker import CircuitBreaker
+from app.core.risk.costs import CostModel, breakeven_win_rate
+from app.core.risk.growth import GrowthPolicy
 from app.monitoring.logger import risk_logger
 
 MAX_RISK_PCT = Decimal("0.01")  # 1% per-trade rule — never configurable
@@ -58,6 +63,7 @@ class TradeRequest(BaseModel):
     account_balance: Decimal
     take_profit_price: Decimal | None = None  # strategy suggestion; optional
     submit_stop_to_broker: bool = False  # opt-in per-strategy flag
+    exit_deadline: datetime | None = None  # day trades: close at this time if still open
 
 
 class ValidationResult(BaseModel):
@@ -126,6 +132,10 @@ class RiskManager:
         min_reward_to_risk: Decimal = Decimal("2.0"),
         max_portfolio_risk_pct: Decimal = Decimal("0.05"),
         circuit_breaker: CircuitBreaker | None = None,
+        *,
+        cost_model: CostModel | None = None,
+        max_breakeven_win_rate: Decimal = Decimal("0.45"),
+        growth: GrowthPolicy | None = None,
     ) -> None:
         if max_portfolio_risk_pct > MAX_PORTFOLIO_RISK_HARD_LIMIT:
             raise ValueError(
@@ -136,6 +146,9 @@ class RiskManager:
         self._min_reward_to_risk = min_reward_to_risk
         self._max_portfolio_risk_pct = max_portfolio_risk_pct
         self._circuit_breaker = circuit_breaker
+        self._cost_model = cost_model
+        self._max_breakeven_win_rate = max_breakeven_win_rate
+        self._growth = growth
 
     def validate(
         self,
@@ -249,6 +262,39 @@ class RiskManager:
                     f"({self._max_portfolio_risk_pct:.0%} of {request.account_balance:.2f})"
                 ),
             )
+
+        # --- Gate 5: growth mode trades only the allowlisted liquid ETFs ---
+        if (
+            self._growth is not None
+            and self._growth.is_active(request.account_balance)
+            and not self._growth.allows(request.symbol)
+        ):
+            self._reject(
+                request,
+                reason="GROWTH_SYMBOL_NOT_ALLOWED",
+                detail=(
+                    f"{request.symbol} is not in GROWTH_UNIVERSE while equity "
+                    f"{request.account_balance:.2f} is below {self._growth.exit_equity}"
+                ),
+            )
+
+        # --- Gate 6: fees and slippage must leave the trade worth taking ---
+        if self._cost_model is not None:
+            reward = request.quantity * (take_profit_price - request.entry_price)
+            cost = self._cost_model.round_trip_cost(request.quantity, request.entry_price)
+            if reward + risk_amount <= 0:
+                self._reject(request, reason="COSTS_TOO_HIGH", detail="zero-size trade")
+            needed = breakeven_win_rate(risk_amount, reward, cost)
+            if needed > self._max_breakeven_win_rate:
+                self._reject(
+                    request,
+                    reason="COSTS_TOO_HIGH",
+                    detail=(
+                        f"fees+slippage {cost:.2f} on reward {reward:.2f} / risk {risk_amount:.2f} "
+                        f"need a {needed:.0%} win rate to break even "
+                        f"(max {self._max_breakeven_win_rate:.0%})"
+                    ),
+                )
 
         return ValidationResult(
             trade_id=request.trade_id,

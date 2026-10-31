@@ -400,3 +400,90 @@ async def test_risk_gate_decision_unaffected_by_slippage(risk_manager: RiskManag
     assert len(result.trades) == 1
     assert result.metrics is not None
     assert result.metrics.signals_rejected == 0
+
+
+# ---------------------------------------------------------------------------
+# Small-account realism
+# ---------------------------------------------------------------------------
+
+
+class FixedLevelsBuyStrategy(BaseStrategy):
+    """BUYs on every call with fixed stop/target; sized by the 1% rule unless `quantity` is set."""
+
+    def __init__(self, stop: str = "24.50", target: str = "26.00", quantity: int | None = None) -> None:
+        self._stop, self._target, self._quantity = Decimal(stop), Decimal(target), quantity
+        self.extra_lengths: list[int] = []
+        self.bar_lengths: list[int] = []
+
+    async def generate_signal(self, data: MarketData) -> Signal:
+        self.extra_lengths.append(len(data.extra_bars.get("SPY", [])))
+        self.bar_lengths.append(len(data.bars))
+        return Signal(
+            symbol=data.symbol, action="BUY", entry_price=data.current_price,
+            stop_loss_price=self._stop, take_profit_price=self._target, timestamp=data.timestamp,
+        )
+
+    async def calculate_position_size(self, params: RiskParams) -> int:
+        if self._quantity is not None:
+            return self._quantity
+        return int(params.account_balance * Decimal("0.01") / (params.entry_price - params.stop_loss_price))
+
+    def get_config_schema(self) -> dict:
+        return {}
+
+
+def _winner_bars(count: int, high: float = 28.5) -> list[PriceBar]:
+    return [_bar(i, 25.0, high, 24.8, 25.0) for i in range(count)]
+
+
+@pytest.mark.asyncio
+async def test_cost_model_charges_broker_fees_per_leg() -> None:
+    from app.core.risk.costs import PLANS, CostModel
+
+    engine = BacktestingEngine(
+        FixedLevelsBuyStrategy(quantity=2), RiskManager(), slippage_pct=Decimal("0"),
+        cost_model=CostModel(PLANS["ibkr_tiered"], Decimal("0")),
+    )
+    result = await engine.run(_winner_bars(5, high=26.5), "SCHB", Decimal("1000"))
+    trade = result.trades[0]
+    assert trade.commission_paid == Decimal("0.72")  # 0.36 per leg
+    assert result.metrics.ending_balance == Decimal("1000") + result.metrics.total_return
+
+
+@pytest.mark.asyncio
+async def test_compound_sizes_later_trades_from_closed_pnl() -> None:
+    def run(compound: bool):
+        engine = BacktestingEngine(
+            FixedLevelsBuyStrategy(target="28.00"), RiskManager(), slippage_pct=Decimal("0"),
+            commission_per_trade=Decimal("0"), compound=compound,
+        )
+        return engine.run(_winner_bars(8), "SCHB", Decimal("1000"))
+
+    fixed, compounded = (await run(False)).trades, (await run(True)).trades
+    assert len(compounded) >= 2
+    assert fixed[1].quantity == fixed[0].quantity
+    assert compounded[1].quantity > compounded[0].quantity
+
+
+@pytest.mark.asyncio
+async def test_gap_below_stop_fills_at_open() -> None:
+    from app.core.backtesting.engine import apply_slippage
+
+    bars = [_bar(0, 25, 25.2, 24.8, 25), _bar(1, 25, 25.2, 24.8, 25), _bar(2, 25, 25.2, 24.8, 25),
+            _bar(3, 23.0, 23.5, 22.5, 23.0)]
+    slippage = Decimal("0.0005")
+    engine = BacktestingEngine(FixedLevelsBuyStrategy(quantity=2), RiskManager(), slippage_pct=slippage)
+    trade = (await engine.run(bars, "SCHB", Decimal("1000"))).trades[0]
+    assert trade.exit_reason == "STOP_LOSS"
+    assert trade.exit_price == apply_slippage(Decimal("23.0"), -1, slippage)
+
+
+@pytest.mark.asyncio
+async def test_extra_bars_never_show_the_future() -> None:
+    strategy = FixedLevelsBuyStrategy(quantity=2)
+    spy = _winner_bars(20)
+    await BacktestingEngine(strategy, RiskManager()).run(
+        _winner_bars(10), "SCHB", Decimal("1000"), extra_bars={"SPY": spy}
+    )
+    # Both series share dates, so each step sees exactly as many SPY bars as its own history.
+    assert strategy.extra_lengths == strategy.bar_lengths

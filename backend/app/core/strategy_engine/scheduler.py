@@ -32,8 +32,10 @@ from decimal import Decimal
 from app.brokers.base import BaseBroker, PriceBar
 from app.core import market_calendar
 from app.core.events import publish_system_alert
+from app.core.risk.growth import GrowthPolicy, effective_equity
 from app.core.risk.manager import RiskManager, RiskRejectionError, TradeRequest
 from app.core.strategy_engine.base import MarketData, RiskParams, Signal
+from app.core.strategy_engine.indicators import avg_dollar_volume
 from app.core.strategy_engine.registry import StrategyRegistry
 from app.data.cache import RedisCache
 from app.monitoring.logger import system_logger, trading_logger
@@ -78,7 +80,16 @@ class StrategyScheduler:
         is_paused: Callable[[], Awaitable[bool]] | None = None,
         signal_repo_factory=None,
         trade_repo_factory=None,
+        capital_limit: Decimal | None = None,
+        growth: GrowthPolicy | None = None,
+        max_spread_bps: Decimal = Decimal("0"),
+        min_avg_dollar_volume: Decimal = Decimal("0"),
     ) -> None:
+        self._capital_limit = capital_limit
+        self._growth = growth
+        self._growth_active: bool | None = None
+        self._max_spread_bps = max_spread_bps
+        self._min_avg_dollar_volume = min_avg_dollar_volume
         self._registry = registry
         self._broker = broker
         self._risk_manager = risk_manager
@@ -97,6 +108,7 @@ class StrategyScheduler:
         self._signal_repo_factory = signal_repo_factory
         self._trade_repo_factory = trade_repo_factory
         self._bar_cache: dict[tuple[str, date], list[PriceBar]] = {}
+        self._intraday_cache: dict[tuple[str, datetime], list[PriceBar]] = {}
         self._warned: set[tuple[str, str, date]] = set()
         self.last_cycle_at: datetime | None = None
         self._consecutive_failures = 0
@@ -160,7 +172,7 @@ class StrategyScheduler:
 
         try:
             summary = await self._broker.get_account_summary()
-            account_balance = summary.net_liquidation
+            account_balance = effective_equity(summary, self._capital_limit)
         except Exception as exc:
             system_logger.warning(
                 "StrategyScheduler: could not fetch account balance",
@@ -170,6 +182,17 @@ class StrategyScheduler:
         if account_balance <= 0:
             system_logger.warning("StrategyScheduler: account balance is not positive")
             return
+
+        if self._growth is not None:
+            active = self._growth.is_active(account_balance)
+            if self._growth_active is not None and active != self._growth_active:
+                await publish_system_alert(
+                    self._cache,
+                    "GROWTH_MODE_CHANGED",
+                    f"Growth mode {'ON' if active else 'OFF'}: equity ${account_balance:.2f}, "
+                    f"exit level ${self._growth.exit_equity}",
+                )
+            self._growth_active = active
 
         self.last_cycle_at = datetime.now(UTC)
         enabled_strategies = await self._load_enabled_strategies()
@@ -272,6 +295,12 @@ class StrategyScheduler:
                     extra={"symbol": symbol, "extra_symbol": extra_symbol},
                 )
 
+        intraday_bars: list[PriceBar] = []
+        if strategy.needs_intraday:
+            intraday_bars = await self._get_intraday_bars(symbol)
+            if not intraday_bars:
+                return
+
         open_position = await self._has_active_trade(symbol)
         market_data = MarketData(
             symbol=symbol,
@@ -280,6 +309,7 @@ class StrategyScheduler:
             timestamp=datetime.now(UTC),
             extra_bars=extra_bars,
             open_position=open_position,
+            intraday_bars=intraday_bars,
         )
 
         signal: Signal = await strategy.generate_signal(market_data)
@@ -293,10 +323,26 @@ class StrategyScheduler:
             )
             return
 
+        if self._max_spread_bps > 0:
+            spread = await self._spread_bps(symbol)
+            if spread is not None and spread > self._max_spread_bps:
+                self._warn_once("wide_spread", symbol, market_calendar.trading_date(self._clock()),
+                                f"StrategyScheduler: spread {spread:.1f} bps above limit, waiting")
+                return
+
         bar_date = bars[-1].timestamp.date()
         signal_id = await self._claim_signal(strategy_id, symbol, bar_date, signal)
         if signal_id is None:
             return
+
+        if self._min_avg_dollar_volume > 0:
+            adv = avg_dollar_volume(bars, 20)
+            if adv < self._min_avg_dollar_volume:
+                await self._set_outcome(
+                    signal_id, "INELIGIBLE",
+                    detail=f"LOW_LIQUIDITY: 20-day average dollar volume {adv:.0f} < {self._min_avg_dollar_volume}",
+                )
+                return
 
         trading_logger.info(
             "StrategyScheduler: signal generated",
@@ -337,6 +383,7 @@ class StrategyScheduler:
             strategy_id=strategy_id,
             take_profit_price=signal.take_profit_price,
             submit_stop_to_broker=signal.submit_stop_to_broker,
+            exit_deadline=signal.exit_deadline,
         )
 
         try:
@@ -355,6 +402,18 @@ class StrategyScheduler:
             await self._set_outcome(signal_id, "ORDER_FAILED", detail=str(exc))
         else:
             await self._set_outcome(signal_id, "SUBMITTED", trade_id=request.trade_id)
+
+    async def _spread_bps(self, symbol: str) -> Decimal | None:
+        """Bid/ask spread in basis points from the price key; None when no usable quote is cached."""
+        try:
+            raw = await self._cache.get(f"price:{symbol}")
+            payload = json.loads(raw) if raw else {}
+            bid, ask = Decimal(str(payload["bid"])), Decimal(str(payload["ask"]))
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return None
+        if bid <= 0 or ask < bid:
+            return None
+        return (ask - bid) / ((ask + bid) / 2) * Decimal("10000")
 
     # ------------------------------------------------------------------
     # Internal: persistence helpers
@@ -481,6 +540,28 @@ class StrategyScheduler:
             for row in rows
             if row.time.date() < trading_day
         ]
+
+    async def _get_intraday_bars(self, symbol: str) -> list[PriceBar]:
+        """Today's completed 5-minute bars, fetched at most once per symbol per 5-minute bucket (IB pacing)."""
+        now = self._clock().astimezone(UTC)
+        bucket = now.replace(minute=now.minute - now.minute % 5, second=0, microsecond=0)
+        key = (symbol, bucket)
+        if key not in self._intraday_cache:
+            try:
+                fetched = await self._broker.get_intraday_bars(symbol)
+            except Exception as exc:
+                system_logger.warning(
+                    "StrategyScheduler: intraday bar fetch failed",
+                    extra={"symbol": symbol, "error": str(exc)},
+                )
+                return []
+            today = market_calendar.trading_date(now)
+            for old in [k for k in self._intraday_cache if k[1] != bucket]:
+                del self._intraday_cache[old]
+            self._intraday_cache[key] = [
+                b for b in fetched if market_calendar.trading_date(b.timestamp) == today
+            ]
+        return self._intraday_cache[key]
 
     async def _get_historical_bars(self, symbol: str) -> list[PriceBar]:
         """Completed-session bars from the DB; [] if missing or stale."""

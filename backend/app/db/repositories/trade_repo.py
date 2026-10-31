@@ -40,6 +40,7 @@ class TradeRepo:
         strategy_id: uuid.UUID | None = None,
         trade_id: uuid.UUID | None = None,
         executed_at: datetime | None = None,
+        exit_deadline: datetime | None = None,
     ) -> Trade:
         """
         Persist a new trade record at PENDING status.
@@ -63,6 +64,7 @@ class TradeRepo:
             risk_amount=risk_amount,
             account_balance_at_entry=account_balance_at_entry,
             strategy_id=strategy_id,
+            exit_deadline=exit_deadline,
             status=TradeStatus.PENDING,
         )
         if trade_id is not None:
@@ -242,6 +244,7 @@ class TradeRepo:
         order_id: str,
         fill_price: Decimal,
         filled_qty: Decimal,
+        commission: Decimal | None = None,
     ) -> Trade | None:
         """Persist the entry fill separately from the audit-immutable columns."""
         stmt = (
@@ -251,6 +254,7 @@ class TradeRepo:
                 entry_order_id=order_id,
                 entry_fill_price=fill_price,
                 filled_quantity=filled_qty,
+                entry_commission=commission,
             )
             .returning(Trade)
         )
@@ -290,6 +294,7 @@ class TradeRepo:
         exit_order_id: str | None,
         closed_at: datetime | None = None,
         exit_reason: ExitReason | None = None,
+        exit_commission: Decimal | None = None,
     ) -> Trade | None:
         """Atomically move CLOSING to CLOSED; None if the trade was not CLOSING."""
         values: dict = {
@@ -302,6 +307,8 @@ class TradeRepo:
             values["exit_order_id"] = exit_order_id
         if exit_reason is not None:
             values["exit_reason"] = exit_reason
+        if exit_commission is not None:
+            values["exit_commission"] = exit_commission
         stmt = (
             update(Trade)
             .where(Trade.id == trade_id, Trade.status == TradeStatus.CLOSING)
@@ -317,6 +324,7 @@ class TradeRepo:
         order_id: str,
         fill_price: Decimal,
         filled_qty: Decimal,
+        commission: Decimal | None = None,
     ) -> Trade | None:
         """Atomically move PENDING/SUBMITTED to OPEN with the fill; None if already moved on."""
         stmt = (
@@ -330,6 +338,7 @@ class TradeRepo:
                 entry_order_id=order_id,
                 entry_fill_price=fill_price,
                 filled_quantity=filled_qty,
+                entry_commission=commission,
             )
             .returning(Trade)
             .execution_options(populate_existing=True)

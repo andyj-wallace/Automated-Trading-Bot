@@ -174,7 +174,7 @@ async def test_signal_opens_exactly_one_trade(trading_engine):
             PriceBar(
                 timestamp=datetime.combine(yesterday - timedelta(days=i), datetime.min.time(), UTC),
                 open=Decimal("199"), high=Decimal("201"), low=Decimal("198"),
-                close=Decimal("200"), volume=1000,
+                close=Decimal("200"), volume=1_000_000,  # clears MIN_AVG_DOLLAR_VOLUME
             )
             for i in range(5)
         ]

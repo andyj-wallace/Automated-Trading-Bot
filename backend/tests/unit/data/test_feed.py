@@ -309,3 +309,16 @@ async def test_mock_broker_different_symbols_produce_different_data(
     msft = await broker.get_historical_data("MSFT")
 
     assert [b.close for b in aapl] != [b.close for b in msft]
+
+
+@pytest.mark.asyncio
+async def test_price_tick_stores_bid_ask_or_null(
+    feed: MarketDataFeed, broker: MockBroker, cache: FakeCache
+) -> None:
+    await feed.add_symbol("AAPL")
+    await broker.simulate_price_tick("AAPL", Decimal("185.00"), bid=Decimal("184.99"), ask=Decimal("185.01"))
+    data = json.loads(await cache.get("price:AAPL"))
+    assert (data["bid"], data["ask"]) == ("184.99", "185.01")
+    await broker.simulate_price_tick("AAPL", Decimal("185.00"))
+    data = json.loads(await cache.get("price:AAPL"))
+    assert data["bid"] is None and data["ask"] is None
