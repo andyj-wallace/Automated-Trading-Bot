@@ -66,34 +66,34 @@ export function ActiveTradesTable({ compact = false }: { compact?: boolean }) {
     <div className="rounded-lg border border-gray-800 bg-gray-900 p-5 flex flex-col gap-4">
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">
-          {compact ? "Open positions" : "Active Trades"}
+          Open positions
         </h2>
         <span className="text-xs text-gray-500">{trades.length} active</span>
       </div>
 
       {notice && (
-        <p className="text-xs text-emerald-400" onClick={() => setNotice(null)}>
+        <p className="text-sm text-emerald-400" role="status" onClick={() => setNotice(null)}>
           {notice}
         </p>
       )}
-      {isLoading && <p className="text-xs text-gray-600">Loading…</p>}
+      {isLoading && <p className="text-sm text-gray-400">Loading…</p>}
       {!isLoading && trades.length === 0 && (
-        <p className="text-xs text-gray-600 py-4 text-center">No active trades</p>
+        <p className="text-sm text-gray-400 py-4 text-center">No open positions yet</p>
       )}
 
       {trades.length > 0 && (
         <div className="overflow-x-auto">
-          <table className="w-full text-xs">
+          <table className="w-full text-sm">
             <thead>
               <tr className="text-gray-500 border-b border-gray-800">
                 <th className="text-left pb-2 font-medium">Symbol</th>
                 {!compact && <th className="text-left pb-2 font-medium">Status</th>}
                 {!compact && <th className="text-right pb-2 font-medium">Qty</th>}
-                <th className="text-right pb-2 font-medium">Entry</th>
+                {!compact && <th className="text-right pb-2 font-medium">Entry</th>}
                 {!compact && <th className="text-right pb-2 font-medium">Stop</th>}
                 {!compact && <th className="text-right pb-2 font-medium">Target</th>}
                 <th className="text-right pb-2 font-medium">Last</th>
-                <th className="text-right pb-2 font-medium">Unrealized</th>
+                <th className="text-right pb-2 font-medium">{compact ? "Profit/loss now" : "Unrealized"}</th>
                 {!compact && <th className="text-right pb-2 font-medium">Risk $</th>}
                 {!compact && <th className="text-right pb-2 font-medium">Opened</th>}
                 <th className="pb-2" />
@@ -151,7 +151,15 @@ function TradeRow({
 
   return (
     <tr className="hover:bg-gray-800/30 transition-colors">
-      <td className="py-2 font-medium text-gray-200">{trade.symbol}</td>
+      <td className="py-2 font-medium text-gray-200">
+        {trade.symbol}
+        {compact && (trade.status === "PENDING" || trade.status === "SUBMITTED") && (
+          <span className="ml-2 text-xs font-normal text-gray-400">Waiting to fill</span>
+        )}
+        {compact && trade.status === "CLOSING" && (
+          <span className="ml-2 text-xs font-normal text-amber-400">Closing</span>
+        )}
+      </td>
       {!compact && (
       <td className="py-2">
         <span className={`px-1.5 py-0.5 rounded ${STATUS_STYLE[trade.status]}`}>
@@ -160,7 +168,7 @@ function TradeRow({
       </td>
       )}
       {!compact && <td className="py-2 text-right text-gray-300">{qty}</td>}
-      <td className="py-2 text-right text-gray-300">{money(entry)}</td>
+      {!compact && <td className="py-2 text-right text-gray-300">{money(entry)}</td>}
       {!compact && (
         <>
           <td className="py-2 text-right text-gray-400">

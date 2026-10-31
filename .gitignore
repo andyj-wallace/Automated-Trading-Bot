@@ -81,3 +81,10 @@ test_ibkr_connection.py
 # --- Alembic -----------------------------------------------------------------
 # Keep versions/ committed; exclude compiled pyc inside it
 alembic/versions/*.pyc
+
+# impeccable (installed tooling)
+.claude/skills/impeccable/
+.claude/agents/
+.github/skills/
+.github/agents/
+.github/hooks/
