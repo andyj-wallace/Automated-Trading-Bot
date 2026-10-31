@@ -4,7 +4,11 @@ Personal trading bot for US stocks and ETFs on Interactive Brokers (IBKR). You c
 
 It runs on an IBKR **paper account** (simulated money). Live trading stays off until the checks in [ROADMAP.md](ROADMAP.md) pass.
 
-![Dashboard](docs/dashboard.png)
+![Home: bot status, today's result and open positions](docs/home.png)
+
+![My Trades: profit and loss with trade history](docs/my-trades.png)
+
+*Screenshots use sample data.*
 
 **Docs:** this README (what it does, how to run it locally) · [DEPLOYMENT.md](DEPLOYMENT.md) (running and operating the full stack) · [ROADMAP.md](ROADMAP.md) (open work).
 
