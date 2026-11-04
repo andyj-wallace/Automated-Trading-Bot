@@ -222,8 +222,9 @@ function StrategyCard({
         <>
           <div className="border-t border-gray-800 bg-red-950/30 px-5 py-3 flex items-center justify-between gap-3">
             <p className="text-xs text-red-300">
-              The circuit breaker stopped this strategy after {streak} losing trade
-              {streak !== 1 ? "s" : ""} in a row and switched it off. Clearing the halt resets the
+              {streak > 0
+                ? `The circuit breaker stopped this strategy after ${streak} losing trade${streak !== 1 ? "s" : ""} in a row and switched it off.`
+                : "The circuit breaker halted this strategy and switched it off."} Clearing the halt resets the
               streak; switch the strategy back on with the toggle above to let it trade again.
             </p>
             <button
