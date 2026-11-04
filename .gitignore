@@ -88,3 +88,4 @@ alembic/versions/*.pyc
 .github/skills/
 .github/agents/
 .github/hooks/
+.agents/
