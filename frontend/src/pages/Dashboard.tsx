@@ -8,6 +8,7 @@
 import { ErrorBoundary } from "../components/common/ErrorBoundary";
 import { AlertsFeed } from "../components/alerts/AlertsFeed";
 import { BrokerConnectionBanner } from "../components/controls/BrokerConnectionBanner";
+import { CircuitBreakerBanner } from "../components/risk/CircuitBreakerBanner";
 import { TradingControlsPanel } from "../components/controls/TradingControlsPanel";
 import { ActiveTradesTable } from "../components/dashboard/ActiveTradesTable";
 import { RiskGauge } from "../components/dashboard/RiskGauge";
@@ -16,8 +17,9 @@ import { WatchlistPanel } from "../components/dashboard/WatchlistPanel";
 import { CircuitBreakerPanel } from "../components/risk/CircuitBreakerPanel";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api/client";
+import { useCircuitBreaker } from "../hooks/useCircuitBreaker";
 import { useLiveStore } from "../store/liveStore";
-import type { CircuitBreakerStatus, Trade } from "../types/api";
+import type { Trade } from "../types/api";
 
 export function Dashboard() {
   const socketState = useLiveStore((s) => s.socketState);
@@ -28,6 +30,8 @@ export function Dashboard() {
       <h1 className="text-2xl font-bold text-white mb-2">Home</h1>
 
       <BrokerConnectionBanner />
+
+      <CircuitBreakerBanner />
 
       {socketState !== WebSocket.OPEN && (
         <p role="status" className="text-sm text-amber-300">
@@ -61,12 +65,7 @@ export function Dashboard() {
 }
 
 function TodayResult() {
-  const tradesVersion = useLiveStore((s) => s.tradesVersion);
-  const { data } = useQuery({
-    queryKey: ["circuit-breaker", tradesVersion],
-    queryFn: async () => (await api.get<CircuitBreakerStatus>("/risk/circuit-breaker")).data,
-    refetchInterval: 30_000,
-  });
+  const { data } = useCircuitBreaker();
   const prices = useLiveStore((s) => s.prices);
   const { data: open = [] } = useQuery({
     queryKey: ["trades", "active"],
