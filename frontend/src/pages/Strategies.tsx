@@ -19,6 +19,7 @@ import { useState } from "react";
 import { NewStrategyDialog } from "../components/strategies/NewStrategyDialog";
 import { StrategyConfigForm } from "../components/strategies/StrategyConfigForm";
 import { StrategyPerformanceChart } from "../components/strategies/StrategyPerformanceChart";
+import { ConfirmDialog } from "../components/common/ConfirmDialog";
 import { api } from "../api/client";
 import type { Strategy, StrategyPatch, WatchedSymbol } from "../types/api";
 import { useCircuitBreaker } from "../hooks/useCircuitBreaker";
@@ -103,6 +104,7 @@ function StrategyCard({
   );
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [confirmHalt, setConfirmHalt] = useState(false);
 
   const { data: breaker } = useCircuitBreaker();
   const killed = breaker?.killed_strategy_ids.includes(strategy.id) ?? false;
@@ -146,6 +148,18 @@ function StrategyCard({
       if (res.error) throw new Error(res.error.message);
     },
     onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["circuit-breaker"] });
+      queryClient.invalidateQueries({ queryKey: ["strategies"] });
+    },
+  });
+
+  const haltMutation = useMutation({
+    mutationFn: async () => {
+      const res = await api.post(`/risk/circuit-breaker/strategies/${strategy.id}/kill`);
+      if (res.error) throw new Error(res.error.message);
+    },
+    onSuccess: () => {
+      setConfirmHalt(false);
       queryClient.invalidateQueries({ queryKey: ["circuit-breaker"] });
       queryClient.invalidateQueries({ queryKey: ["strategies"] });
     },
@@ -279,7 +293,40 @@ function StrategyCard({
               strategyName={strategy.name}
             />
           </div>
+
+          {/* Halt strategy section */}
+          <div className="border-t border-gray-800 pt-4 flex items-center justify-between gap-3">
+            <p className="text-xs text-gray-500">
+              Halting stops this strategy from opening new trades and switches it off. Trades that
+              are already open keep their stops and targets.
+            </p>
+            <button
+              onClick={() => setConfirmHalt(true)}
+              disabled={killed || haltMutation.isPending}
+              className="shrink-0 px-3 py-1.5 text-xs rounded border border-red-800 text-red-300 hover:bg-red-950/50 disabled:border-gray-800 disabled:text-gray-600"
+            >
+              {killed ? "Halted" : "Halt strategy"}
+            </button>
+          </div>
         </div>
+      )}
+
+      {confirmHalt && (
+        <ConfirmDialog
+          title={`Halt ${strategy.name}?`}
+          confirmLabel="Halt strategy"
+          busy={haltMutation.isPending}
+          error={haltMutation.error?.message ?? null}
+          onConfirm={() => haltMutation.mutate()}
+          onCancel={() => {
+            haltMutation.reset();
+            setConfirmHalt(false);
+          }}
+        >
+          This strategy stops looking for new trades and is switched off. Open positions are not
+          touched — their stops and targets stay in place. You can clear the halt later from this
+          page.
+        </ConfirmDialog>
       )}
     </div>
   );
