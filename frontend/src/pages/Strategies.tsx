@@ -105,6 +105,7 @@ function StrategyCard({
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [confirmHalt, setConfirmHalt] = useState(false);
+  const [confirmClearHalt, setConfirmClearHalt] = useState(false);
 
   const { data: breaker } = useCircuitBreaker();
   const killed = breaker?.killed_strategy_ids.includes(strategy.id) ?? false;
@@ -148,6 +149,7 @@ function StrategyCard({
       if (res.error) throw new Error(res.error.message);
     },
     onSuccess: () => {
+      setConfirmClearHalt(false);
       queryClient.invalidateQueries({ queryKey: ["circuit-breaker"] });
       queryClient.invalidateQueries({ queryKey: ["strategies"] });
     },
@@ -228,7 +230,7 @@ function StrategyCard({
               streak; switch the strategy back on with the toggle above to let it trade again.
             </p>
             <button
-              onClick={() => clearHaltMutation.mutate()}
+              onClick={() => setConfirmClearHalt(true)}
               disabled={clearHaltMutation.isPending}
               className="shrink-0 px-2 py-1 text-xs rounded bg-red-700 hover:bg-red-800 disabled:bg-red-950 disabled:text-red-800 text-white"
             >
@@ -327,6 +329,23 @@ function StrategyCard({
           This strategy stops looking for new trades and is switched off. Open positions are not
           touched — their stops and targets stay in place. You can clear the halt later from this
           page.
+        </ConfirmDialog>
+      )}
+
+      {confirmClearHalt && (
+        <ConfirmDialog
+          title={`Clear the halt for ${strategy.name}?`}
+          confirmLabel="Clear halt"
+          busy={clearHaltMutation.isPending}
+          error={clearHaltMutation.error?.message ?? null}
+          onConfirm={() => clearHaltMutation.mutate()}
+          onCancel={() => {
+            clearHaltMutation.reset();
+            setConfirmClearHalt(false);
+          }}
+        >
+          This resets the circuit-breaker loss streak. It does not switch the strategy back on;
+          use the toggle above if you want it to trade again.
         </ConfirmDialog>
       )}
     </div>
