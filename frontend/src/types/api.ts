@@ -219,7 +219,7 @@ export interface CircuitBreakerStatus {
   daily_realized_pnl: string;
   day_starting_balance: string;
   killed_strategy_ids: string[];
-  trading_date: string;
+  trading_date: string | null;
   daily_loss_limit_pct: string;
   halt_threshold_amount: string;
   consecutive_losses: Record<string, number>;
