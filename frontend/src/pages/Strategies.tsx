@@ -21,6 +21,7 @@ import { StrategyConfigForm } from "../components/strategies/StrategyConfigForm"
 import { StrategyPerformanceChart } from "../components/strategies/StrategyPerformanceChart";
 import { api } from "../api/client";
 import type { Strategy, StrategyPatch, WatchedSymbol } from "../types/api";
+import { useCircuitBreaker } from "../hooks/useCircuitBreaker";
 
 export function Strategies() {
   const [creating, setCreating] = useState(false);
@@ -103,6 +104,10 @@ function StrategyCard({
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
 
+  const { data: breaker } = useCircuitBreaker();
+  const killed = breaker?.killed_strategy_ids.includes(strategy.id) ?? false;
+  const streak = breaker?.consecutive_losses[strategy.id] ?? 0;
+
   const toggleMutation = useMutation({
     mutationFn: async (is_enabled: boolean) => {
       const res = await api.patch<Strategy>(`/strategies/${strategy.id}`, {
@@ -132,6 +137,17 @@ function StrategyCard({
     },
     onError: (err: Error) => {
       setSaveError(err.message);
+    },
+  });
+
+  const clearHaltMutation = useMutation({
+    mutationFn: async () => {
+      const res = await api.post(`/risk/circuit-breaker/strategies/${strategy.id}/reset`);
+      if (res.error) throw new Error(res.error.message);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["circuit-breaker"] });
+      queryClient.invalidateQueries({ queryKey: ["strategies"] });
     },
   });
 
@@ -168,6 +184,12 @@ function StrategyCard({
                     {assignedCount} symbol{assignedCount !== 1 ? "s" : ""}
                   </span>
                 )}
+                {killed && (
+                  <span className="text-xs px-1.5 py-0.5 rounded bg-red-950 text-red-300">Halted by loss streak</span>
+                )}
+                {!killed && streak > 0 && (
+                  <span className="text-xs text-amber-400 tabular-nums">{streak} loss{streak !== 1 ? "es" : ""} in a row</span>
+                )}
               </div>
             </div>
           </button>
@@ -180,6 +202,29 @@ function StrategyCard({
           onChange={(v) => toggleMutation.mutate(v)}
         />
       </div>
+
+      {/* Halted notice */}
+      {killed && (
+        <>
+          <div className="border-t border-gray-800 bg-red-950/30 px-5 py-3 flex items-center justify-between gap-3">
+            <p className="text-xs text-red-300">
+              The circuit breaker stopped this strategy after {streak} losing trade
+              {streak !== 1 ? "s" : ""} in a row and switched it off. Clearing the halt resets the
+              streak; switch the strategy back on with the toggle above to let it trade again.
+            </p>
+            <button
+              onClick={() => clearHaltMutation.mutate()}
+              disabled={clearHaltMutation.isPending}
+              className="shrink-0 px-2 py-1 text-xs rounded bg-red-700 hover:bg-red-800 disabled:bg-red-950 disabled:text-red-800 text-white"
+            >
+              {clearHaltMutation.isPending ? "Clearing…" : "Clear halt"}
+            </button>
+          </div>
+          {clearHaltMutation.error && (
+            <p role="alert" className="px-5 pb-3 text-xs text-red-400">{clearHaltMutation.error.message}</p>
+          )}
+        </>
+      )}
 
       {/* Expanded: config form + performance chart */}
       {expanded && (
