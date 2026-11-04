@@ -1,34 +1,22 @@
 /** Circuit breaker: today's realized P&L vs the halt threshold, plus loss streak resets. */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { api } from "../../api/client";
-import { useLiveStore } from "../../store/liveStore";
-import type { CircuitBreakerStatus, Strategy } from "../../types/api";
+import { useCircuitBreaker } from "../../hooks/useCircuitBreaker";
+import type { Strategy } from "../../types/api";
 import { ConfirmDialog } from "../common/ConfirmDialog";
 
 export function CircuitBreakerPanel() {
   const queryClient = useQueryClient();
-  const riskVersion = useLiveStore((s) => s.riskVersion);
-  const tradesVersion = useLiveStore((s) => s.tradesVersion);
   const [confirmReset, setConfirmReset] = useState(false);
 
-  const { data } = useQuery({
-    queryKey: ["circuit-breaker"],
-    queryFn: async () => (await api.get<CircuitBreakerStatus>("/risk/circuit-breaker")).data,
-    refetchInterval: 30_000,
-  });
+  const { data, isLoading, error } = useCircuitBreaker();
 
   const { data: strategies = [] } = useQuery({
     queryKey: ["strategies"],
     queryFn: async () => (await api.get<Strategy[]>("/strategies")).data ?? [],
   });
-
-  useEffect(() => {
-    if (riskVersion + tradesVersion > 0) {
-      queryClient.invalidateQueries({ queryKey: ["circuit-breaker"] });
-    }
-  }, [riskVersion, tradesVersion, queryClient]);
 
   const resetMutation = useMutation({
     mutationFn: async (path: string) => {
@@ -42,13 +30,57 @@ export function CircuitBreakerPanel() {
     },
   });
 
-  if (!data) return null;
+  if (isLoading) {
+    return (
+      <div className="rounded-lg border border-gray-800 bg-gray-900 p-5 flex flex-col gap-4">
+        <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">
+          Circuit Breaker
+        </h2>
+        <p className="text-xs text-gray-600">Loading loss limit…</p>
+      </div>
+    );
+  }
+
+  if (error && !data) {
+    return (
+      <div className="rounded-lg border border-gray-800 bg-gray-900 p-5 flex flex-col gap-4">
+        <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">
+          Circuit Breaker
+        </h2>
+        <p role="alert" className="text-xs text-red-400">
+          Could not load the loss limit: {error.message}
+        </p>
+      </div>
+    );
+  }
+
+  if (!data) {
+    return (
+      <div className="rounded-lg border border-gray-800 bg-gray-900 p-5 flex flex-col gap-4">
+        <h2 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">
+          Circuit Breaker
+        </h2>
+        <p className="text-xs text-gray-600">No loss-limit data yet.</p>
+      </div>
+    );
+  }
 
   const pnl = Number(data.daily_realized_pnl);
   const threshold = Number(data.halt_threshold_amount);
   const lossFill = threshold > 0 ? Math.min((Math.max(0, -pnl) / threshold) * 100, 100) : 0;
   const names = new Map(strategies.map((s) => [s.id, s.name]));
-  const streaks = Object.entries(data.consecutive_losses).filter(([, n]) => n > 0);
+
+  const ids = new Set([
+    ...Object.keys(data.consecutive_losses).filter((id) => data.consecutive_losses[id] > 0),
+    ...data.killed_strategy_ids,
+  ]);
+  const rows = [...ids]
+    .map((id) => ({
+      id,
+      streak: data.consecutive_losses[id] ?? 0,
+      killed: data.killed_strategy_ids.includes(id),
+    }))
+    .sort((a, b) => Number(b.killed) - Number(a.killed) || b.streak - a.streak);
 
   return (
     <div className="rounded-lg border border-gray-800 bg-gray-900 p-5 flex flex-col gap-4">
@@ -90,22 +122,22 @@ export function CircuitBreakerPanel() {
         </div>
       )}
 
-      {streaks.length > 0 && (
+      {rows.length > 0 && (
         <div className="flex flex-col gap-1.5">
           <span className="text-xs text-gray-500">Consecutive losses</span>
-          {streaks.map(([id, n]) => (
-            <div key={id} className="flex items-center justify-between text-xs">
+          {rows.map((row) => (
+            <div key={row.id} className="flex items-center justify-between text-xs">
               <span className="text-gray-300">
-                {names.get(id) ?? id.slice(0, 8)}
-                {data.killed_strategy_ids.includes(id) && (
+                {names.get(row.id) ?? row.id.slice(0, 8)}
+                {row.killed && (
                   <span className="ml-2 text-red-400">killed</span>
                 )}
               </span>
               <span className="flex items-center gap-3">
-                <span className="tabular-nums text-amber-400">{n}</span>
+                <span className="tabular-nums text-amber-400">{row.streak}</span>
                 <button
                   onClick={() =>
-                    resetMutation.mutate(`/risk/circuit-breaker/strategies/${id}/reset`)
+                    resetMutation.mutate(`/risk/circuit-breaker/strategies/${row.id}/reset`)
                   }
                   disabled={resetMutation.isPending}
                   className="px-2 py-0.5 rounded border border-gray-700 text-gray-300 hover:bg-gray-800"
@@ -115,6 +147,9 @@ export function CircuitBreakerPanel() {
               </span>
             </div>
           ))}
+          <p className="text-xs text-gray-600">
+            Reset clears the loss streak so the strategy can trade again. A halted strategy also has to be switched back on from the Strategies page.
+          </p>
         </div>
       )}
 
