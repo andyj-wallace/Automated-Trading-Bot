@@ -18,23 +18,53 @@ import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any as Any
+from typing import Literal as Literal
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel as BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.v1.backtesting_helpers import (
+    _bad_request,
+    _build_costs,
+    _load_extra_bars,
+    _load_slot_bars,
+    _no_historical_data,
+    _require_daily_only,
+    _run_portfolio_job_locked,
+    _to_price_bars,
+)
+from app.api.v1.backtesting_models import (
+    _RANGE_DAYS,
+    BacktestRunRequest,
+    PortfolioBacktestRunRequest,
+    PortfolioSlotRequest,
+    _Job,
+)
+from app.api.v1.backtesting_serialise import (
+    _serialise_metrics as _serialise_metrics,
+)
+from app.api.v1.backtesting_serialise import (
+    _serialise_portfolio_result,
+    _serialise_result,
+)
 from app.api.v1.schemas import err, ok
 from app.brokers.base import PriceBar
-from app.config import get_settings
-from app.core.backtesting.engine import BacktestingEngine, BacktestMetrics, BacktestResult
+from app.config import get_settings as get_settings
+from app.core.backtesting.engine import BacktestingEngine
+from app.core.backtesting.engine import BacktestMetrics as BacktestMetrics
+from app.core.backtesting.engine import BacktestResult as BacktestResult
 from app.core.backtesting.portfolio_engine import (
-    PortfolioBacktestEngine,
-    PortfolioBacktestResult,
-    PortfolioSlot,
+    PortfolioBacktestEngine as PortfolioBacktestEngine,
 )
-from app.core.risk.costs import PLANS, CostModel
+from app.core.backtesting.portfolio_engine import (
+    PortfolioBacktestResult as PortfolioBacktestResult,
+)
+from app.core.backtesting.portfolio_engine import PortfolioSlot as PortfolioSlot
+from app.core.risk.costs import PLANS as PLANS
+from app.core.risk.costs import CostModel as CostModel
 from app.core.risk.manager import RiskManager
 from app.core.strategy_engine.registry import registry
 from app.db.repositories.ohlcv_repo import OHLCVRepo
@@ -50,118 +80,7 @@ MAX_JOBS = 20
 # ---------------------------------------------------------------------------
 
 
-class _Job:
-    def __init__(self, job_id: uuid.UUID, request: Any) -> None:
-        self.job_id = job_id
-        self.request = request
-        # (RiskManager, engine kwargs) from _build_costs; None keeps the legacy engines.
-        self.costs: tuple[RiskManager, dict] | None = None
-        # Extra-symbol bars: a dict for a single run, one dict per slot for a portfolio run.
-        self.extra_bars: Any = None
-        self.status: str = "pending"
-        self.error: str | None = None
-        self.result: BacktestResult | None = None
-        self.portfolio_result: PortfolioBacktestResult | None = None
-        self.created_at: datetime = datetime.now(UTC)
-        self.started_at: datetime | None = None
-        self.finished_at: datetime | None = None
-
-
 _jobs: dict[uuid.UUID, _Job] = {}
-
-
-# ---------------------------------------------------------------------------
-# Request / response schemas
-# ---------------------------------------------------------------------------
-
-
-class BacktestRunRequest(BaseModel):
-    symbol: str
-    strategy_type: str
-    strategy_config: dict[str, Any] = {}
-    account_balance: str = "100000"
-    commission_plan: Literal["legacy", "ibkr_fixed", "ibkr_tiered", "zero"] = "legacy"
-    slippage_bps: str = "5"
-    compound: bool = False
-
-
-class PortfolioSlotRequest(BaseModel):
-    symbol: str
-    strategy_type: str
-    config: dict[str, Any] = {}
-
-
-_RANGE_DAYS: dict[str, int] = {
-    "1y": 365,
-    "2y": 730,
-    "5y": 365 * 5,
-}
-
-
-class PortfolioBacktestRunRequest(BaseModel):
-    slots: list[PortfolioSlotRequest]
-    account_balance: str = "100000"
-    range: str = "5y"
-    commission_plan: Literal["legacy", "ibkr_fixed", "ibkr_tiered", "zero"] = "legacy"
-    slippage_bps: str = "5"
-    compound: bool = False
-
-
-def _build_costs(body: BacktestRunRequest | PortfolioBacktestRunRequest) -> tuple[RiskManager, dict]:
-    """
-    Risk manager and engine kwargs for the requested fee schedule.
-
-    "legacy" keeps today's engines exactly (flat $1 per leg, default RiskManager). Anything else
-    uses the broker's real schedule, and the fee gate rejects in backtests as it would live.
-    Growth-mode universe and position limits are not applied in backtests.
-    """
-    if body.commission_plan == "legacy":
-        return RiskManager(), {"compound": body.compound}
-    settings = get_settings()
-    cost_model = CostModel(PLANS[body.commission_plan], Decimal(body.slippage_bps))
-    risk_manager = RiskManager(
-        min_reward_to_risk=settings.min_reward_to_risk,
-        cost_model=cost_model,
-        max_breakeven_win_rate=settings.max_breakeven_win_rate,
-    )
-    return risk_manager, {
-        "slippage_pct": cost_model.slippage_bps / Decimal("10000"),
-        "cost_model": cost_model,
-        "compound": body.compound,
-    }
-
-
-def _to_price_bars(db_bars) -> list[PriceBar]:
-    return [
-        PriceBar(
-            timestamp=b.time, open=b.open, high=b.high, low=b.low, close=b.close,
-            volume=b.volume, bar_size=b.bar_size,
-        )
-        for b in db_bars
-    ]
-
-
-async def _load_extra_bars(
-    repo: OHLCVRepo, strategy, start: datetime, end: datetime
-) -> tuple[dict[str, list[PriceBar]], str | None]:
-    """Bars for the strategy's extra symbols (e.g. SPY); the second item names a symbol with no data."""
-    extra: dict[str, list[PriceBar]] = {}
-    for symbol in strategy.required_extra_symbols():
-        symbol = symbol.upper()
-        rows = await repo.get_bars(symbol, start=start, end=end)
-        if not rows:
-            return extra, symbol
-        extra[symbol] = _to_price_bars(rows)
-    return extra, None
-
-
-def _require_daily_only(strategies) -> None:
-    if any(s.needs_intraday for s in strategies):
-        raise ValueError("day-trade strategies need 5-minute bars; backtests only have daily bars")
-
-
-def _bad_request(code: str, message: str) -> JSONResponse:
-    return JSONResponse(status_code=422, content=err(code, message))
 
 
 # ---------------------------------------------------------------------------
@@ -294,32 +213,11 @@ async def run_portfolio_backtest(
         return _bad_request("INVALID_CONFIG", str(exc))
 
     # Fetch and validate OHLCV data for all symbols
-    bars_by_slot: list[list[PriceBar]] = []
-    extras_by_slot: list[dict[str, list[PriceBar]]] = []
-    missing: list[str] = []
-
-    for slot_req, strategy in zip(body.slots, strategies, strict=True):
-        ticker = slot_req.symbol.upper()
-        db_bars = await ohlcv_repo.get_bars(ticker, start=start, end=end)
-        if not db_bars:
-            missing.append(ticker)
-            continue
-        extra_bars, missing_extra = await _load_extra_bars(ohlcv_repo, strategy, start, end)
-        if missing_extra:
-            missing.append(missing_extra)
-            continue
-        bars_by_slot.append(_to_price_bars(db_bars))
-        extras_by_slot.append(extra_bars)
-
+    bars_by_slot, extras_by_slot, missing = await _load_slot_bars(
+        ohlcv_repo, body.slots, strategies, start, end
+    )
     if missing:
-        return JSONResponse(
-            status_code=422,
-            content=err(
-                "NO_HISTORICAL_DATA",
-                f"No historical OHLCV bars found for: {missing}. "
-                "Fetch historical data first via HistoricalDataFetcher.",
-            ),
-        )
+        return _no_historical_data(missing)
 
     # Evict oldest job if at capacity
     if len(_jobs) >= MAX_JOBS:
@@ -440,110 +338,3 @@ async def _run_portfolio_job(
 ) -> None:
     async with _backtest_slot:
         await _run_portfolio_job_locked(job, slot_requests, bars_by_slot, account_balance_str)
-
-
-async def _run_portfolio_job_locked(
-    job: _Job,
-    slot_requests: list[PortfolioSlotRequest],
-    bars_by_slot: list[list[PriceBar]],
-    account_balance_str: str,
-) -> None:
-    job.status = "running"
-    job.started_at = datetime.now(UTC)
-
-    try:
-        slots = [
-            PortfolioSlot(
-                strategy=registry.build(sr.strategy_type, sr.config),
-                symbol=sr.symbol.upper(),
-                bars=bars,
-                strategy_type=sr.strategy_type,
-                strategy_config=sr.config,
-                extra_bars=extra,
-            )
-            for sr, bars, extra in zip(slot_requests, bars_by_slot, job.extra_bars, strict=True)
-        ]
-        risk_manager, engine_kwargs = job.costs or (RiskManager(), {})
-        engine = PortfolioBacktestEngine(risk_manager, **engine_kwargs)
-        result = await asyncio.to_thread(
-            asyncio.run,
-            engine.run(slots, account_balance=Decimal(account_balance_str)),
-        )
-        job.portfolio_result = result
-        job.status = "done"
-    except Exception as exc:
-        job.error = str(exc)
-        job.status = "error"
-    finally:
-        job.finished_at = datetime.now(UTC)
-
-
-# ---------------------------------------------------------------------------
-# Result serialisation
-# ---------------------------------------------------------------------------
-
-
-def _serialise_result(result: BacktestResult) -> dict:
-    m = result.metrics
-    trades_out = [
-        {
-            "trade_id": str(t.trade_id),
-            "entry_price": str(t.entry_price),
-            "exit_price": str(t.exit_price) if t.exit_price else None,
-            "stop_loss_price": str(t.stop_loss_price),
-            "take_profit_price": str(t.take_profit_price),
-            "quantity": t.quantity,
-            "pnl": str(t.pnl) if t.pnl is not None else None,
-            "exit_reason": t.exit_reason,
-            "entry_time": t.entry_time.isoformat(),
-            "exit_time": t.exit_time.isoformat() if t.exit_time else None,
-        }
-        for t in result.trades
-    ]
-
-    return {
-        "symbol": result.symbol,
-        "strategy_type": result.strategy_type,
-        "account_balance": str(result.account_balance),
-        "start_time": result.start_time.isoformat(),
-        "end_time": result.end_time.isoformat(),
-        "trades": trades_out,
-        "metrics": _serialise_metrics(m) if m else None,
-    }
-
-
-def _serialise_metrics(m: BacktestMetrics) -> dict:
-    return {
-        "trade_count": m.trade_count,
-        "win_count": m.win_count,
-        "loss_count": m.loss_count,
-        "win_rate_pct": round(m.win_rate_pct, 2),
-        "total_return": str(m.total_return),
-        "total_return_pct": round(m.total_return_pct, 4),
-        "avg_trade_pnl": str(m.avg_trade_pnl),
-        "avg_winner": str(m.avg_winner),
-        "avg_loser": str(m.avg_loser),
-        "largest_winner": str(m.largest_winner),
-        "largest_loser": str(m.largest_loser),
-        "max_drawdown_pct": round(m.max_drawdown_pct, 4),
-        "sharpe_ratio": round(m.sharpe_ratio, 4),
-        "bars_tested": m.bars_tested,
-        "signals_generated": m.signals_generated,
-        "signals_rejected": m.signals_rejected,
-        "ending_balance": str(m.ending_balance),
-        "total_commission_paid": str(m.total_commission_paid),
-    }
-
-
-def _serialise_portfolio_result(result: PortfolioBacktestResult) -> dict:
-    return {
-        "account_balance": str(result.account_balance),
-        "start_time": result.start_time.isoformat(),
-        "end_time": result.end_time.isoformat(),
-        "per_strategy": [_serialise_result(ps) for ps in result.per_strategy],
-        "combined_equity_curve": [
-            [ts.isoformat(), str(pnl)]
-            for ts, pnl in result.combined_equity_curve
-        ],
-        "combined_metrics": _serialise_metrics(result.combined_metrics),
-    }

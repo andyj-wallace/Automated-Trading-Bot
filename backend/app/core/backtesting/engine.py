@@ -37,80 +37,24 @@ Limitations (intentional scope):
 
 from __future__ import annotations
 
-import math
-from bisect import bisect_right
-from dataclasses import dataclass, field
-from datetime import datetime
-from decimal import ROUND_HALF_UP, Decimal
-from uuid import UUID, uuid4
+import math as math
+from bisect import bisect_right as bisect_right
+from dataclasses import dataclass as dataclass
+from dataclasses import field as field
+from datetime import datetime as datetime
+from decimal import ROUND_HALF_UP as ROUND_HALF_UP
+from decimal import Decimal
+from uuid import UUID as UUID
+from uuid import uuid4
 
 from app.brokers.base import PriceBar
+from app.core.backtesting.fills import apply_slippage, exit_fill, leg_commission, visible_extra_bars
+from app.core.backtesting.metrics import _compute_metrics
+from app.core.backtesting.results import BacktestMetrics as BacktestMetrics
+from app.core.backtesting.results import BacktestResult, SimulatedTrade
 from app.core.risk.costs import CostModel
 from app.core.risk.manager import RiskManager, RiskRejectionError, TradeRequest
-from app.core.strategy_engine.base import BaseStrategy, MarketData, RiskParams
-
-# ---------------------------------------------------------------------------
-# Domain models
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class SimulatedTrade:
-    trade_id: UUID
-    symbol: str
-    direction: str          # "BUY" (shorts skipped for now)
-    entry_price: Decimal
-    stop_loss_price: Decimal
-    take_profit_price: Decimal
-    quantity: int
-    risk_amount: Decimal
-    entry_bar_index: int
-    entry_time: datetime
-    exit_price: Decimal | None = None
-    exit_time: datetime | None = None
-    exit_reason: str | None = None   # "STOP_LOSS" | "TAKE_PROFIT" | "END_OF_DATA"
-    pnl: Decimal | None = None
-    commission_paid: Decimal = Decimal("0")  # entry + exit leg, already netted into pnl
-
-
-@dataclass
-class BacktestMetrics:
-    """Computed summary metrics for a completed backtest (15.2)."""
-
-    trade_count: int
-    win_count: int
-    loss_count: int
-    win_rate_pct: float          # 0–100
-
-    total_return: Decimal        # sum of all P&L
-    total_return_pct: float      # total_return / initial_balance × 100
-    avg_trade_pnl: Decimal
-    avg_winner: Decimal
-    avg_loser: Decimal
-    largest_winner: Decimal
-    largest_loser: Decimal
-
-    max_drawdown_pct: float      # peak-to-trough on cumulative equity, 0–100
-    sharpe_ratio: float          # annualised Sharpe (daily returns, rf=0)
-
-    bars_tested: int
-    signals_generated: int
-    signals_rejected: int        # by RiskManager
-    total_commission_paid: Decimal = Decimal("0")
-    ending_balance: Decimal = Decimal("0")  # initial balance + total_return
-
-
-@dataclass
-class BacktestResult:
-    symbol: str
-    strategy_type: str
-    strategy_config: dict
-    account_balance: Decimal
-    start_time: datetime
-    end_time: datetime
-    trades: list[SimulatedTrade] = field(default_factory=list)
-    metrics: BacktestMetrics | None = None
-
+from app.core.strategy_engine.base import BaseStrategy, MarketData, RiskParams, Signal
 
 # ---------------------------------------------------------------------------
 # Engine
@@ -208,103 +152,16 @@ class BacktestingEngine:
 
             # 2. No open trade — generate signal from strategy
             if open_trade is None:
-                market_data = MarketData(
-                    symbol=symbol,
-                    current_price=current_bar.close,
-                    bars=history,
-                    timestamp=current_bar.timestamp,
-                    extra_bars=visible_extra_bars(extra_bars, extra_times, current_bar.timestamp),
+                open_trade, generated, rejected = await self._try_enter(
+                    symbol, bars, i, current_bar, history,
+                    extra_bars, extra_times, account_balance, result,
                 )
-                signal = await self._strategy.generate_signal(market_data)
-
-                if signal.action == "HOLD":
-                    continue
-
-                if signal.action == "SELL":
-                    # Skip shorts — RiskManager long-only guard would reject anyway
-                    continue
-
-                signals_generated += 1
-
-                # Fill at next bar's open (look-ahead safe only if i+1 < len)
-                if i + 1 >= len(bars):
-                    continue
-                fill_bar = bars[i + 1]
-                raw_fill_price = fill_bar.open
-
-                # Risk gates run on the intended (pre-slippage) price, matching
-                # live OrderManager: validation happens before the broker call,
-                # using the requested price — slippage is only realized after,
-                # in the actual fill. This keeps gate accept/reject decisions
-                # identical to the frictionless case; only PnL is affected.
-                balance = account_balance
-                if self._compound:
-                    balance += sum((t.pnl or Decimal("0") for t in result.trades), Decimal("0"))
-                    if balance <= 0:
-                        continue
-                risk_params = RiskParams(
-                    account_balance=balance,
-                    entry_price=raw_fill_price,
-                    stop_loss_price=signal.stop_loss_price or (raw_fill_price * Decimal("0.97")),
-                )
-                quantity = await self._strategy.calculate_position_size(risk_params)
-                if quantity <= 0:
-                    signals_rejected += 1
-                    continue
-
-                # Run through risk gates
-                stop = signal.stop_loss_price or (raw_fill_price * Decimal("0.97")).quantize(Decimal("0.01"))
-                tp_hint = signal.take_profit_price
-
-                request = TradeRequest(
-                    trade_id=uuid4(),
-                    symbol=symbol,
-                    direction="BUY",
-                    quantity=Decimal(str(quantity)),
-                    entry_price=raw_fill_price,
-                    stop_loss_price=stop,
-                    account_balance=balance,
-                    take_profit_price=tp_hint,
-                )
-                try:
-                    validation = self._risk_manager.validate(request)
-                except RiskRejectionError:
-                    signals_rejected += 1
-                    continue
-
-                # Long entry: slippage works against us — we pay slightly more.
-                fill_price = self._apply_slippage(raw_fill_price, worse_direction=1)
-                risk_amt = Decimal(str(quantity)) * (fill_price - request.stop_loss_price)
-                open_trade = SimulatedTrade(
-                    trade_id=request.trade_id,
-                    symbol=symbol,
-                    direction="BUY",
-                    entry_price=fill_price,
-                    stop_loss_price=request.stop_loss_price,
-                    take_profit_price=validation.take_profit_price,
-                    quantity=quantity,
-                    risk_amount=risk_amt,
-                    entry_bar_index=i + 1,
-                    entry_time=fill_bar.timestamp,
-                    commission_paid=leg_commission(
-                        self._cost_model, self._commission_per_trade, quantity, fill_price
-                    ),  # entry leg
-                )
+                signals_generated += generated
+                signals_rejected += rejected
 
         # Close any trade still open at end of data
         if open_trade is not None:
-            last_bar = bars[-1]
-            # Long exit: slippage works against us — we receive slightly less.
-            open_trade.exit_price = self._apply_slippage(last_bar.close, worse_direction=-1)
-            open_trade.exit_time = last_bar.timestamp
-            open_trade.exit_reason = "END_OF_DATA"
-            open_trade.commission_paid += leg_commission(
-                self._cost_model, self._commission_per_trade, open_trade.quantity, open_trade.exit_price
-            )  # exit leg
-            open_trade.pnl = (
-                (open_trade.exit_price - open_trade.entry_price) * open_trade.quantity
-                - open_trade.commission_paid
-            )
+            self._close_at_end(open_trade, bars)
             result.trades.append(open_trade)
 
         result.metrics = _compute_metrics(
@@ -319,6 +176,135 @@ class BacktestingEngine:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    async def _try_enter(
+        self,
+        symbol: str,
+        bars: list[PriceBar],
+        i: int,
+        current_bar: PriceBar,
+        history: list[PriceBar],
+        extra_bars: dict[str, list[PriceBar]],
+        extra_times: dict[str, list[datetime]],
+        account_balance: Decimal,
+        result: BacktestResult,
+    ) -> tuple[SimulatedTrade | None, int, int]:
+        """Evaluate the strategy on this bar and try to open a trade on a BUY."""
+        signals_generated = 0
+        market_data = MarketData(
+            symbol=symbol,
+            current_price=current_bar.close,
+            bars=history,
+            timestamp=current_bar.timestamp,
+            extra_bars=visible_extra_bars(extra_bars, extra_times, current_bar.timestamp),
+        )
+        signal = await self._strategy.generate_signal(market_data)
+
+        if signal.action == "HOLD":
+            return None, 0, 0
+
+        if signal.action == "SELL":
+            # Skip shorts — RiskManager long-only guard would reject anyway
+            return None, 0, 0
+
+        signals_generated += 1
+
+        open_trade, signals_rejected = await self._try_open(
+            symbol, bars, i, signal, account_balance, result
+        )
+        return open_trade, signals_generated, signals_rejected
+
+    async def _try_open(
+        self,
+        symbol: str,
+        bars: list[PriceBar],
+        i: int,
+        signal: Signal,
+        account_balance: Decimal,
+        result: BacktestResult,
+    ) -> tuple[SimulatedTrade | None, int]:
+        """Run the entry gates for `signal`; return the new trade (or None) and rejections."""
+        signals_rejected = 0
+        # Fill at next bar's open (look-ahead safe only if i+1 < len)
+        if i + 1 >= len(bars):
+            return None, signals_rejected
+        fill_bar = bars[i + 1]
+        raw_fill_price = fill_bar.open
+
+        # Risk gates run on the intended (pre-slippage) price, matching
+        # live OrderManager: validation happens before the broker call,
+        # using the requested price — slippage is only realized after,
+        # in the actual fill. This keeps gate accept/reject decisions
+        # identical to the frictionless case; only PnL is affected.
+        balance = account_balance
+        if self._compound:
+            balance += sum((t.pnl or Decimal("0") for t in result.trades), Decimal("0"))
+            if balance <= 0:
+                return None, signals_rejected
+        risk_params = RiskParams(
+            account_balance=balance,
+            entry_price=raw_fill_price,
+            stop_loss_price=signal.stop_loss_price or (raw_fill_price * Decimal("0.97")),
+        )
+        quantity = await self._strategy.calculate_position_size(risk_params)
+        if quantity <= 0:
+            signals_rejected += 1
+            return None, signals_rejected
+
+        # Run through risk gates
+        stop = signal.stop_loss_price or (raw_fill_price * Decimal("0.97")).quantize(Decimal("0.01"))
+        tp_hint = signal.take_profit_price
+
+        request = TradeRequest(
+            trade_id=uuid4(),
+            symbol=symbol,
+            direction="BUY",
+            quantity=Decimal(str(quantity)),
+            entry_price=raw_fill_price,
+            stop_loss_price=stop,
+            account_balance=balance,
+            take_profit_price=tp_hint,
+        )
+        try:
+            validation = self._risk_manager.validate(request)
+        except RiskRejectionError:
+            signals_rejected += 1
+            return None, signals_rejected
+
+        # Long entry: slippage works against us — we pay slightly more.
+        fill_price = self._apply_slippage(raw_fill_price, worse_direction=1)
+        risk_amt = Decimal(str(quantity)) * (fill_price - request.stop_loss_price)
+        open_trade = SimulatedTrade(
+            trade_id=request.trade_id,
+            symbol=symbol,
+            direction="BUY",
+            entry_price=fill_price,
+            stop_loss_price=request.stop_loss_price,
+            take_profit_price=validation.take_profit_price,
+            quantity=quantity,
+            risk_amount=risk_amt,
+            entry_bar_index=i + 1,
+            entry_time=fill_bar.timestamp,
+            commission_paid=leg_commission(
+                self._cost_model, self._commission_per_trade, quantity, fill_price
+            ),  # entry leg
+        )
+        return open_trade, signals_rejected
+
+    def _close_at_end(self, open_trade: SimulatedTrade, bars: list[PriceBar]) -> None:
+        """Close a trade still open at the end of the data at the last bar's close."""
+        last_bar = bars[-1]
+        # Long exit: slippage works against us — we receive slightly less.
+        open_trade.exit_price = self._apply_slippage(last_bar.close, worse_direction=-1)
+        open_trade.exit_time = last_bar.timestamp
+        open_trade.exit_reason = "END_OF_DATA"
+        open_trade.commission_paid += leg_commission(
+            self._cost_model, self._commission_per_trade, open_trade.quantity, open_trade.exit_price
+        )  # exit leg
+        open_trade.pnl = (
+            (open_trade.exit_price - open_trade.entry_price) * open_trade.quantity
+            - open_trade.commission_paid
+        )
 
     def _check_exit(
         self, trade: SimulatedTrade, bar: PriceBar, bar_index: int
@@ -348,125 +334,3 @@ class BacktestingEngine:
     def _apply_slippage(self, price: Decimal, *, worse_direction: int) -> Decimal:
         """Adjust `price` unfavorably by this engine's `_slippage_pct`."""
         return apply_slippage(price, worse_direction, self._slippage_pct)
-
-
-def exit_fill(
-    trade: SimulatedTrade, bar: PriceBar, slippage_pct: Decimal
-) -> tuple[Decimal, str] | None:
-    """Exit price and reason if `bar` reaches the stop or target; a gap past a level fills at the open."""
-    if bar.open <= trade.stop_loss_price:
-        return apply_slippage(bar.open, -1, slippage_pct), "STOP_LOSS"
-    if bar.low <= trade.stop_loss_price:
-        return apply_slippage(trade.stop_loss_price, -1, slippage_pct), "STOP_LOSS"
-    if bar.open >= trade.take_profit_price:
-        return apply_slippage(bar.open, -1, slippage_pct), "TAKE_PROFIT"
-    if bar.high >= trade.take_profit_price:
-        return apply_slippage(trade.take_profit_price, -1, slippage_pct), "TAKE_PROFIT"
-    return None
-
-
-def leg_commission(
-    cost_model: CostModel | None, flat_fee: Decimal, quantity: int, price: Decimal
-) -> Decimal:
-    """One order's fee: the broker schedule when a cost model is set, else the flat per-leg fee."""
-    return cost_model.commission(Decimal(quantity), price) if cost_model else flat_fee
-
-
-def visible_extra_bars(
-    extra_bars: dict[str, list[PriceBar]], extra_times: dict[str, list[datetime]], now: datetime
-) -> dict[str, list[PriceBar]]:
-    """Each extra symbol's bars dated <= `now` (no look-ahead)."""
-    return {
-        sym: series[: bisect_right(extra_times[sym], now)] for sym, series in extra_bars.items()
-    }
-
-
-def apply_slippage(price: Decimal, worse_direction: int, slippage_pct: Decimal) -> Decimal:
-    """
-    Adjust `price` unfavorably by `slippage_pct`.
-
-    worse_direction=+1 for a buy (we pay more), -1 for a sell (we receive
-    less). Rounded to 2dp like a real stock price. Shared between
-    BacktestingEngine and PortfolioBacktestEngine so both apply identical
-    friction.
-    """
-    adjusted = price * (Decimal("1") + worse_direction * slippage_pct)
-    return adjusted.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-
-
-# ---------------------------------------------------------------------------
-# Metrics computation (15.2)
-# ---------------------------------------------------------------------------
-
-
-def _compute_metrics(
-    trades: list[SimulatedTrade],
-    initial_balance: Decimal,
-    bars_tested: int,
-    signals_generated: int,
-    signals_rejected: int,
-) -> BacktestMetrics:
-    if not trades:
-        return BacktestMetrics(
-            trade_count=0, win_count=0, loss_count=0, win_rate_pct=0.0,
-            total_return=Decimal("0"), total_return_pct=0.0,
-            avg_trade_pnl=Decimal("0"), avg_winner=Decimal("0"),
-            avg_loser=Decimal("0"), largest_winner=Decimal("0"),
-            largest_loser=Decimal("0"), max_drawdown_pct=0.0,
-            sharpe_ratio=0.0, bars_tested=bars_tested,
-            signals_generated=signals_generated, signals_rejected=signals_rejected,
-            ending_balance=initial_balance,
-        )
-
-    pnls = [t.pnl or Decimal("0") for t in trades]
-    winners = [p for p in pnls if p > 0]
-    losers = [p for p in pnls if p <= 0]
-    total_return = sum(pnls, Decimal("0"))
-    total_commission = sum((t.commission_paid for t in trades), Decimal("0"))
-
-    # Equity curve for drawdown and Sharpe
-    equity = Decimal("0")
-    peak = Decimal("0")
-    max_dd = Decimal("0")
-    daily_returns: list[float] = []
-
-    for p in pnls:
-        equity += p
-        if equity > peak:
-            peak = equity
-        dd = peak - equity
-        if dd > max_dd:
-            max_dd = dd
-        daily_returns.append(float(p) / float(initial_balance))
-
-    max_dd_pct = float(max_dd / initial_balance) * 100 if initial_balance else 0.0
-
-    # Annualised Sharpe (assumes ~252 trading days; backtest bars are daily)
-    sharpe = 0.0
-    if len(daily_returns) > 1:
-        mean_r = sum(daily_returns) / len(daily_returns)
-        variance = sum((r - mean_r) ** 2 for r in daily_returns) / (len(daily_returns) - 1)
-        std_r = math.sqrt(variance)
-        if std_r > 0:
-            sharpe = (mean_r / std_r) * math.sqrt(252)
-
-    return BacktestMetrics(
-        trade_count=len(trades),
-        win_count=len(winners),
-        loss_count=len(losers),
-        win_rate_pct=len(winners) / len(trades) * 100,
-        total_return=total_return,
-        total_return_pct=float(total_return / initial_balance) * 100,
-        avg_trade_pnl=total_return / len(trades),
-        avg_winner=sum(winners, Decimal("0")) / len(winners) if winners else Decimal("0"),
-        avg_loser=sum(losers, Decimal("0")) / len(losers) if losers else Decimal("0"),
-        largest_winner=max(winners, default=Decimal("0")),
-        largest_loser=min(losers, default=Decimal("0")),
-        max_drawdown_pct=max_dd_pct,
-        sharpe_ratio=sharpe,
-        bars_tested=bars_tested,
-        signals_generated=signals_generated,
-        signals_rejected=signals_rejected,
-        total_commission_paid=total_commission,
-        ending_balance=initial_balance + total_return,
-    )

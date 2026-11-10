@@ -8,10 +8,12 @@ See DEPLOYMENT.md for running the Gateway (Docker, auto-login).
 """
 
 import asyncio
-import math
+import math as math
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from datetime import UTC, datetime, timedelta
+from datetime import UTC as UTC
+from datetime import datetime
+from datetime import timedelta as timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -20,20 +22,30 @@ from ib_async import IB, LimitOrder, MarketOrder, Stock, StopOrder
 from app.brokers.base import (
     AccountSummary,
     BaseBroker,
-    BrokerConnectionInfo,
     OrderRequest,
     OrderResult,
     Position,
-    PriceBar,
     PriceFeedCallback,
-    PriceUpdate,
+)
+from app.brokers.base import (
+    BrokerConnectionInfo as BrokerConnectionInfo,
+)
+from app.brokers.base import (
+    PriceBar as PriceBar,
+)
+from app.brokers.base import (
+    PriceUpdate as PriceUpdate,
 )
 from app.brokers.ibkr import mapper
-from app.brokers.ibkr.hints import login_hint
+from app.brokers.ibkr.connection_status import IBKRConnectionStatusMixin
+from app.brokers.ibkr.hints import login_hint as login_hint
+from app.brokers.ibkr.market_data import _REEMIT_SECONDS as _REEMIT_SECONDS
+from app.brokers.ibkr.market_data import IBKRMarketDataMixin
+from app.brokers.ibkr.market_data import _positive_decimal as _positive_decimal
 from app.config import Settings
 from app.core import market_calendar
 from app.core.events import publish_system_alert
-from app.core.tasks import spawn
+from app.core.tasks import spawn as spawn
 from app.monitoring.logger import system_logger
 
 if TYPE_CHECKING:
@@ -46,9 +58,6 @@ _CANCEL_WAIT_SECONDS = 10
 _COMMISSION_WAIT_SECONDS = 2
 _STOP_ACK_SECONDS = 10
 
-# Re-emit an unchanged price after this many seconds so the Redis price key stays fresh.
-_REEMIT_SECONDS = 5
-
 _DEFAULT_BACKOFF = (5, 10, 20, 40, 60)
 
 
@@ -56,14 +65,7 @@ class LiveTradingGuardError(RuntimeError):
     """Raised when the configured or actual account mode conflicts with the environment."""
 
 
-def _positive_decimal(value: float | None) -> Decimal | None:
-    """Convert a tick value to Decimal; None for missing, NaN, infinite or non-positive."""
-    if value is None or math.isnan(value) or math.isinf(value) or value <= 0:
-        return None
-    return Decimal(str(value))
-
-
-class IBKRClient(BaseBroker):
+class IBKRClient(IBKRMarketDataMixin, IBKRConnectionStatusMixin, BaseBroker):
     """
     Production broker implementation backed by Interactive Brokers via ib_async.
 
@@ -176,41 +178,6 @@ class IBKRClient(BaseBroker):
                 f"(account prefix {str(bad[0])[:2]}). Refusing to trade."
             )
 
-    def add_reconnect_listener(self, fn: Callable[[], Awaitable[None]]) -> None:
-        """Register a coroutine function awaited after every successful reconnect."""
-        self._reconnect_listeners.append(fn)
-
-    def _now(self) -> datetime:
-        return self._clock().astimezone(UTC)
-
-    def _mark_down(self, exc: BaseException | None = None) -> None:
-        if self._down_since is None:
-            self._down_since = self._now()
-        if exc is not None:
-            self._last_error = str(exc) or type(exc).__name__
-
-    def _hint(self) -> str:
-        return login_hint(self._clock(), self._settings.ib_auto_restart_time)
-
-    def connection_info(self) -> BrokerConnectionInfo:
-        """Connection state plus the most likely fix, for the dashboard and health check."""
-        if self._ib.isConnected():
-            return BrokerConnectionInfo(state="connected", last_connected_at=self._last_connected_at)
-        if self._account_mismatch:
-            state = "account_mismatch"
-            hint = "The Gateway is logged into a non-paper account; log it into the paper account."
-        else:
-            down_for = (self._now() - self._down_since).total_seconds() if self._down_since else 0
-            state = "down" if down_for >= self._alert_after else "reconnecting"
-            hint = self._hint()
-        return BrokerConnectionInfo(
-            state=state,
-            down_since=self._down_since,
-            last_connected_at=self._last_connected_at,
-            last_error=self._last_error,
-            hint=hint,
-        )
-
     async def _supervise(self) -> None:
         loop = asyncio.get_running_loop()
         down_since: float | None = None
@@ -282,45 +249,6 @@ class IBKRClient(BaseBroker):
         self._last_emitted.clear()
         self._pending_tickers_handler_registered = False
 
-    def _on_disconnected(self) -> None:
-        """Fired by ib_async when the Gateway drops the connection; the supervisor reconnects."""
-        system_logger.warning(
-            "IBKRClient lost connection to IB Gateway",
-            extra={"host": self._settings.ibkr_host, "port": self._settings.ibkr_port},
-        )
-
-    def _on_error(self, req_id: int, error_code: int, error_string: str, contract) -> None:
-        """
-        Fired by ib_async for every error or informational message from IB Gateway.
-
-        Error codes 1100-1300 relate to connectivity. Key ones:
-          1100 — connection lost
-          1101 — reconnected, data lost
-          1102 — reconnected, data maintained
-          2110 — connectivity between TWS and server is broken
-        See: https://ibkrcampus.com/ibkr-api-page/trader-workstation-api/#error-codes
-        """
-        # IB uses low codes (1-9xx) for normal info messages; only log as warning/error for real problems
-        if error_code < 2000:
-            system_logger.warning(
-                "IBKRClient: IB Gateway error",
-                extra={
-                    "req_id": req_id,
-                    "error_code": error_code,
-                    "error": error_string,
-                    "symbol": contract.symbol if contract else None,
-                },
-            )
-        else:
-            system_logger.info(
-                "IBKRClient: IB Gateway message",
-                extra={
-                    "req_id": req_id,
-                    "error_code": error_code,
-                    "ib_message": error_string,
-                },
-            )
-
     def is_connected(self) -> bool:
         return self._ib.isConnected()
 
@@ -337,66 +265,6 @@ class IBKRClient(BaseBroker):
         self._require_connected()
         ib_positions = await self._ib.reqPositionsAsync()
         return [mapper.map_position(p) for p in ib_positions]
-
-    # ------------------------------------------------------------------
-    # Market data
-    # ------------------------------------------------------------------
-
-    async def subscribe_price_feed(
-        self,
-        tickers: list[str],
-        callback: PriceFeedCallback,
-    ) -> None:
-        """
-        Subscribe to real-time price ticks for the given symbols.
-
-        Registers new contracts with IBKR and attaches the callback to
-        the pendingTickersEvent. Subsequent calls with the same symbols
-        are idempotent (already-subscribed tickers are skipped).
-        """
-        self._require_connected()
-
-        if callback not in self._price_callbacks:
-            self._price_callbacks.append(callback)
-
-        for symbol in tickers:
-            if symbol not in self._subscribed_contracts:
-                contract = Stock(symbol, "SMART", "USD")
-                self._ib.reqMktData(contract)
-                self._subscribed_contracts[symbol] = contract
-
-        if not self._pending_tickers_handler_registered:
-            self._ib.pendingTickersEvent += self._on_pending_tickers
-            self._pending_tickers_handler_registered = True
-
-    def _on_pending_tickers(self, tickers: set) -> None:
-        """
-        Synchronous callback fired by ib_async when ticker data updates.
-
-        Only valid last-trade prices are forwarded; callbacks run as referenced tasks.
-        """
-        now = datetime.now(UTC)
-        for ticker in tickers:
-            price = _positive_decimal(ticker.last)
-            if price is None:
-                continue
-            symbol = ticker.contract.symbol
-            last = self._last_emitted.get(symbol)
-            if last and last[0] == price and (now - last[1]).total_seconds() < _REEMIT_SECONDS:
-                continue
-            self._last_emitted[symbol] = (price, now)
-            prev_close = _positive_decimal(ticker.close)
-            update = PriceUpdate(
-                ticker=symbol,
-                price=price,
-                bid=_positive_decimal(ticker.bid),
-                ask=_positive_decimal(ticker.ask),
-                day_change=(price - prev_close) if prev_close else None,
-                day_change_pct=((price - prev_close) / prev_close) if prev_close else None,
-                timestamp=now,
-            )
-            for cb in list(self._price_callbacks):
-                spawn(cb(update), name=f"tick-{symbol}", registry=self._tasks)
 
     # ------------------------------------------------------------------
     # Order management
@@ -469,65 +337,6 @@ class IBKRClient(BaseBroker):
         self._require_connected()
         fills = await self._ib.reqExecutionsAsync()
         return mapper.summarize_fills(order_ref, list(fills))
-
-    async def unsubscribe_price_feed(self, ticker: str) -> None:
-        """Cancel a real-time market data subscription for one ticker."""
-        self._require_connected()
-        if ticker in self._subscribed_contracts:
-            self._ib.cancelMktData(self._subscribed_contracts[ticker])
-            del self._subscribed_contracts[ticker]
-
-    async def get_historical_data(
-        self,
-        symbol: str,
-        duration: str = "1 Y",
-        bar_size: str = "1 day",
-    ) -> list[PriceBar]:
-        """Fetch OHLCV history from IB Gateway via reqHistoricalDataAsync."""
-        self._require_connected()
-        contract = Stock(symbol, "SMART", "USD")
-        bars = await self._ib.reqHistoricalDataAsync(
-            contract,
-            endDateTime="",       # empty string = now
-            durationStr=duration,
-            barSizeSetting=bar_size,
-            whatToShow="TRADES",
-            useRTH=True,          # regular trading hours only
-        )
-        return [mapper.map_price_bar(bar, bar_size) for bar in bars]
-
-    async def get_intraday_bars(self, symbol: str) -> list[PriceBar]:
-        """Today's completed 5-minute regular-hours bars; the still-forming bar is dropped."""
-        self._require_connected()
-        bars = await self._ib.reqHistoricalDataAsync(
-            Stock(symbol, "SMART", "USD"),
-            endDateTime="",
-            durationStr="1 D",
-            barSizeSetting="5 mins",
-            whatToShow="TRADES",
-            useRTH=True,
-            formatDate=2,  # UTC datetimes; the default is exchange-local time that would be mislabelled as UTC
-        )
-        now = datetime.now(UTC)
-        mapped = [mapper.map_price_bar(bar, "5 mins") for bar in bars]
-        return [b for b in mapped if b.timestamp + timedelta(minutes=5) <= now]
-
-    async def validate_ticker(self, symbol: str) -> bool:
-        """
-        Check whether the symbol resolves to a valid IBKR-tradeable stock.
-
-        Qualifies the contract against IBKR's contract database. Returns True
-        if at least one matching contract is found, False otherwise. Falls back
-        to True if not connected so callers are never blocked by connectivity.
-        """
-        if not self._ib.isConnected():
-            return True  # cannot validate without connection — allow the add
-        contract = Stock(symbol.upper(), "SMART", "USD")
-        try:
-            details = await self._ib.reqContractDetailsAsync(contract)
-            return len(details) > 0
-        except Exception:
-            return False
 
     async def cancel_order(self, broker_order_id: str) -> bool:
         """
