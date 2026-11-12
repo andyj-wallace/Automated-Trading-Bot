@@ -148,3 +148,45 @@ async def test_get_active_trade_none_for_other_symbol(factory):
     await _make_open(factory)
     async with factory() as s:
         assert await TradeRepo(s).get_active_trade("MSFT") is None
+
+
+async def test_raise_current_stop_only_raises(factory):
+    tid = await _make_open(factory)
+    async with factory() as s:
+        await TradeRepo(s).raise_current_stop(tid, Decimal("201"))
+        await s.commit()
+    async with factory() as s:
+        await TradeRepo(s).raise_current_stop(tid, Decimal("199"))
+        await s.commit()
+    async with factory() as s:
+        t = await TradeRepo(s).get_by_id(tid)
+    assert t.current_stop_price == Decimal("201")
+    assert t.stop_loss_price == Decimal("195")
+
+
+async def test_set_stop_order_keeps_higher_trailing_stop(factory):
+    tid = await _make_open(factory)
+    async with factory() as s:
+        await TradeRepo(s).raise_current_stop(tid, Decimal("201"))
+        await s.commit()
+    async with factory() as s:
+        await TradeRepo(s).set_stop_order(tid, "STOP1", Decimal("195"))
+        await s.commit()
+    async with factory() as s:
+        t = await TradeRepo(s).get_by_id(tid)
+    assert t.current_stop_price == Decimal("201")
+    assert t.stop_order_id == "STOP1"
+
+
+async def test_set_stop_order_sets_stop_when_null(factory):
+    tid = await _make_open(factory)
+    async with factory() as s:
+        await s.execute(text("UPDATE trades SET current_stop_price = NULL WHERE id = :id"), {"id": tid})
+        await s.commit()
+    async with factory() as s:
+        await TradeRepo(s).set_stop_order(tid, "STOP1", Decimal("195"))
+        await s.commit()
+    async with factory() as s:
+        t = await TradeRepo(s).get_by_id(tid)
+    assert t.current_stop_price == Decimal("195")
+    assert t.stop_order_id == "STOP1"

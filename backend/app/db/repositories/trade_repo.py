@@ -15,7 +15,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.trade import ACTIVE_RISK_STATUSES, ExitReason, Trade, TradeDirection, TradeStatus
@@ -241,8 +241,22 @@ class TradeRepo:
         """Record (or clear, with None) the protective stop order id and its price."""
         values: dict = {"stop_order_id": order_id}
         if stop_price is not None:
-            values["current_stop_price"] = stop_price
+            values["current_stop_price"] = func.greatest(Trade.current_stop_price, stop_price)
         await self.session.execute(update(Trade).where(Trade.id == trade_id).values(**values))
+
+    async def raise_current_stop(self, trade_id: uuid.UUID, stop_price: Decimal) -> None:
+        """Persist a trailed stop; never lowers the stored current_stop_price."""
+        await self.session.execute(
+            update(Trade)
+            .where(
+                Trade.id == trade_id,
+                or_(
+                    Trade.current_stop_price.is_(None),
+                    Trade.current_stop_price < stop_price,
+                ),
+            )
+            .values(current_stop_price=stop_price)
+        )
 
     async def set_exit_order(self, trade_id: uuid.UUID, order_id: str) -> None:
         """Record the broker order id of the exit order."""
