@@ -108,7 +108,8 @@ class CompositeStrategy(BaseStrategy):
         """
         Run all sub-strategies on the same market data and combine results.
 
-        "any" mode:      returns the first non-HOLD signal encountered.
+        "any" mode:      when flat, returns the first BUY (SELLs are skipped); when
+                          holding, returns the first SELL (BUYs are skipped).
         "all" mode:      combines all sub-strategies' signals only when every
                           one produces the same non-HOLD action; otherwise HOLD.
         "majority" mode: combines the agreeing sub-strategies' signals when a
@@ -118,8 +119,9 @@ class CompositeStrategy(BaseStrategy):
         signals = [await s.generate_signal(market_data) for s in self._strategies]
 
         if self._mode == "any":
+            wanted = "SELL" if market_data.open_position else "BUY"
             for sig in signals:
-                if sig.action != "HOLD":
+                if sig.action == wanted:
                     return sig
             return self._hold(market_data.symbol)
 
@@ -171,7 +173,8 @@ class CompositeStrategy(BaseStrategy):
                     "enum": ["any", "all", "majority"],
                     "default": "any",
                     "description": (
-                        "'any': fire on the first sub-strategy signal. "
+                        "'any': fire on the first BUY when flat, or the first SELL when "
+                        "holding a position. "
                         "'all': require all sub-strategies to agree on the same action. "
                         "'majority': require a strict majority (> half) to agree."
                     ),

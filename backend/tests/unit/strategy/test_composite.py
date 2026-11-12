@@ -36,13 +36,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from unittest.mock import AsyncMock
 
 import pytest
 
 # Importing these triggers their self-registration in the global registry
 import app.core.strategy_engine.mean_reversion  # noqa: F401
 import app.core.strategy_engine.stock_trend  # noqa: F401
-from app.core.strategy_engine.base import MarketData, RiskParams
+from app.core.strategy_engine.base import MarketData, RiskParams, Signal
 from app.core.strategy_engine.composite import CompositeStrategy
 
 from .conftest import make_bars_from_closes
@@ -96,6 +97,27 @@ def _any_composite(**overrides) -> CompositeStrategy:
     }
     config.update(overrides)
     return CompositeStrategy(config=config)
+
+
+class _StubStrategy:
+    """Sub-strategy returning a fixed signal."""
+
+    def __init__(self, signal: Signal):
+        self.generate_signal = AsyncMock(return_value=signal)
+
+
+def _buy_signal() -> Signal:
+    return Signal(symbol="TEST", action="BUY", entry_price=Decimal("10"),
+                  stop_loss_price=Decimal("9"), timestamp=datetime.now(UTC))
+
+
+def _sell_signal() -> Signal:
+    return Signal(symbol="TEST", action="SELL", entry_price=Decimal("10"),
+                  stop_loss_price=Decimal("11"), timestamp=datetime.now(UTC))
+
+
+def _hold_signal() -> Signal:
+    return Signal(symbol="TEST", action="HOLD", timestamp=datetime.now(UTC))
 
 
 def _all_composite() -> CompositeStrategy:
@@ -257,6 +279,32 @@ class TestAnyMode:
         assert signal.action == "BUY"
         # Entry should be ST's signal (stop_loss_pct=0.03 → stop=10.19)
         assert signal.stop_loss_price == Decimal("10.19")
+
+    @pytest.mark.asyncio
+    async def test_any_mode_prefers_buy_when_flat(self):
+        """Flat: the BUY wins over an earlier SELL."""
+        c = _any_composite()
+        c._strategies = [_StubStrategy(_sell_signal()), _StubStrategy(_buy_signal())]
+        signal = await c.generate_signal(_market(_both_hold_closes()))
+        assert signal.action == "BUY"
+
+    @pytest.mark.asyncio
+    async def test_any_mode_prefers_sell_when_holding(self):
+        """Holding: the SELL wins over an earlier BUY."""
+        c = _any_composite()
+        c._strategies = [_StubStrategy(_buy_signal()), _StubStrategy(_sell_signal())]
+        market = _market(_both_hold_closes())
+        market.open_position = True
+        signal = await c.generate_signal(market)
+        assert signal.action == "SELL"
+
+    @pytest.mark.asyncio
+    async def test_any_mode_holds_when_only_sell_and_flat(self):
+        """Flat with only a SELL signal available: no entry, so HOLD."""
+        c = _any_composite()
+        c._strategies = [_StubStrategy(_sell_signal()), _StubStrategy(_hold_signal())]
+        signal = await c.generate_signal(_market(_both_hold_closes()))
+        assert signal.action == "HOLD"
 
 
 # ---------------------------------------------------------------------------
