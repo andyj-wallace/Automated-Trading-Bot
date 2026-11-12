@@ -49,7 +49,8 @@ Frontend: ESLint is configured in `frontend/eslint.config.js`; the lint script u
 `--max-warnings 0`. TypeScript is checked with `tsc`.
 
 ## Do not touch
-- backend/alembic/versions/
+- backend/alembic/versions/000*.py
+- backend/alembic/versions/0010_*.py
 - .env.example
 - .env.prod.example
 - frontend/package-lock.json
