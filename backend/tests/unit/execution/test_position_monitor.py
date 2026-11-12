@@ -147,7 +147,7 @@ async def test_stop_never_loosens_on_pullback(monitor: PositionMonitor) -> None:
 async def test_trailed_stop_eventually_triggers_close(monitor: PositionMonitor) -> None:
     trade_id = _track(monitor, entry="200", stop="190", tp="999")
     await monitor.on_price_update(_tick("220"))
-    assert not monitor._tasks
+    assert not monitor._closing
     await monitor.on_price_update(_tick("209"))
     await _settle(monitor)
     monitor._order_manager.close_position.assert_awaited_once_with(trade_id, "STOP_LOSS")
@@ -317,6 +317,9 @@ class _Session:
     async def __aexit__(self, *exc):
         return False
 
+    async def commit(self):
+        return None
+
 
 def _patch_open_trades(monkeypatch, holder: list):
     class Repo:
@@ -443,3 +446,86 @@ async def test_watchdog_silent_when_market_closed(monkeypatch) -> None:
     _track(monitor)
     await monitor._check_price_feed()
     assert alerts == []
+
+
+# ---------------------------------------------------------------------------
+# Persisting the trailed stop (entry=100, stop=95 -> R=5, 0.1R=0.5)
+# ---------------------------------------------------------------------------
+
+
+def _patch_stop_writes(monkeypatch, *, fail_first: bool = False, gate=None) -> list:
+    calls: list[tuple[uuid.UUID, Decimal]] = []
+    state = {"fail": fail_first}
+
+    class Repo:
+        def __init__(self, session) -> None:
+            pass
+
+        async def raise_current_stop(self, trade_id, stop_price):
+            calls.append((trade_id, stop_price))
+            if gate is not None:
+                await gate.wait()
+            if state["fail"]:
+                state["fail"] = False
+                raise RuntimeError("db down")
+
+    monkeypatch.setattr("app.db.repositories.trade_repo.TradeRepo", Repo)
+    return calls
+
+
+async def test_ratchet_of_point_one_r_persists_stop(monkeypatch) -> None:
+    calls = _patch_stop_writes(monkeypatch)
+    monitor = _monitor()
+    monitor._session_factory = _Session
+    trade_id = _track(monitor, entry="100", stop="95", tp="220")
+    await monitor.on_price_update(_tick("106"))
+    await _settle(monitor)
+    assert calls == [(trade_id, Decimal("101"))]
+    assert monitor._tracked[trade_id].persisted_stop == Decimal("101")
+
+
+async def test_small_ratchet_does_not_persist(monkeypatch) -> None:
+    calls = _patch_stop_writes(monkeypatch)
+    monitor = _monitor()
+    monitor._session_factory = _Session
+    trade_id = _track(monitor, entry="100", stop="95", tp="220")
+    await monitor.on_price_update(_tick("106"))
+    await _settle(monitor)
+    await monitor.on_price_update(_tick("106.3"))  # stop 101.3, only +0.3 from 101
+    await _settle(monitor)
+    assert len(calls) == 1
+    await monitor.on_price_update(_tick("106.6"))  # stop 101.6, +0.6 from 101
+    await _settle(monitor)
+    assert calls == [(trade_id, Decimal("101")), (trade_id, Decimal("101.6"))]
+
+
+async def test_failed_write_retries_on_next_tick(monkeypatch) -> None:
+    calls = _patch_stop_writes(monkeypatch, fail_first=True)
+    monitor = _monitor()
+    monitor._session_factory = _Session
+    trade_id = _track(monitor, entry="100", stop="95", tp="220")
+    await monitor.on_price_update(_tick("106"))
+    await _settle(monitor)
+    assert calls == [(trade_id, Decimal("101"))]
+    assert monitor._tracked[trade_id].persisted_stop != Decimal("101")
+    assert monitor._tracked[trade_id].persist_in_flight is False
+    await monitor.on_price_update(_tick("106"))  # no new ratchet, still retries
+    await _settle(monitor)
+    assert calls[-1] == (trade_id, Decimal("101"))
+    assert len(calls) == 2
+    assert monitor._tracked[trade_id].persisted_stop == Decimal("101")
+
+
+async def test_no_duplicate_write_while_in_flight(monkeypatch) -> None:
+    gate = asyncio.Event()
+    calls = _patch_stop_writes(monkeypatch, gate=gate)
+    monitor = _monitor()
+    monitor._session_factory = _Session
+    _track(monitor, entry="100", stop="95", tp="220")
+    await monitor.on_price_update(_tick("106"))
+    await monitor.on_price_update(_tick("106.6"))
+    await asyncio.sleep(0)
+    assert len(calls) == 1
+    gate.set()
+    await _settle(monitor)
+    assert len(calls) == 1

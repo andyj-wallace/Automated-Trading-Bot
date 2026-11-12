@@ -16,11 +16,12 @@ Trailing / breakeven stop (long trades only):
   price from there — turning "winner that reverses" into a scratch instead
   of a full loss, without changing the original 1%-risk or R:R rules.
 
-  This only adjusts PositionMonitor's in-memory tracked copy of the stop —
-  the DB row's stop_loss_price is one of the audit-sensitive fields that is
+  The DB row's stop_loss_price is one of the audit-sensitive fields that is
   never updated after creation (see Trade model), so the original
   risk-approved stop remains the permanent audit record. The trailed stop is
-  purely an operational, in-memory protective level; closes still report
+  kept in PositionMonitor's tracked copy and saved to the DB's
+  current_stop_price when it rises by at least 0.1R (retried on later ticks
+  if the write fails). The IBKR stop order is not moved. Closes still report
   exit_reason="STOP_LOSS" (logged with both the original and effective stop
   so a trailed exit is distinguishable in system.log).
 
@@ -255,6 +256,7 @@ class PositionMonitor:
                 continue
 
             self._update_trailing_stop(tracked, price)
+            self._maybe_persist_stop(tracked)
 
             if price <= tracked.stop_loss_price:
                 hits.append((tracked.trade_id, "STOP_LOSS", tracked))
@@ -304,6 +306,43 @@ class PositionMonitor:
         candidate_stop = price - (r * self._trailing_distance_r)
         if candidate_stop > tracked.stop_loss_price:
             tracked.stop_loss_price = candidate_stop
+
+    def _maybe_persist_stop(self, tracked: _TrackedTrade) -> None:
+        """Start a background write of the trailed stop once it has risen by at least 0.1R."""
+        if tracked.direction != "BUY" or tracked.persist_in_flight:
+            return
+        r = tracked.entry_price - tracked.initial_stop_loss_price
+        if r <= 0:
+            return
+        last = (
+            tracked.persisted_stop
+            if tracked.persisted_stop is not None
+            else tracked.initial_stop_loss_price
+        )
+        if tracked.stop_loss_price - last >= r * Decimal("0.1"):
+            tracked.persist_in_flight = True
+            spawn(
+                self._persist_stop(tracked, tracked.stop_loss_price),
+                name=f"persist-stop-{tracked.trade_id}",
+                registry=self._tasks,
+            )
+
+    async def _persist_stop(self, tracked: _TrackedTrade, stop_price: Decimal) -> None:
+        """Save a trailed stop to current_stop_price; a failed write is retried on a later tick."""
+        from app.db.repositories.trade_repo import TradeRepo
+
+        try:
+            async with self._session_factory() as session:
+                await TradeRepo(session).raise_current_stop(tracked.trade_id, stop_price)
+                await session.commit()
+            tracked.persisted_stop = stop_price
+        except Exception as exc:
+            system_logger.error(
+                "PositionMonitor: persisting trailing stop failed",
+                extra={"trade_id": str(tracked.trade_id), "error": str(exc)},
+            )
+        finally:
+            tracked.persist_in_flight = False
 
     # ------------------------------------------------------------------
     # Internal: stale-trade timeout sweep
