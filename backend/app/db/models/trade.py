@@ -42,6 +42,7 @@ class ExitReason(str, enum.Enum):
     STALE_TIMEOUT = "STALE_TIMEOUT"
     EXTERNAL = "EXTERNAL"  # closed outside the app, found by the reconciler
     TIME_EXIT = "TIME_EXIT"  # day trade closed at its exit_deadline
+    SIGNAL_EXIT = "SIGNAL_EXIT"
 
 
 class Trade(Base):

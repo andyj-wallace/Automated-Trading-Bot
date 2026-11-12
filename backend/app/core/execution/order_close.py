@@ -27,7 +27,7 @@ class OrderCloseMixin:
     async def close_position(
         self,
         trade_id: uuid.UUID,
-        reason: str,  # an ExitReason value: "STOP_LOSS" | "TAKE_PROFIT" | "MANUAL" | "STALE_TIMEOUT" | "EXTERNAL" | "TIME_EXIT"
+        reason: str,  # an ExitReason value: "STOP_LOSS" | "TAKE_PROFIT" | "MANUAL" | "STALE_TIMEOUT" | "EXTERNAL" | "TIME_EXIT" | "SIGNAL_EXIT"
         *,
         allow_from_closing: bool = False,
     ) -> CloseOutcome:

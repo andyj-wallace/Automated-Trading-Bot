@@ -58,7 +58,8 @@ export type ExitReason =
   | "MANUAL"
   | "STALE_TIMEOUT"
   | "EXTERNAL"
-  | "TIME_EXIT";
+  | "TIME_EXIT"
+  | "SIGNAL_EXIT";
 
 export interface Trade {
   id: string;
