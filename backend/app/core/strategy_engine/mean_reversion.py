@@ -37,7 +37,7 @@ Registration:
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 
 from app.core.risk.calculator import RiskCalculator
 from app.core.strategy_engine.base import BaseStrategy, MarketData, RiskParams, Signal
@@ -152,10 +152,8 @@ class MeanReversionStrategy(BaseStrategy):
             stop_distance = entry - stop
 
             # Take-profit: rolling mean, but never below the 2:1 R:R floor.
-            mean_target = mean_now.quantize(_TWO_DP, rounding=ROUND_HALF_UP)
-            min_take_profit = (entry + stop_distance * 2).quantize(
-                _TWO_DP, rounding=ROUND_HALF_UP
-            )
+            mean_target = mean_now.quantize(_TWO_DP, rounding=ROUND_CEILING)
+            min_take_profit = (entry + stop_distance * 2).quantize(_TWO_DP, rounding=ROUND_CEILING)
             take_profit = max(mean_target, min_take_profit)
 
             return Signal(

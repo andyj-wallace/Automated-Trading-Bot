@@ -38,7 +38,7 @@ Registration:
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 
 from app.core.risk.calculator import RiskCalculator
 from app.core.strategy_engine.base import BaseStrategy, MarketData, RiskParams, Signal
@@ -122,7 +122,7 @@ class MovingAverageStrategy(BaseStrategy):
             # Golden cross — BUY
             stop = (entry * (1 - self.stop_loss_pct)).quantize(_TWO_DP, rounding=ROUND_HALF_UP)
             stop_distance = entry - stop
-            take_profit = (entry + stop_distance * 2).quantize(_TWO_DP, rounding=ROUND_HALF_UP)
+            take_profit = (entry + stop_distance * 2).quantize(_TWO_DP, rounding=ROUND_CEILING)
             return Signal(
                 symbol=market_data.symbol,
                 action="BUY",
@@ -141,7 +141,7 @@ class MovingAverageStrategy(BaseStrategy):
             # stop_loss is ABOVE entry for a short position
             stop = (entry * (1 + self.stop_loss_pct)).quantize(_TWO_DP, rounding=ROUND_HALF_UP)
             stop_distance = stop - entry
-            take_profit = (entry - stop_distance * 2).quantize(_TWO_DP, rounding=ROUND_HALF_UP)
+            take_profit = (entry - stop_distance * 2).quantize(_TWO_DP, rounding=ROUND_CEILING)
             return Signal(
                 symbol=market_data.symbol,
                 action="SELL",

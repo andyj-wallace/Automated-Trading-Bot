@@ -200,6 +200,21 @@ async def test_buy_take_profit_at_2_to_1_rr() -> None:
 
 
 @pytest.mark.asyncio
+async def test_take_profit_rounds_up_to_cent() -> None:
+    """Raw target 104.1302 rounds up to 104.14 so the 2:1 floor still holds."""
+    s = _strategy(fast=3, slow=5, stop_pct="0.02")
+    entry = Decimal("100.1234")
+    bars = make_bars_from_closes(_closes_golden_cross())
+    data = make_market_data("X", bars, current_price=entry)
+    signal = await s.generate_signal(data)
+    assert signal.action == "BUY"
+    required = signal.entry_price + 2 * (signal.entry_price - signal.stop_loss_price)
+    assert signal.take_profit_price >= required
+    assert signal.take_profit_price == Decimal("104.14")
+    assert signal.take_profit_price.as_tuple().exponent == -2
+
+
+@pytest.mark.asyncio
 async def test_buy_entry_price_is_current_price() -> None:
     s = _strategy(fast=3, slow=5)
     bars = make_bars_from_closes(_closes_golden_cross())

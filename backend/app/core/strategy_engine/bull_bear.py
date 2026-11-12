@@ -71,7 +71,7 @@ Registration:
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 
 from app.brokers.base import PriceBar
 from app.core.risk.calculator import RiskCalculator
@@ -225,7 +225,7 @@ class BullBearStrategy(BaseStrategy):
         if stop >= entry:
             return None, None
         stop_distance = entry - stop
-        take_profit = (entry + stop_distance * 2).quantize(_TWO_DP, rounding=ROUND_HALF_UP)
+        take_profit = (entry + stop_distance * 2).quantize(_TWO_DP, rounding=ROUND_CEILING)
         return stop, take_profit
 
     def min_history_bars(self) -> int:
