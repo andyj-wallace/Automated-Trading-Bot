@@ -78,6 +78,8 @@ class _TrackedTrade:
     take_profit_price: Decimal
     opened_at: datetime
     exit_deadline: datetime | None = None
+    persisted_stop: Decimal | None = None  # last stop confirmed in the DB; None means initial stop
+    persist_in_flight: bool = False  # True while a stop write is running
 
 
 class PositionMonitor:
@@ -218,16 +220,19 @@ class PositionMonitor:
                 self._tracked.pop(trade_id, None)
 
     def _track(self, trade: Trade) -> None:
+        stored = getattr(trade, "current_stop_price", None)
+        live = max(trade.stop_loss_price, stored) if stored is not None else trade.stop_loss_price
         self._tracked[trade.id] = _TrackedTrade(
             trade_id=trade.id,
             symbol=trade.symbol,
             direction=trade.direction.value,
             entry_price=trade.entry_price,
-            stop_loss_price=trade.stop_loss_price,
+            stop_loss_price=live,
             initial_stop_loss_price=trade.stop_loss_price,
             take_profit_price=trade.take_profit_price,
             opened_at=trade.executed_at,
             exit_deadline=trade.exit_deadline,
+            persisted_stop=live,
         )
 
     # ------------------------------------------------------------------

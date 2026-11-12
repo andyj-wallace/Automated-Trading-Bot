@@ -242,12 +242,61 @@ async def test_resync_tracks_the_exit_deadline(monkeypatch) -> None:
     assert monitor._tracked[trade.id].exit_deadline == deadline
 
 
+async def test_track_starts_from_persisted_stop(monkeypatch) -> None:
+    monitor = _monitor()
+    monitor._session_factory = _Session
+    trade = _db_trade(entry="100", stop="95", tp="220", current_stop_price="101")
+    _patch_open_trades(monkeypatch, [trade])
+    await monitor._resync()
+    tracked = monitor._tracked[trade.id]
+    assert tracked.stop_loss_price == Decimal("101")
+    assert tracked.initial_stop_loss_price == Decimal("95")
+    assert tracked.persisted_stop == Decimal("101")
+
+
+async def test_track_ignores_lower_persisted_stop(monkeypatch) -> None:
+    monitor = _monitor()
+    monitor._session_factory = _Session
+    trade = _db_trade(entry="100", stop="95", tp="220", current_stop_price="90")
+    _patch_open_trades(monkeypatch, [trade])
+    await monitor._resync()
+    assert monitor._tracked[trade.id].stop_loss_price == Decimal("95")
+
+
+async def test_track_without_persisted_stop(monkeypatch) -> None:
+    monitor = _monitor()
+    monitor._session_factory = _Session
+    trade = _db_trade(entry="100", stop="95", tp="220", current_stop_price=None)
+    _patch_open_trades(monkeypatch, [trade])
+    await monitor._resync()
+    assert monitor._tracked[trade.id].stop_loss_price == Decimal("95")
+
+
+async def test_restart_with_persisted_stop_closes_with_stop_loss(monkeypatch) -> None:
+    monitor = _monitor()
+    monitor._session_factory = _Session
+    trade = _db_trade(entry="100", stop="95", tp="220", current_stop_price="101")
+    _patch_open_trades(monkeypatch, [trade])
+    await monitor._resync()
+    await monitor.on_price_update(_tick("101", trade.symbol))
+    await _settle(monitor)
+    monitor._order_manager.close_position.assert_awaited_once_with(trade.id, "STOP_LOSS")
+
+
 # ---------------------------------------------------------------------------
 # DB resync
 # ---------------------------------------------------------------------------
 
 
-def _db_trade(trade_id=None, symbol="AAPL", entry="200", stop="190", tp="220", exit_deadline=None):
+def _db_trade(
+    trade_id=None,
+    symbol="AAPL",
+    entry="200",
+    stop="190",
+    tp="220",
+    exit_deadline=None,
+    current_stop_price=None,
+):
     return SimpleNamespace(
         id=trade_id or uuid.uuid4(),
         symbol=symbol,
@@ -257,6 +306,7 @@ def _db_trade(trade_id=None, symbol="AAPL", entry="200", stop="190", tp="220", e
         take_profit_price=Decimal(tp),
         executed_at=datetime.now(UTC),
         exit_deadline=exit_deadline,
+        current_stop_price=Decimal(current_stop_price) if current_stop_price is not None else None,
     )
 
 
