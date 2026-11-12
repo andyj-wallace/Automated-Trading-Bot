@@ -6,17 +6,22 @@ Open work only. When something is finished, delete it from this file.
 
 Everything here runs on the paper account. Settings are in `.env.example`; terms are explained in the README's Growth mode section.
 
+### 0. Close strategy-to-trade audit gaps
+
+Audit reviewed November 10, 2026. The backend unit suite passed (754 tests), but mocked reproductions exposed these gaps; add regression coverage as each is fixed.
+
+- [ ] **High — Finish partially filled stop exits.** `order_close.py` currently finalizes a trade whenever the cancelled protective stop has any fill. Account for stop and exit fills together, sell only the remaining held shares, and mark CLOSED only when the position is fully exited. Verify that a stop filling 4 of 10 shares leaves 6 managed shares to close, without overselling or losing fills, fees or P&L.
+- [ ] **High — Resolve live partial entry orders.** `ibkr/mapper.py` maps both working and cancelled partial orders to `PARTIAL`; `order_entry.py` immediately moves either to OPEN. Preserve whether a remainder is still working, confirm cancellation or continue tracking it, and reconcile late fills into the recorded quantity and protective stop. Cover partial fills during cancellation and after the initial broker response; do not leave additional shares untracked.
+- [ ] **High — Enforce leadership for manual trading.** Manual buy and close routes use `get_engine`, which checks startup but not leadership. Route order mutations through the leader or reject follower requests, and ensure leadership loss prevents new submissions. Verify concurrent manual and scheduled orders across engine instances cannot bypass duplicate-symbol or portfolio-risk reservations; the current submission lock protects only one process.
+- [ ] **Medium — Report broker rejection accurately.** `scheduler_submit.py` records SUBMITTED whenever `submit_order` returns without raising, including REJECTED/ERROR results; the manual route also returns HTTP 201 for the resulting cancelled trade. Inspect the broker outcome, expose rejection details to the signal log and API/UI, and distinguish filled, working, rejected and unknown states. Test clean broker rejections as well as exceptions without changing successful fill or pending-order behavior.
+
 ### 1. Validate growth mode on paper
 
-1. [ ] Check your IBKR pricing plan (Client Portal: Settings > Account Settings > Pricing) and set `COMMISSION_PLAN`. On Fixed, the bot starts trading at about $700; switching to Tiered lowers that to about $250.
-2. [ ] Set `TRADING_CAPITAL_LIMIT=100` and `ACCOUNT_TYPE=cash`. Enable `trend_pullback` with ETFs from `GROWTH_UNIVERSE` that trade under about $50 (check prices on the Watchlist page; for example SCHB, SCHX, SCHG, SPDW, XLF).
-3. [ ] Run one week at 100. Expect **no entries**: `GET /api/v1/signals` shows `RISK_REJECTED` with `COSTS_TOO_HIGH`, or `ZERO_QUANTITY` when one share already risks more than $1. `GET /api/v1/trading/status` shows `growth_mode.active: true` and the daily summary shows the growth line.
-4. [ ] Run two or more weeks at `TRADING_CAPITAL_LIMIT=1000` on Fixed (or `300` on Tiered). Expect rare entries in whole shares, a non-zero `entry_commission`, P&L after fees, a protective stop, and at most 2 active trades. If the daily summary's fee line warns, correct `COMMISSION_PLAN`.
-5. [ ] Backtest `trend_pullback` on 5 ETFs over 5 years with the Small account preset, starting at $100, $300 and $1,000, on both fee plans. Record the results below. **Go for live money only if the return after fees is positive at your planned equity and fee plan.** Otherwise keep paper trading or add funds.
-
-| ETFs | Start | Plan | Trades | Win rate | Return after fees | Max drawdown | Fees paid |
-|------|-------|------|--------|----------|-------------------|--------------|-----------|
-| | | | | | | | |
+1. [ ] Check your IBKR pricing plan (Client Portal: Settings > Account Settings > Pricing) and set `COMMISSION_PLAN`. Validate eligibility using the configured cost model, current prices and actual stop distances; the example equity thresholds in the README are not guarantees of entry.
+2. [ ] Set `TRADING_CAPITAL_LIMIT=100` and `ACCOUNT_TYPE=cash`. Enable `trend_pullback` with currently affordable ETFs from the configured `GROWTH_UNIVERSE`; check prices on the Watchlist page and confirm enough history exists for each symbol and its market filter.
+3. [ ] Run one week at 100. Confirm zero-size and fee-ineligible signals are blocked with `ZERO_QUANTITY` or `RISK_REJECTED` / `COSTS_TOO_HIGH`, respectively. Check `growth_mode` in `GET /api/v1/trading/status` and the daily summary against the configured growth policy.
+4. [ ] Run two or more weeks at a paper capital limit that passes the configured fee and whole-share checks. Verify recorded commissions, P&L after fees, protective stops, and the configured growth-mode position cap. Investigate daily-summary fee warnings against the actual pricing plan.
+5. [ ] Backtest `trend_pullback` on 5 ETFs over 5 years with the Small account preset, starting at $100, $300 and $1,000, on both fee plans. Save the symbols, settings, test dates, trade count, win rate, return after fees, maximum drawdown and fees paid with the validation results. Require positive return after fees at the planned equity and fee plan before considering the separate live review; otherwise continue paper validation.
 
 ### 2. Paper soak: 5 trading days in a row
 
@@ -41,11 +46,11 @@ Run once during the soak:
 
 ### 3. Go live (separate change)
 
-Needs everything above to pass and your explicit go-ahead. It means live credentials, `IBKR_TRADING_MODE=live`, `ENVIRONMENT=production`, Gateway `TRADING_MODE: live`, port 4003, and `TRADING_CAPITAL_LIMIT` unset.
+- [ ] Complete the audit fixes and paper validation above, then prepare a separate live-deployment review covering broker account-mode guards, credentials, Gateway configuration, capital limits, monitoring and rollback. The current deployment runbook is paper-only; passing validation does not authorize a switch. Any live deployment requires your explicit go-ahead and an approved runbook.
 
 ## Optional
 
-- [ ] **Show growth mode on the Home page.** `/trading/status` returns `growth_mode` and `frontend/src/types/api.ts` has its type, but nothing displays it. Show a chip with equity and the $2,000 exit level while `growth_mode.active` is true.
+- [ ] **Show growth mode on the Home page.** `/trading/status` returns `growth_mode` and `frontend/src/types/api.ts` has its type, but nothing displays it. Show a chip with equity and the returned `exit_equity` while `growth_mode.active` is true.
 - [ ] **AWS host.** Only if you choose AWS over your Mac or another always-on machine. CDK in Python: default VPC; one t3.small EC2 instance (Amazon Linux 2023, Docker) with no inbound security-group rules; SSM Session Manager for shell and port forwarding (8080, 5900); encrypted gp3 volume with daily snapshots; an IAM role with `AmazonSSMManagedInstanceCore` and write access to one S3 backup bucket; secrets in Secrets Manager, rendered into `.env.prod` at boot.
 - [ ] **Persist the trailing stop.** When `_update_trailing_stop` ratchets by at least 0.1R, write `current_stop_price` (never the audit column `stop_loss_price`). `_track` and `_resync` then start from it, so a restart keeps the raised stop.
 - [ ] **Strategy cleanup.** Centralize `min_separation_pct` parsing in `filters.py`; make `min_separation_ok` return `False` when the slower value is ≤ 0; make `CompositeStrategy` return HOLD when the combined stop would be `None`; fetch extra-symbol bars with `asyncio.gather`.
@@ -58,7 +63,7 @@ Needs everything above to pass and your explicit go-ahead. It means live credent
 - **Mobile PWA:** manifest and service worker, responsive layout, web push (needs HTTPS).
 - **Second broker (Alpaca, Tradier):** new `BaseBroker` implementation and mapper, per-broker paper-mode guard.
 
-### Dividend investing Stretegy
+### Dividend investing strategy
 
 Build a long-term dividend-income strategy with gradual purchases and optional dividend reinvestment for compounding. Hold through price declines rather than selling on ordinary trading signals; exit individual companies when a dividend cut or omission is confirmed. These are proposed strategy rules to research and validate, not assumptions of guaranteed returns.
 
