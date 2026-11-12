@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.brokers.base import PriceBar
+from app.core.execution.order_close import CloseOutcome
 from app.core.market_calendar import ET
 from app.core.risk.growth import GrowthPolicy
 from app.core.risk.manager import RiskRejectionError
@@ -19,6 +20,7 @@ from app.core.strategy_engine.scheduler import (
     _CONSECUTIVE_MISS_ESCALATION_THRESHOLD,
     StrategyScheduler,
 )
+from app.db.models.trade import TradeStatus
 
 STRATEGY_ID = uuid.uuid4()
 MONDAY_11AM = datetime(2026, 10, 19, 11, 0, tzinfo=ET)
@@ -63,12 +65,16 @@ class FakeSignalRepo:
 
 class FakeTradeRepo:
     active = False
+    trade = None
 
     def __init__(self, _session):
         pass
 
     async def has_active_trade(self, symbol):
         return FakeTradeRepo.active
+
+    async def get_active_trade(self, symbol):
+        return FakeTradeRepo.trade
 
 
 def _price_json(price="150", age=0, bid=None, ask=None) -> str:
@@ -83,6 +89,7 @@ def _make(clock_now=MONDAY_11AM, **kwargs):
     claims: list = []
     signals = FakeSignalRepo(claims)
     FakeTradeRepo.active = False
+    FakeTradeRepo.trade = None
     sched = StrategyScheduler(
         registry=AsyncMock(),
         broker=AsyncMock(),
@@ -122,6 +129,25 @@ def _buy_strategy(quantity=10):
     )
     strategy.calculate_position_size = AsyncMock(return_value=quantity)
     return strategy
+
+
+def _sell_strategy():
+    strategy = _buy_strategy()
+    strategy.generate_signal.return_value = Signal(
+        symbol="AAPL",
+        action="SELL",
+        entry_price=Decimal("150"),
+        stop_loss_price=Decimal("155"),
+        quantity=10,
+        timestamp=datetime.now(UTC),
+    )
+    return strategy
+
+
+def _own_trade(status=TradeStatus.OPEN, strategy_id=STRATEGY_ID):
+    FakeTradeRepo.active = True
+    FakeTradeRepo.trade = SimpleNamespace(id=uuid.uuid4(), status=status, strategy_id=strategy_id)
+    return FakeTradeRepo.trade
 
 
 def _mock_strategy():
@@ -604,3 +630,72 @@ async def test_missing_extra_bars_keep_warning_and_signal(monkeypatch):
     messages = [c.args[0] for c in warn.call_args_list if c.args]
     assert sum("no usable bars for required extra symbol" in m for m in messages) == 1
     strategy.generate_signal.assert_awaited_once()
+
+
+# --- SELL closes the strategy's own OPEN trade -------------------------------
+
+
+async def test_sell_closes_own_open_trade():
+    sched = _make()
+    sched._order_manager.close_position = AsyncMock(return_value=CloseOutcome.CLOSED)
+    trade = _own_trade()
+    await _run(sched, _sell_strategy())
+    sched._order_manager.close_position.assert_awaited_once_with(trade.id, "SIGNAL_EXIT")
+    assert sched._signals.outcomes == [("EXIT_CLOSED", None, trade.id)]
+    assert sched._signals.claims[0]["action"] == "SELL"
+    sched._order_manager.submit_order.assert_not_awaited()
+
+
+async def test_sell_without_active_trade_is_hold():
+    sched = _make()
+    sched._order_manager.close_position = AsyncMock(return_value=CloseOutcome.CLOSED)
+    await _run(sched, _sell_strategy())
+    assert sched._signals.claims == []
+    assert sched._signals.outcomes == []
+    sched._order_manager.close_position.assert_not_awaited()
+    sched._order_manager.submit_order.assert_not_awaited()
+
+
+@pytest.mark.parametrize("other_strategy_id", [uuid.uuid4(), None])
+async def test_sell_ignores_foreign_or_manual_trade(other_strategy_id):
+    sched = _make()
+    sched._order_manager.close_position = AsyncMock(return_value=CloseOutcome.CLOSED)
+    _own_trade(strategy_id=other_strategy_id)
+    await _run(sched, _sell_strategy())
+    sched._order_manager.close_position.assert_not_awaited()
+    assert sched._signals.claims == []
+
+
+async def test_sell_ignores_trade_not_open():
+    sched = _make()
+    sched._order_manager.close_position = AsyncMock(return_value=CloseOutcome.CLOSED)
+    _own_trade(status=TradeStatus.SUBMITTED)
+    await _run(sched, _sell_strategy())
+    sched._order_manager.close_position.assert_not_awaited()
+    assert sched._signals.claims == []
+
+
+async def test_sell_skips_spread_and_liquidity_gates():
+    sched = _make(max_spread_bps=Decimal("20"), min_avg_dollar_volume=Decimal(10**9))
+    sched._cache.get = AsyncMock(return_value=_price_json(bid="100.00", ask="100.50"))
+    sched._order_manager.close_position = AsyncMock(return_value=CloseOutcome.CLOSED)
+    trade = _own_trade()
+    await _run(sched, _sell_strategy())
+    sched._order_manager.close_position.assert_awaited_once_with(trade.id, "SIGNAL_EXIT")
+    sched._order_manager.submit_order.assert_not_awaited()
+
+
+async def test_sell_close_error_records_exit_failed():
+    sched = _make()
+    sched._order_manager.close_position = AsyncMock(side_effect=RuntimeError("boom"))
+    trade = _own_trade()
+    await _run(sched, _sell_strategy())
+    assert sched._signals.outcomes == [("EXIT_FAILED", "boom", trade.id)]
+
+
+async def test_sell_market_closed_outcome():
+    sched = _make()
+    sched._order_manager.close_position = AsyncMock(return_value=CloseOutcome.MARKET_CLOSED)
+    trade = _own_trade()
+    await _run(sched, _sell_strategy())
+    assert sched._signals.outcomes == [("EXIT_MARKET_CLOSED", None, trade.id)]

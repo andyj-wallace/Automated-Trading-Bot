@@ -11,6 +11,7 @@ from app.core import market_calendar
 from app.core.risk.manager import RiskRejectionError, TradeRequest
 from app.core.strategy_engine.base import RiskParams, Signal
 from app.core.strategy_engine.indicators import avg_dollar_volume
+from app.db.models.trade import TradeStatus
 from app.monitoring.logger import trading_logger
 
 
@@ -26,6 +27,9 @@ class SchedulerSubmitMixin:
         open_position: bool,
     ) -> uuid.UUID | None:
         if signal.action == "HOLD":
+            return None
+        if signal.action == "SELL":
+            await self._handle_sell(strategy_id, symbol, bars, signal, open_position)
             return None
         if open_position:
             trading_logger.info(
@@ -55,6 +59,43 @@ class SchedulerSubmitMixin:
                 )
                 return None
         return signal_id
+
+    async def _handle_sell(
+        self,
+        strategy_id: uuid.UUID,
+        symbol: str,
+        bars: list[PriceBar],
+        signal: Signal,
+        open_position: bool,
+    ) -> None:
+        if not open_position:
+            return
+        trade = await self._get_active_trade(symbol)
+        if trade is None:
+            return
+        if trade.status != TradeStatus.OPEN or trade.strategy_id != strategy_id:
+            trading_logger.info(
+                "StrategyScheduler: SELL ignored, active trade not an OPEN trade of this strategy",
+                extra={
+                    "symbol": symbol,
+                    "strategy_id": str(strategy_id),
+                    "trade_id": str(trade.id),
+                },
+            )
+            return
+
+        signal_id = await self._claim_signal(
+            strategy_id, symbol, bars[-1].timestamp.date(), signal
+        )
+        if signal_id is None:
+            return
+
+        try:
+            outcome = await self._order_manager.close_position(trade.id, "SIGNAL_EXIT")
+        except Exception as exc:
+            await self._set_outcome(signal_id, "EXIT_FAILED", detail=str(exc), trade_id=trade.id)
+            return
+        await self._set_outcome(signal_id, f"EXIT_{outcome.value}", trade_id=trade.id)
 
     async def _size_and_submit(
         self,

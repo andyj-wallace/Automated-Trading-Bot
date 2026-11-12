@@ -32,6 +32,10 @@ class SchedulerPersistenceMixin:
         async with self._session_factory() as session:
             return await self._trade_repo(session).has_active_trade(symbol)
 
+    async def _get_active_trade(self, symbol: str):
+        async with self._session_factory() as session:
+            return await self._trade_repo(session).get_active_trade(symbol)
+
     async def _claim_signal(
         self, strategy_id: uuid.UUID, symbol: str, bar_date: date, signal: Signal
     ) -> uuid.UUID | None:
