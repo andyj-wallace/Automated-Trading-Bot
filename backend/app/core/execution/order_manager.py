@@ -147,6 +147,26 @@ class OrderManager(OrderEntryMixin, OrderCloseMixin, ProtectiveStopMixin, OrderR
         # across concurrent submit_order() calls in this process — see the
         # portfolio-risk-cap race note in the module docstring.
         self._submission_lock = asyncio.Lock()
+        # Counts submit_order() calls from entering the lock until they return or raise.
+        self._entries_in_flight = 0
+        self._entries_idle = asyncio.Event()
+        self._entries_idle.set()
+
+    def _entry_done(self) -> None:
+        """Release one in-flight submit_order() count; wake waiters at zero."""
+        self._entries_in_flight -= 1
+        if self._entries_in_flight == 0:
+            self._entries_idle.set()
+
+    async def wait_for_entries_idle(self, timeout: float) -> bool:
+        """Wait until no submit_order call is in flight; False if timeout passes first."""
+        if self._entries_in_flight == 0:
+            return True
+        try:
+            await asyncio.wait_for(self._entries_idle.wait(), timeout)
+        except TimeoutError:
+            return False
+        return True
 
     async def submit_order(
         self,
@@ -176,48 +196,59 @@ class OrderManager(OrderEntryMixin, OrderCloseMixin, ProtectiveStopMixin, OrderR
         # so the broker round-trip below does NOT need to hold the lock.
         # ------------------------------------------------------------------
         async with self._submission_lock:
-            validation = await self._validate_entry(request)
+            self._entries_in_flight += 1
+            self._entries_idle.clear()
+            try:
+                validation = await self._validate_entry(request)
+                if self._session_factory:
+                    await self._create_pending(request, validation)
+            except BaseException:
+                self._entry_done()
+                raise
+
+        try:
+            # ------------------------------------------------------------------
+            # Step 3 — Pre-submission audit entry (must be written before broker)
+            # ------------------------------------------------------------------
+            self._write_pre_submission(request, validation)
+
+            # ------------------------------------------------------------------
+            # Step 4 — Transition to SUBMITTED immediately before broker call
+            # ------------------------------------------------------------------
             if self._session_factory:
-                await self._create_pending(request, validation)
+                await self._transition(request.trade_id, "SUBMITTED")
 
-        # ------------------------------------------------------------------
-        # Step 3 — Pre-submission audit entry (must be written before broker)
-        # ------------------------------------------------------------------
-        self._write_pre_submission(request, validation)
+            # ------------------------------------------------------------------
+            # Step 5 — Submit to broker (entry is always a plain market order;
+            # the protective stop is placed after the fill, see place_protective_stop)
+            # ------------------------------------------------------------------
+            broker_request, order_result, broker_error, state_unknown = (
+                await self._submit_entry(request)
+            )
 
-        # ------------------------------------------------------------------
-        # Step 4 — Transition to SUBMITTED immediately before broker call
-        # ------------------------------------------------------------------
-        if self._session_factory:
-            await self._transition(request.trade_id, "SUBMITTED")
+            # ------------------------------------------------------------------
+            # Step 6 — Post-confirmation audit entry
+            # If this write fails it is a system fault: escalate to error.log
+            # ------------------------------------------------------------------
+            self._audit_post_confirmation(request, validation, order_result)
 
-        # ------------------------------------------------------------------
-        # Step 5 — Submit to broker (entry is always a plain market order;
-        # the protective stop is placed after the fill, see place_protective_stop)
-        # ------------------------------------------------------------------
-        broker_request, order_result, broker_error, state_unknown = await self._submit_entry(request)
+            # ------------------------------------------------------------------
+            # Step 7 — Record the outcome. Nothing becomes OPEN without a real fill.
+            # ------------------------------------------------------------------
+            filled = await self._record_entry_outcome(
+                request, validation, order_result, broker_request, state_unknown
+            )
+            if broker_error:
+                raise broker_error
 
-        # ------------------------------------------------------------------
-        # Step 6 — Post-confirmation audit entry
-        # If this write fails it is a system fault: escalate to error.log
-        # ------------------------------------------------------------------
-        self._audit_post_confirmation(request, validation, order_result)
+            # ------------------------------------------------------------------
+            # Step 8 — Record KPI snapshot (non-fatal if it fails)
+            # ------------------------------------------------------------------
+            await self._snapshot_after_entry(request, filled)
 
-        # ------------------------------------------------------------------
-        # Step 7 — Record the outcome. Nothing becomes OPEN without a real fill.
-        # ------------------------------------------------------------------
-        filled = await self._record_entry_outcome(
-            request, validation, order_result, broker_request, state_unknown
-        )
-        if broker_error:
-            raise broker_error
-
-        # ------------------------------------------------------------------
-        # Step 8 — Record KPI snapshot (non-fatal if it fails)
-        # ------------------------------------------------------------------
-        await self._snapshot_after_entry(request, filled)
-
-        return validation, order_result
+            return validation, order_result
+        finally:
+            self._entry_done()
 
     async def _load_active_trades(self) -> list:
         """
