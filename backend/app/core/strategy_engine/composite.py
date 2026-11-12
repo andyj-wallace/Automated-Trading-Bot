@@ -144,6 +144,10 @@ class CompositeStrategy(BaseStrategy):
             return self._combine_agreeing_signals(agreeing)
         return self._hold(market_data.symbol)
 
+    def min_history_bars(self) -> int:
+        """Largest history requirement among the sub-strategies."""
+        return max((s.min_history_bars() for s in self._strategies), default=0)
+
     def required_extra_symbols(self) -> list[str]:
         """Union of every sub-strategy's extra symbols, first-seen order."""
         seen: dict[str, None] = {}

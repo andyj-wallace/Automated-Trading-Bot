@@ -228,6 +228,10 @@ class BullBearStrategy(BaseStrategy):
         take_profit = (entry + stop_distance * 2).quantize(_TWO_DP, rounding=ROUND_HALF_UP)
         return stop, take_profit
 
+    def min_history_bars(self) -> int:
+        """Regime SMA bars or target SMA/ATR bars, whichever is longer."""
+        return max(self.regime_period + 1, max(self.entry_period, self.atr_period) + 1)
+
     def required_extra_symbols(self) -> list[str]:
         return [self.regime_symbol]
 
