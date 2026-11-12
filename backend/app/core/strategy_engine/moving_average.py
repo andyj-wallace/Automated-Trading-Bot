@@ -84,6 +84,10 @@ class MovingAverageStrategy(BaseStrategy):
     # BaseStrategy interface
     # ------------------------------------------------------------------
 
+    def min_history_bars(self) -> int:
+        """Completed daily bars this strategy's rules need."""
+        return self.slow_period + 1
+
     async def generate_signal(self, market_data: MarketData) -> Signal:
         """
         Analyse bars and return BUY, SELL, or HOLD.

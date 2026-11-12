@@ -145,3 +145,7 @@ class BaseStrategy(ABC):
         trading some other symbol returns ["SPY"] here.
         """
         return []
+
+    def min_history_bars(self) -> int:
+        """Completed daily bars this strategy's rules need; 0 means no minimum."""
+        return 0

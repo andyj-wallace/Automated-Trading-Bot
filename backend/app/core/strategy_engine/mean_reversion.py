@@ -94,6 +94,12 @@ class MeanReversionStrategy(BaseStrategy):
     # BaseStrategy interface
     # ------------------------------------------------------------------
 
+    def min_history_bars(self) -> int:
+        """Completed daily bars this strategy's rules need."""
+        if self.max_trend_pct > 0:
+            return max(self.lookback + 1, self.lookback + self.trend_lookback)
+        return self.lookback + 1
+
     async def generate_signal(self, market_data: MarketData) -> Signal:
         """
         Analyse bars and return BUY or HOLD.

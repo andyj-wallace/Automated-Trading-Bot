@@ -89,6 +89,10 @@ class IntraWeekMeanReversionStrategy(BaseStrategy):
     # BaseStrategy interface
     # ------------------------------------------------------------------
 
+    def min_history_bars(self) -> int:
+        """Completed daily bars this strategy's rules need."""
+        return self.ma_period
+
     async def generate_signal(self, market_data: MarketData) -> Signal:
         """
         Analyse bars and return BUY or HOLD.
