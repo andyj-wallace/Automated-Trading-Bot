@@ -53,7 +53,7 @@ Registration:
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 
 from app.brokers.base import PriceBar
 from app.core.risk.calculator import RiskCalculator
@@ -146,9 +146,8 @@ class IntraWeekMeanReversionStrategy(BaseStrategy):
             return self._hold(market_data.symbol)
 
         # --- Take-profit: VWAP + (VWAP − stop) × rr_ratio ---
-        take_profit = (
-            weekly_vwap + (weekly_vwap - stop) * self.rr_ratio
-        ).quantize(_TWO_DP, rounding=ROUND_HALF_UP)
+        raw_target = weekly_vwap + (weekly_vwap - stop) * self.rr_ratio
+        take_profit = raw_target.quantize(_TWO_DP, rounding=ROUND_CEILING)
 
         if take_profit <= entry:
             return self._hold(market_data.symbol)

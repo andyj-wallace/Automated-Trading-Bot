@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, time, timedelta
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 
 from app.core import market_calendar
 from app.core.risk.calculator import RiskCalculator
 from app.core.strategy_engine.base import BaseStrategy, MarketData, RiskParams, Signal
 from app.core.strategy_engine.filters import regime_ok
 from app.core.strategy_engine.indicators import sma
+
+_CENT = Decimal("0.01")
 
 
 class DayTradeStrategy(BaseStrategy):
@@ -55,9 +57,11 @@ class DayTradeStrategy(BaseStrategy):
         """BUY at the current price with a rr_ratio target and a deadline before the close."""
         price = market_data.current_price
         stop = stop.quantize(Decimal("0.01"))
+        raw_target = price + self.rr_ratio * (price - stop)
+        take_profit = raw_target.quantize(_CENT, rounding=ROUND_CEILING)
         return Signal(
             symbol=market_data.symbol, action="BUY", entry_price=price, stop_loss_price=stop,
-            take_profit_price=(price + self.rr_ratio * (price - stop)).quantize(Decimal("0.01")),
+            take_profit_price=take_profit,
             timestamp=market_data.timestamp, exit_deadline=exit_deadline(market_data.timestamp),
         )
 

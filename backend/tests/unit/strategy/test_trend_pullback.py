@@ -2,10 +2,12 @@
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal as D
+from uuid import uuid4
 
 import pytest
 
 from app.brokers.base import PriceBar
+from app.core.risk.manager import RiskManager, TradeRequest
 from app.core.strategy_engine.base import MarketData, RiskParams
 from app.core.strategy_engine.trend_pullback import TrendPullbackStrategy
 from tests.unit.strategy.conftest import make_bars
@@ -45,6 +47,23 @@ async def _signal(data=None, **config):
 async def test_buy_on_bounce():
     s = await _signal()
     assert (s.action, s.stop_loss_price, s.take_profit_price) == ("BUY", D("91.12"), D("95.56"))
+
+
+async def test_sub_penny_price_buy_passes_risk_validation():
+    k = D("25.1234") / D("92.60")
+    scaled = [
+        b.model_copy(update={"open": b.open * k, "high": b.high * k, "low": b.low * k, "close": b.close * k})
+        for b in BARS
+    ]
+    signal = await _signal(_data(price="25.1234", bars=scaled))
+    assert signal.action == "BUY"
+    request = TradeRequest(
+        trade_id=uuid4(), symbol="SCHB", direction="BUY", quantity=1, entry_price=D("25.1234"),
+        stop_loss_price=signal.stop_loss_price, account_balance=D("100000"),
+        take_profit_price=signal.take_profit_price,
+    )
+    result = RiskManager().validate(request)
+    assert result.take_profit_price == signal.take_profit_price
 
 
 async def test_regime_symbol_empty_needs_no_spy_bars():

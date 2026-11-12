@@ -24,7 +24,7 @@ symbol is the regime symbol). Self-registers as "trend_pullback".
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_HALF_UP, Decimal
 
 from app.core.risk.calculator import RiskCalculator
 from app.core.strategy_engine.base import BaseStrategy, MarketData, RiskParams, Signal
@@ -100,7 +100,7 @@ class TrendPullbackStrategy(BaseStrategy):
         risk = price - stop
         if stop <= 0 or risk <= 0 or risk > atr_now * self.max_stop_atr:
             return self._hold(symbol)
-        take_profit = (price + risk * self.rr_ratio).quantize(_TWO_DP, rounding=ROUND_HALF_UP)
+        take_profit = (price + risk * self.rr_ratio).quantize(_TWO_DP, rounding=ROUND_CEILING)
         return Signal(
             symbol=symbol, action="BUY", entry_price=price, stop_loss_price=stop,
             take_profit_price=take_profit, timestamp=market_data.timestamp,
