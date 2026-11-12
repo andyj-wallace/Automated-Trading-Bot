@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC as UTC
 from datetime import datetime as datetime
 from datetime import timedelta as timedelta
@@ -129,8 +129,10 @@ class OrderManager(OrderEntryMixin, OrderCloseMixin, ProtectiveStopMixin, OrderR
         growth: GrowthPolicy | None = None,
         account_type: str | None = None,
         cost_model: CostModel | None = None,
+        is_paused: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         self._growth = growth
+        self._is_paused = is_paused
         self._account_type = account_type  # None skips the settled-cash / day-trade checks
         self._cost_model = cost_model
         self._broker = broker
@@ -151,6 +153,14 @@ class OrderManager(OrderEntryMixin, OrderCloseMixin, ProtectiveStopMixin, OrderR
         self._entries_in_flight = 0
         self._entries_idle = asyncio.Event()
         self._entries_idle.set()
+
+    async def _paused_for(self, request: TradeRequest) -> bool:
+        """True when a strategy entry must be blocked by the trading pause."""
+        return (
+            request.strategy_id is not None
+            and self._is_paused is not None
+            and await self._is_paused()
+        )
 
     def _entry_done(self) -> None:
         """Release one in-flight submit_order() count; wake waiters at zero."""
@@ -199,6 +209,11 @@ class OrderManager(OrderEntryMixin, OrderCloseMixin, ProtectiveStopMixin, OrderR
             self._entries_in_flight += 1
             self._entries_idle.clear()
             try:
+                if await self._paused_for(request):
+                    raise RiskRejectionError(
+                        "TRADING_PAUSED: strategy entries are blocked while trading is paused",
+                        request,
+                    )
                 validation = await self._validate_entry(request)
                 if self._session_factory:
                     await self._create_pending(request, validation)
@@ -222,6 +237,12 @@ class OrderManager(OrderEntryMixin, OrderCloseMixin, ProtectiveStopMixin, OrderR
             # Step 5 — Submit to broker (entry is always a plain market order;
             # the protective stop is placed after the fill, see place_protective_stop)
             # ------------------------------------------------------------------
+            if await self._paused_for(request):
+                if self._session_factory:
+                    await self._transition(request.trade_id, "CANCELLED")
+                raise RiskRejectionError(
+                    "TRADING_PAUSED: paused before the order was sent", request
+                )
             broker_request, order_result, broker_error, state_unknown = (
                 await self._submit_entry(request)
             )

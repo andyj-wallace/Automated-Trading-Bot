@@ -83,6 +83,7 @@ class TradingEngine:
             growth=self.growth,
             account_type=settings.account_type,
             cost_model=self.cost_model,
+            is_paused=lambda: self.trading_state.is_paused(),
         )
         self.feed = MarketDataFeed(self.broker, self.cache, AsyncSessionFactory)
         self.position_monitor = PositionMonitor(
