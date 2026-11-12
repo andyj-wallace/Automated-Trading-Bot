@@ -96,6 +96,36 @@ async def test_raising_fetch_counts_as_failed():
     cache.publish.assert_awaited_once()
 
 
+async def test_refresh_calls_on_refreshed_for_stored_symbols():
+    refreshed: list[str] = []
+    job, _ = await _job(Clock(_at(2026, 10, 19, 10, 0)))
+    job._on_refreshed = refreshed.append
+    await job.refresh({"AAPL", "SPY"}, duration="10 D")
+    assert refreshed == ["AAPL", "SPY"]
+
+
+async def test_refresh_skips_on_refreshed_for_failed_symbol():
+    refreshed: list[str] = []
+    fetch = AsyncMock(side_effect=[RuntimeError("pacing"), 5])
+    job, _ = await _job(Clock(_at(2026, 10, 19, 10, 0)), fetch=fetch)
+    job._on_refreshed = refreshed.append
+    await job.refresh({"AAPL", "SPY"}, duration="10 D")
+    assert refreshed == ["SPY"]
+
+
+async def test_on_refreshed_error_is_logged_not_raised():
+    fetch = AsyncMock(return_value=5)
+    job, cache = await _job(Clock(_at(2026, 10, 19, 10, 0)), fetch=fetch)
+
+    def boom(symbol: str) -> None:
+        raise RuntimeError("scheduler gone")
+
+    job._on_refreshed = boom
+    results = await job.refresh({"AAPL"}, duration="10 D")
+    assert results == {"AAPL": 5}
+    cache.publish.assert_not_awaited()
+
+
 async def test_desired_symbols_includes_extra_symbols(monkeypatch):
     from app.core.strategy_engine.builtin import load_builtin_strategies
     from app.core.strategy_engine.registry import registry

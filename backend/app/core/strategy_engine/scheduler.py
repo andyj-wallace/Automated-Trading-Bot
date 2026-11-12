@@ -116,6 +116,7 @@ class StrategyScheduler(SchedulerSubmitMixin, SchedulerPersistenceMixin, Schedul
         self._signal_repo_factory = signal_repo_factory
         self._trade_repo_factory = trade_repo_factory
         self._bar_cache: dict[tuple[str, date], list[PriceBar]] = {}
+        self._bar_generation: dict[str, int] = {}
         self._intraday_cache: dict[tuple[str, datetime], list[PriceBar]] = {}
         self._warned: set[tuple[str, str, date]] = set()
         self.last_cycle_at: datetime | None = None

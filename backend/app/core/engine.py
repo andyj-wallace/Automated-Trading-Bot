@@ -117,6 +117,7 @@ class TradingEngine:
             self.cache,
             run_at=settings.bar_refresh_time_et,
             clock=clock,
+            on_refreshed=lambda symbol: self.scheduler.invalidate_bars(symbol),
         )
         self._bar_refresh_task = PeriodicTask("bar_refresh", bar_refresh_interval, self.bar_refresh.tick)
         self.trading_state = TradingState(self.cache)

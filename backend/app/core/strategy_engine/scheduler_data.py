@@ -111,6 +111,13 @@ class SchedulerDataMixin:
             ]
         return self._intraday_cache[key]
 
+    def invalidate_bars(self, symbol: str) -> None:
+        """Drop cached daily bars for symbol so the next cycle re-reads the DB."""
+        key = symbol.upper()
+        self._bar_generation[key] = self._bar_generation.get(key, 0) + 1
+        for cached_key in [k for k in self._bar_cache if k[0] == key]:
+            del self._bar_cache[cached_key]
+
     async def _get_historical_bars(self, symbol: str) -> list[PriceBar]:
         """Completed-session bars from the DB; [] if missing or stale."""
         trading_day = market_calendar.trading_date(self._clock())
@@ -118,6 +125,7 @@ class SchedulerDataMixin:
         cached = self._bar_cache.get(key)
         if cached is not None:
             return cached
+        generation = self._bar_generation.get(symbol, 0)
         try:
             bars = await self._fetch_db_bars(symbol, trading_day)
         except Exception as exc:
@@ -136,5 +144,6 @@ class SchedulerDataMixin:
             return []
         for old in [k for k in self._bar_cache if k[1] != trading_day]:
             del self._bar_cache[old]
-        self._bar_cache[key] = bars
+        if self._bar_generation.get(symbol, 0) == generation:
+            self._bar_cache[key] = bars
         return bars

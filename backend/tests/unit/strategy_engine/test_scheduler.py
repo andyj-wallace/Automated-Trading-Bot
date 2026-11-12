@@ -474,3 +474,38 @@ async def test_exit_deadline_flows_into_trade_request():
     await _run(sched, strategy)
     request = sched._order_manager.submit_order.await_args.args[0]
     assert request.exit_deadline == deadline
+
+
+async def test_invalidate_bars_returns_new_bars_same_day():
+    sched = _make()
+    OLD = [_bar(FRIDAY)]
+    NEW = [_bar(date(2026, 10, 15)), _bar(FRIDAY)]
+    sched._fetch_db_bars = AsyncMock(return_value=OLD)
+    assert len(await sched._get_historical_bars("AAPL")) == 1
+    sched._fetch_db_bars = AsyncMock(return_value=NEW)
+    assert len(await sched._get_historical_bars("AAPL")) == 1
+    sched.invalidate_bars("aapl")
+    assert len(await sched._get_historical_bars("AAPL")) == 2
+
+
+async def test_inflight_read_does_not_recache_after_invalidate():
+    import asyncio
+
+    sched = _make()
+    OLD = [_bar(FRIDAY)]
+    NEW = [_bar(date(2026, 10, 15)), _bar(FRIDAY)]
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_fetch(symbol, day):
+        started.set()
+        await release.wait()
+        return OLD
+
+    sched._fetch_db_bars = slow_fetch
+    task = asyncio.create_task(sched._get_historical_bars("AAPL"))
+    await started.wait()
+    sched.invalidate_bars("AAPL")
+    release.set()
+    assert len(await task) == 1
+    sched._fetch_db_bars = AsyncMock(return_value=NEW)
+    assert len(await sched._get_historical_bars("AAPL")) == 2

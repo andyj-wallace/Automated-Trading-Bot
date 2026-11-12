@@ -28,6 +28,7 @@ class BarRefreshJob:
         clock: Callable[[], datetime] = market_calendar.now_et,
         pause_seconds: float = 2.0,
         registry=None,
+        on_refreshed: Callable[[str], None] | None = None,
     ) -> None:
         if registry is None:
             from app.core.strategy_engine.registry import registry as default_registry
@@ -40,6 +41,7 @@ class BarRefreshJob:
         self._clock = clock
         self._pause = pause_seconds
         self._registry = registry
+        self._on_refreshed = on_refreshed
         self._fetcher = HistoricalDataFetcher(broker)
         self._startup_done = False
         self._last_run: date | None = None
@@ -104,6 +106,14 @@ class BarRefreshJob:
             results[symbol] = count
             if count == 0:
                 failed.append(symbol)
+            elif self._on_refreshed is not None:
+                try:
+                    self._on_refreshed(symbol)
+                except Exception as exc:
+                    system_logger.warning(
+                        "BarRefreshJob: on_refreshed callback failed",
+                        extra={"symbol": symbol, "error": str(exc)},
+                    )
         if failed:
             await publish_system_alert(
                 self._cache,
