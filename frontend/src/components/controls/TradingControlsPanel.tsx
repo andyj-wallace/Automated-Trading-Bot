@@ -5,7 +5,7 @@ import { useState } from "react";
 import { api } from "../../api/client";
 import { useTradingStatus } from "../../hooks/useTradingStatus";
 import { useLiveStore } from "../../store/liveStore";
-import type { FlattenResult, Trade, TradingStatus } from "../../types/api";
+import type { FlattenResult, FlattenResultItem, Trade, TradingStatus } from "../../types/api";
 import { ConfirmDialog } from "../common/ConfirmDialog";
 
 function summarize(s: TradingStatus): { headline: string; detail: string; dot: string } {
@@ -18,6 +18,35 @@ function summarize(s: TradingStatus): { headline: string; detail: string; dot: s
   if (!s.market_open)
     return { headline: "Waiting for the market to open", detail: "Trading starts automatically when the market opens.", dot: "bg-gray-500" };
   return { headline: "Trading automatically", detail: "The bot finds trades, sizes them and manages exits for you.", dot: "bg-emerald-500" };
+}
+
+function describeFlatten(results: FlattenResultItem[]): string {
+  let sold = 0;
+  let cancelled = 0;
+  let failed = 0;
+  let inFlight = false;
+  for (const item of results) {
+    if ("trade_id" in item) {
+      if (item.outcome === "CLOSED" || item.outcome === "PENDING_EXIT") sold++;
+      else if (item.outcome === "ENTRY_CANCELLED") cancelled++;
+      else if (
+        item.outcome === "ENTRY_CANCEL_FAILED" ||
+        item.outcome === "FAILED" ||
+        item.outcome === "MARKET_CLOSED"
+      )
+        failed++;
+    } else if (item.outcome === "ENTRIES_STILL_IN_FLIGHT") {
+      inFlight = true;
+    }
+  }
+  const parts = [`Selling ${sold} position${sold !== 1 ? "s" : ""}.`];
+  if (cancelled > 0)
+    parts.push(`Cancelled ${cancelled} buy order${cancelled !== 1 ? "s" : ""} that had not filled.`);
+  if (failed > 0) parts.push(`${failed} could not be handled. Check the Trades page.`);
+  if (inFlight)
+    parts.push("Some buy orders were still being sent and may still open. Check the Trades page.");
+  parts.push("The bot is paused.");
+  return parts.join(" ");
 }
 
 export function TradingControlsPanel() {
@@ -47,8 +76,7 @@ export function TradingControlsPanel() {
       return res.data;
     },
     onSuccess: (data) => {
-      const n = data?.results.length ?? 0;
-      setMessage(`Selling ${n} position${n !== 1 ? "s" : ""}. The bot is paused.`);
+      setMessage(describeFlatten(data?.results ?? []));
       setFlattenOpen(false);
       refresh();
     },

@@ -210,10 +210,11 @@ export interface TradingStatus {
   growth_mode: GrowthModeStatus;
 }
 
-export interface FlattenResult {
-  paused: boolean;
-  results: { trade_id: string; symbol: string; outcome: string }[];
-}
+export type FlattenEntryOutcome = "ENTRY_CANCELLED" | "ENTRY_ADOPTED" | "ENTRY_CANCEL_FAILED";
+export interface FlattenInFlightItem { outcome: "ENTRIES_STILL_IN_FLIGHT" }
+export interface FlattenTradeItem { trade_id: string; symbol: string; outcome: string }
+export type FlattenResultItem = FlattenInFlightItem | FlattenTradeItem;
+export interface FlattenResult { paused: boolean; results: FlattenResultItem[] }
 
 export interface CircuitBreakerStatus {
   daily_halted: boolean;
