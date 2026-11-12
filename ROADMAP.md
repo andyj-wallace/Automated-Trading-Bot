@@ -52,7 +52,6 @@ Run once during the soak:
 
 - [ ] **Show growth mode on the Home page.** `/trading/status` returns `growth_mode` and `frontend/src/types/api.ts` has its type, but nothing displays it. Show a chip with equity and the returned `exit_equity` while `growth_mode.active` is true.
 - [ ] **AWS host.** Only if you choose AWS over your Mac or another always-on machine. CDK in Python: default VPC; one t3.small EC2 instance (Amazon Linux 2023, Docker) with no inbound security-group rules; SSM Session Manager for shell and port forwarding (8080, 5900); encrypted gp3 volume with daily snapshots; an IAM role with `AmazonSSMManagedInstanceCore` and write access to one S3 backup bucket; secrets in Secrets Manager, rendered into `.env.prod` at boot.
-- [ ] **Persist the trailing stop.** When `_update_trailing_stop` ratchets by at least 0.1R, write `current_stop_price` (never the audit column `stop_loss_price`). `_track` and `_resync` then start from it, so a restart keeps the raised stop.
 - [ ] **Strategy cleanup.** Centralize `min_separation_pct` parsing in `filters.py`; make `min_separation_ok` return `False` when the slower value is ≤ 0; make `CompositeStrategy` return HOLD when the combined stop would be `None`; fetch extra-symbol bars with `asyncio.gather`.
 - [ ] **Repository tidy-up.** Move `test_ibkr_connection.py` to `backend/scripts/check_gateway.py`. Split `requirements-dev.txt` (pytest, pytest-asyncio, pytest-cov) from the runtime requirements; the Dockerfile installs runtime only, CI installs both.
 

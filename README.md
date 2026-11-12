@@ -77,11 +77,15 @@ PositionMonitor watches the price and closes the trade ◄───────�
 Reconciler compares the bot's trades with IBKR's positions every 2 minutes
 ```
 
-1. On NYSE trading days, 09:45-15:45 ET, the scheduler runs each enabled strategy every 60 seconds on its assigned symbols.
+1. On NYSE trading days, 09:45-15:45 ET, the scheduler runs each enabled strategy every 60 seconds on its assigned symbols. Creating or changing a strategy while the bot runs downloads 2 years of daily price history for its symbols and any extra symbols it needs (for example SPY, which tracks the whole US market, for the market filter), and the scheduler uses the new bars the same day.
 2. Each strategy, symbol, day and action can act only once.
 3. The risk checks below decide whether to trade and how many shares to buy. Quantities are always whole shares: IBKR's API rejects fractional stock orders.
 4. After the fill, a stop order rests at IBKR in case the bot goes offline (`BROKER_PROTECTIVE_STOPS`). The profit target stays inside the bot.
-5. The trade closes on its stop, trailing stop, target, time limit (`STALE_TRADE_MAX_DAYS`), day-trade deadline, or your manual close or flatten. These act only while the market is open, so an overnight gap fills at the next open.
+5. The trade closes on its stop, trailing stop, target, time limit (`STALE_TRADE_MAX_DAYS`), day-trade deadline, or your manual close or flatten. These act only while the market is open, so an overnight gap fills at the next open. A strategy can also close its own trade with a sell signal, called a signal exit (`SIGNAL_EXIT`): when the strategy that opened the trade produces a SELL, for example `moving_average`'s "death cross" when the 50-day average falls below the 200-day. Signal exits do not run while trading is paused. A SELL never opens a short position (a bet that the price will fall), and it is ignored when there is no open trade, or when the trade was opened by another strategy or manually.
+
+**Trailing stop:** a stop that moves up as the price rises, locking in more of the gain. The raised stop is saved with the trade whenever it rises by at least 0.1R, so it survives a backend restart. R is the per-share risk: entry price minus the original stop. The stop order already resting at IBKR is not moved.
+
+**Flatten** (the "Sell everything" button) is best effort, not a guarantee. It pauses trading, waits up to 30 seconds for strategy buy orders that are being sent, cancels buy orders still working at IBKR, closes any that already filled, and then closes all open trades. Two limits: an entry that is partly filled and still working is closed without cancelling its unfilled part, and an entry still being sent to IBKR after that 30-second wait can still open.
 
 Trade status: `PENDING → SUBMITTED → OPEN → CLOSING → CLOSED`, or `CANCELLED` if it never opened. `logs/audit.log` records every order before and after it reaches the broker. It is append-only and never rotated.
 
@@ -155,7 +159,7 @@ The bot starts trading around **$250** on Tiered and **$700** on Fixed. `trades.
 
 Strategies use completed daily bars, refreshed at 16:30 ET; the two day-trade strategies also use 5-minute bars. Configure them on the Strategies page; changes apply on the next cycle without a restart.
 
-**Backtesting** runs one strategy or a portfolio on stored daily bars. Fee schedule and compounding are options, and the Small account preset applies a $100 balance, Fixed fees and compounding. A bar that gaps past a stop or target fills at its open. Each run needs enough history to warm up: a 50/200 average needs 200 bars before it can trade. The day-trade strategies can't be backtested.
+**Backtesting** runs one strategy or a portfolio on stored daily bars. Fee schedule and compounding are options, and the Small account preset applies a $100 balance, Fixed fees and compounding. A bar that gaps past a stop or target fills at its open. Each run needs enough history to warm up: a 50/200 average needs 200 bars before it can trade. The day-trade strategies can't be backtested. Backtests do not simulate signal exits.
 
 ## Pages
 
