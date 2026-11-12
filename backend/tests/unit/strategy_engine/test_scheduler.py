@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -107,6 +107,7 @@ def _make(clock_now=MONDAY_11AM, **kwargs):
 
 def _buy_strategy(quantity=10):
     strategy = AsyncMock()
+    strategy.min_history_bars = lambda: 0
     strategy.required_extra_symbols = lambda: []
     strategy.needs_intraday = False
     strategy.generate_signal = AsyncMock(
@@ -120,6 +121,12 @@ def _buy_strategy(quantity=10):
         )
     )
     strategy.calculate_position_size = AsyncMock(return_value=quantity)
+    return strategy
+
+
+def _mock_strategy():
+    strategy = AsyncMock()
+    strategy.min_history_bars = lambda: 0
     return strategy
 
 
@@ -296,7 +303,7 @@ async def test_no_price_logs_warning_below_escalation_threshold():
     sched = _make()
     sched._get_current_price = AsyncMock(return_value=None)
     with patch("app.core.strategy_engine.scheduler.system_logger") as log:
-        await _run(sched, AsyncMock())
+        await _run(sched, _mock_strategy())
     log.warning.assert_called_once()
     log.error.assert_not_called()
     assert sched._consecutive_price_misses["AAPL"] == 1
@@ -307,7 +314,7 @@ async def test_no_price_escalates_to_error_after_threshold():
     sched._get_current_price = AsyncMock(return_value=None)
     sched._consecutive_price_misses["AAPL"] = _CONSECUTIVE_MISS_ESCALATION_THRESHOLD - 1
     with patch("app.core.strategy_engine.scheduler.system_logger") as log:
-        await _run(sched, AsyncMock())
+        await _run(sched, _mock_strategy())
     log.error.assert_called_once()
 
 
@@ -509,3 +516,91 @@ async def test_inflight_read_does_not_recache_after_invalidate():
     assert len(await task) == 1
     sched._fetch_db_bars = AsyncMock(return_value=NEW)
     assert len(await sched._get_historical_bars("AAPL")) == 2
+
+
+# --- short history warning -----------------------------------------------------
+
+
+def _short_history_calls(warn) -> list:
+    return [c for c in warn.call_args_list if c.kwargs.get("extra", {}).get("kind") == "short_history"]
+
+
+async def test_short_history_warns_once_per_symbol_per_day(monkeypatch):
+    from app.monitoring.logger import system_logger
+
+    warn = MagicMock()
+    monkeypatch.setattr(system_logger, "warning", warn)
+    sched = _make()
+    strategy = _buy_strategy()
+    strategy.min_history_bars = lambda: 5
+    await _run(sched, strategy)
+    await _run(sched, strategy)
+    assert len(_short_history_calls(warn)) == 1
+    assert strategy.generate_signal.await_count == 2
+
+
+async def test_short_extra_symbol_bars_warn(monkeypatch):
+    from app.monitoring.logger import system_logger
+
+    warn = MagicMock()
+    monkeypatch.setattr(system_logger, "warning", warn)
+    bars_by_symbol = {
+        "AAPL": [_bar(date(2026, 10, 15)), _bar(FRIDAY)],
+        "SPY": [_bar(FRIDAY)],
+    }
+    sched = _make()
+    sched._fetch_db_bars = AsyncMock(side_effect=lambda sym, day: bars_by_symbol[sym])
+    strategy = _buy_strategy()
+    strategy.min_history_bars = lambda: 2
+    strategy.required_extra_symbols = lambda: ["SPY"]
+    await _run(sched, strategy)
+    assert len(_short_history_calls(warn)) == 1
+    strategy.generate_signal.assert_awaited_once()
+
+
+async def test_enough_history_no_short_warning(monkeypatch):
+    from app.monitoring.logger import system_logger
+
+    warn = MagicMock()
+    monkeypatch.setattr(system_logger, "warning", warn)
+    sched = _make()
+    strategy = _buy_strategy()
+    strategy.min_history_bars = lambda: 1
+    await _run(sched, strategy)
+    assert _short_history_calls(warn) == []
+
+
+async def test_zero_primary_bars_no_short_history_and_no_signal(monkeypatch):
+    from app.monitoring.logger import system_logger
+
+    warn = MagicMock()
+    monkeypatch.setattr(system_logger, "warning", warn)
+    sched = _make()
+    sched._fetch_db_bars = AsyncMock(return_value=[])
+    strategy = _buy_strategy()
+    strategy.min_history_bars = lambda: 5
+    await _run(sched, strategy)
+    assert _short_history_calls(warn) == []
+    strategy.generate_signal.assert_not_awaited()
+    assert ("no_bars", "AAPL", date(2026, 10, 19)) in sched._warned
+
+
+async def test_missing_extra_bars_keep_warning_and_signal(monkeypatch):
+    from app.monitoring.logger import system_logger
+
+    warn = MagicMock()
+    monkeypatch.setattr(system_logger, "warning", warn)
+    sched = _make()
+
+    async def fetch(symbol, day):
+        return [_bar(FRIDAY)] if symbol == "AAPL" else []
+
+    sched._fetch_db_bars = AsyncMock(side_effect=fetch)
+    strategy = _buy_strategy()
+    strategy.min_history_bars = lambda: 1
+    strategy.required_extra_symbols = lambda: ["SPY"]
+    await _run(sched, strategy)
+    assert _short_history_calls(warn) == []
+    messages = [c.args[0] for c in warn.call_args_list if c.args]
+    assert sum("no usable bars for required extra symbol" in m for m in messages) == 1
+    strategy.generate_signal.assert_awaited_once()

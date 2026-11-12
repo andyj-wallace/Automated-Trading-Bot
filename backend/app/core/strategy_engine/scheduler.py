@@ -307,6 +307,12 @@ class StrategyScheduler(SchedulerSubmitMixin, SchedulerPersistenceMixin, Schedul
                     extra={"symbol": symbol, "extra_symbol": extra_symbol},
                 )
 
+        need = strategy.min_history_bars()
+        if need and (len(bars) < need or any(len(b) < need for b in extra_bars.values())):
+            self._warn_once("short_history", symbol, market_calendar.trading_date(self._clock()),
+                            f"StrategyScheduler: fewer completed bars than the strategy needs ({need}); "
+                            "it may hold until more history loads")
+
         intraday_bars: list[PriceBar] = []
         if strategy.needs_intraday:
             intraday_bars = await self._get_intraday_bars(symbol)
