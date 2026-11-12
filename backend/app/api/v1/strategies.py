@@ -10,7 +10,7 @@ PATCH /api/v1/strategies/{id}      — Toggle is_enabled and/or update JSONB con
 
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,8 +21,35 @@ from app.core.strategy_engine.registry import registry
 from app.core.strategy_engine.seed import config_error, normalize_config
 from app.db.repositories.strategy_repo import StrategyRepo
 from app.dependencies import get_db
+from app.monitoring.logger import system_logger
 
 router = APIRouter(prefix="/strategies", tags=["strategies"])
+
+
+def _strategy_symbols(type_name: str, config: dict) -> set[str]:
+    """Return the config symbols plus the strategy's extra symbols, upper-cased."""
+    symbols = {str(s).upper() for s in config.get("symbols", [])}
+    try:
+        strategy = registry.build(type_name, config)
+        symbols |= {str(s).upper() for s in strategy.required_extra_symbols()}
+    except Exception as exc:
+        system_logger.warning(
+            "Strategy backfill: could not build strategy for extra symbols",
+            extra={"strategy_type": type_name, "error": str(exc)},
+        )
+    return symbols
+
+
+def _spawn_backfill(request: Request, type_name: str, config: dict) -> None:
+    """Start a 2-year bar backfill for a strategy's symbols when the engine is running."""
+    engine = getattr(request.app.state, "engine", None)
+    bar_refresh = getattr(engine, "bar_refresh", None)
+    if engine is None or bar_refresh is None or not engine.started:
+        return
+    symbols = _strategy_symbols(type_name, config)
+    if not symbols:
+        return
+    engine.spawn(bar_refresh.refresh(symbols, "2 Y"), "bar-backfill")
 
 
 @router.get("")
@@ -51,6 +78,7 @@ async def list_strategy_types() -> JSONResponse:
 
 @router.post("", status_code=201)
 async def create_strategy(
+    request: Request,
     body: StrategyCreateIn,
     db: AsyncSession = Depends(get_db),
 ) -> JSONResponse:
@@ -63,6 +91,7 @@ async def create_strategy(
         name=body.name, type=body.type, config=config, is_enabled=body.is_enabled
     )
     await db.commit()
+    _spawn_backfill(request, body.type, config)
     return JSONResponse(
         status_code=201, content=ok(jsonable_encoder(StrategyOut.model_validate(strategy)))
     )
@@ -70,6 +99,7 @@ async def create_strategy(
 
 @router.patch("/{strategy_id}")
 async def patch_strategy(
+    request: Request,
     strategy_id: uuid.UUID,
     body: StrategyPatchIn,
     db: AsyncSession = Depends(get_db),
@@ -106,4 +136,5 @@ async def patch_strategy(
         )
 
     await db.commit()
+    _spawn_backfill(request, strategy.type, strategy.config)
     return JSONResponse(content=ok(jsonable_encoder(StrategyOut.model_validate(strategy))))

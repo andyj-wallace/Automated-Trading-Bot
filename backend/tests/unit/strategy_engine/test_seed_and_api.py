@@ -4,11 +4,12 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.api.v1.strategies import _strategy_symbols
 from app.core.strategy_engine.builtin import load_builtin_strategies
 from app.core.strategy_engine.registry import registry
 from app.core.strategy_engine.seed import config_error, default_config, seed_strategies
@@ -139,3 +140,64 @@ def test_patch_invalid_config_is_422_and_row_unchanged(client):
     )
     assert r.status_code == 422
     assert row.config["fast_period"] == 10
+
+
+def _fake_engine(started=True):
+    return SimpleNamespace(
+        started=started,
+        bar_refresh=SimpleNamespace(refresh=MagicMock(return_value="job")),
+        spawn=MagicMock(),
+    )
+
+
+def test_post_strategy_spawns_backfill_with_extra_symbols(client, monkeypatch):
+    fake = _fake_engine()
+    monkeypatch.setattr(app.state, "engine", fake, raising=False)
+    r = client.post(
+        "/api/v1/strategies",
+        json={"name": "tp", "type": "trend_pullback", "config": {"symbols": ["aapl"]}},
+    )
+    assert r.status_code == 201
+    fake.bar_refresh.refresh.assert_called_once()
+    symbols, duration = fake.bar_refresh.refresh.call_args.args
+    assert set(symbols) >= {"AAPL", "SPY"}
+    assert duration == "2 Y"
+    fake.spawn.assert_called_once_with("job", "bar-backfill")
+
+
+def test_patch_strategy_spawns_backfill(client, monkeypatch):
+    fake = _fake_engine()
+    monkeypatch.setattr(app.state, "engine", fake, raising=False)
+    r = client.post(
+        "/api/v1/strategies",
+        json={"name": "tp", "type": "trend_pullback", "config": {"symbols": ["aapl"]}},
+    )
+    strategy_id = r.json()["data"]["id"]
+    fake.bar_refresh.refresh.reset_mock()
+    fake.spawn.reset_mock()
+
+    r = client.patch(
+        f"/api/v1/strategies/{strategy_id}", json={"config": {"symbols": ["msft"]}}
+    )
+    assert r.status_code == 200
+    fake.bar_refresh.refresh.assert_called_once()
+    symbols, duration = fake.bar_refresh.refresh.call_args.args
+    assert set(symbols) >= {"MSFT", "SPY"}
+    assert duration == "2 Y"
+    fake.spawn.assert_called_once_with("job", "bar-backfill")
+
+
+def test_no_backfill_when_engine_not_started(client, monkeypatch):
+    fake = _fake_engine(started=False)
+    monkeypatch.setattr(app.state, "engine", fake, raising=False)
+    r = client.post(
+        "/api/v1/strategies",
+        json={"name": "tp", "type": "trend_pullback", "config": {"symbols": ["aapl"]}},
+    )
+    assert r.status_code == 201
+    fake.bar_refresh.refresh.assert_not_called()
+    fake.spawn.assert_not_called()
+
+
+def test_strategy_symbols_survives_build_failure():
+    assert _strategy_symbols("no_such_type", {"symbols": ["msft"]}) == {"MSFT"}
