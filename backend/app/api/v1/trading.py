@@ -15,9 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.schemas import FlattenIn, PauseIn, err, ok
 from app.core.engine import TradingEngine
+from app.core.execution.flatten import flatten_positions
 from app.db.repositories.trade_repo import TradeRepo
 from app.dependencies import get_db, get_engine
-from app.monitoring.logger import system_logger
 
 router = APIRouter(prefix="/trading", tags=["trading"])
 
@@ -88,16 +88,7 @@ async def flatten(
             status_code=422,
             content=err("CONFIRMATION_REQUIRED", 'Body must be {"confirm": "FLATTEN"}'),
         )
-    await engine.trading_state.pause("flatten")
-    trades = await TradeRepo(db).get_open_trades()
-    results = []
-    for trade in trades:
-        try:
-            outcome = (await engine.order_manager.close_position(trade.id, "MANUAL")).value
-        except Exception as exc:
-            system_logger.error(
-                "Flatten: close failed", extra={"trade_id": str(trade.id), "error": str(exc)}
-            )
-            outcome = "FAILED"
-        results.append({"trade_id": str(trade.id), "symbol": trade.symbol, "outcome": outcome})
+    results = await flatten_positions(
+        engine.trading_state, engine.order_manager, engine.broker, TradeRepo(db)
+    )
     return JSONResponse(content=ok({"paused": True, "results": results}))

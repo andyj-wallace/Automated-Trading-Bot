@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.v1 import signals, symbols, trades, trading
-from app.brokers.base import BrokerConnectionInfo
+from app.brokers.base import BrokerConnectionInfo, OrderResult
 from app.core.execution.order_manager import CloseOutcome
 from app.core.risk.growth import GrowthPolicy
 from app.core.risk.manager import RiskRejectionError
@@ -56,6 +56,8 @@ def env(monkeypatch):
     order_manager = SimpleNamespace(
         close_position=AsyncMock(return_value=CloseOutcome.CLOSED),
         submit_order=AsyncMock(),
+        wait_for_entries_idle=AsyncMock(return_value=True),
+        adopt_entry_fill=AsyncMock(return_value=True),
     )
     engine = SimpleNamespace(
         trading_state=TradingState(cache),
@@ -68,6 +70,8 @@ def env(monkeypatch):
             get_account_summary=AsyncMock(
                 return_value=SimpleNamespace(net_liquidation=Decimal("100000"))
             ),
+            find_order_by_ref=AsyncMock(return_value=None),
+            cancel_order=AsyncMock(return_value=True),
         ),
         settings=SimpleNamespace(
             trading_capital_limit=None, commission_plan="ibkr_fixed", account_type="cash"
@@ -155,6 +159,7 @@ def test_flatten_requires_confirm(env):
 
 def test_flatten_closes_all_and_leaves_paused(env):
     rows = [trade_row("AAPL"), trade_row("MSFT")]
+    env.monkeypatch.setattr(trading.TradeRepo, "get_active_trades", AsyncMock(return_value=[]))
     env.monkeypatch.setattr(trading.TradeRepo, "get_open_trades", AsyncMock(return_value=rows))
     env.engine.order_manager.close_position.side_effect = [
         CloseOutcome.CLOSED, CloseOutcome.PENDING_EXIT
@@ -165,6 +170,30 @@ def test_flatten_closes_all_and_leaves_paused(env):
     assert env.cache.data["trading:paused"] == "1"
     calls = env.engine.order_manager.close_position.await_args_list
     assert all(c.args[1] == "MANUAL" for c in calls)
+
+
+def test_flatten_cancels_working_entry_and_closes_open(env):
+    a = trade_row("AAPL", status="OPEN")
+    b = trade_row("MSFT", status="SUBMITTED")
+    env.monkeypatch.setattr(
+        trading.TradeRepo, "get_active_trades", AsyncMock(return_value=[a, b])
+    )
+    env.monkeypatch.setattr(trading.TradeRepo, "get_open_trades", AsyncMock(return_value=[a]))
+    working = OrderResult(
+        trade_id=b.id, broker_order_id="B1", status="WORKING", filled_quantity=Decimal("0"),
+        avg_fill_price=Decimal("0"), timestamp=NOW,
+    )
+    rejected = working.model_copy(update={"status": "REJECTED"})
+    env.engine.broker.find_order_by_ref.side_effect = [working, rejected]
+    resp = env.client.post("/api/v1/trading/flatten", json={"confirm": "FLATTEN"})
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert data["paused"] is True
+    outcomes = {r["trade_id"]: r["outcome"] for r in data["results"]}
+    assert outcomes[str(b.id)] == "ENTRY_CANCELLED"
+    assert outcomes[str(a.id)] == "CLOSED"
+    env.engine.broker.cancel_order.assert_awaited_once_with("B1")
+    env.engine.order_manager.close_position.assert_awaited_once_with(a.id, "MANUAL")
 
 
 @pytest.mark.parametrize(
