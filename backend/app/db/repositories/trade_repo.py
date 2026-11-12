@@ -124,6 +124,18 @@ class TradeRepo:
         )
         return (await self.session.execute(stmt)).first() is not None
 
+    async def get_active_trade(self, symbol: str) -> Trade | None:
+        """Return the symbol's PENDING, SUBMITTED, OPEN or CLOSING trade, if any."""
+        stmt = (
+            select(Trade)
+            .where(
+                Trade.symbol == symbol.upper(),
+                Trade.status.in_(ACTIVE_RISK_STATUSES),
+            )
+            .limit(1)
+        )
+        return (await self.session.execute(stmt)).scalars().first()
+
     async def list(
         self,
         symbol: str | None = None,

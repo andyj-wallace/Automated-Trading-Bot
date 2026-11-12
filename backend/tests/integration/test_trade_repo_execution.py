@@ -133,3 +133,18 @@ async def test_exit_deadline_and_time_exit_persist(factory):
     async with factory() as s:
         t = await TradeRepo(s).get_by_id(tid)
     assert t.exit_deadline == deadline and t.exit_reason == ExitReason.TIME_EXIT
+
+
+async def test_get_active_trade_returns_open_trade(factory):
+    tid = await _make_open(factory)
+    async with factory() as s:
+        t = await TradeRepo(s).get_active_trade("aapl")
+    assert t is not None
+    assert t.id == tid
+    assert t.status == TradeStatus.OPEN
+
+
+async def test_get_active_trade_none_for_other_symbol(factory):
+    await _make_open(factory)
+    async with factory() as s:
+        assert await TradeRepo(s).get_active_trade("MSFT") is None
