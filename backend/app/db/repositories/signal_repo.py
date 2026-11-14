@@ -1,6 +1,7 @@
 """Repository for the strategy_signals table."""
 
 import uuid
+from collections.abc import Collection
 from datetime import date
 from decimal import Decimal
 
@@ -25,23 +26,28 @@ class SignalRepo:
         entry_price: Decimal | None = None,
         stop_loss_price: Decimal | None = None,
         take_profit_price: Decimal | None = None,
+        reclaim_outcomes: Collection[str] = (),
     ) -> uuid.UUID | None:
-        """Insert the signal; return its id, or None if this key was already claimed."""
-        stmt = (
-            insert(StrategySignal)
-            .values(
-                strategy_id=strategy_id,
-                symbol=symbol.upper(),
-                bar_date=bar_date,
-                action=action,
-                entry_price=entry_price,
-                stop_loss_price=stop_loss_price,
-                take_profit_price=take_profit_price,
-            )
-            .on_conflict_do_nothing(constraint="uq_strategy_signals_dedupe")
-            .returning(StrategySignal.id)
+        """Claim the key and return its id; None if taken and its outcome is not reclaimable."""
+        stmt = insert(StrategySignal).values(
+            strategy_id=strategy_id,
+            symbol=symbol.upper(),
+            bar_date=bar_date,
+            action=action,
+            entry_price=entry_price,
+            stop_loss_price=stop_loss_price,
+            take_profit_price=take_profit_price,
         )
-        return (await self.session.execute(stmt)).scalar_one_or_none()
+        if reclaim_outcomes:
+            stmt = stmt.on_conflict_do_update(
+                constraint="uq_strategy_signals_dedupe",
+                set_={"outcome": "CLAIMED", "detail": None, "trade_id": None},
+                where=StrategySignal.outcome.in_(tuple(reclaim_outcomes)),
+            )
+        else:
+            stmt = stmt.on_conflict_do_nothing(constraint="uq_strategy_signals_dedupe")
+        result = await self.session.execute(stmt.returning(StrategySignal.id))
+        return result.scalar_one_or_none()
 
     async def set_outcome(
         self,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Collection
 from datetime import date
 
 from app.core.strategy_engine.base import Signal
@@ -37,7 +38,13 @@ class SchedulerPersistenceMixin:
             return await self._trade_repo(session).get_active_trade(symbol)
 
     async def _claim_signal(
-        self, strategy_id: uuid.UUID, symbol: str, bar_date: date, signal: Signal
+        self,
+        strategy_id: uuid.UUID,
+        symbol: str,
+        bar_date: date,
+        signal: Signal,
+        *,
+        reclaim_outcomes: Collection[str] = (),
     ) -> uuid.UUID | None:
         async with self._session_factory() as session:
             signal_id = await self._signal_repo(session).claim(
@@ -48,6 +55,7 @@ class SchedulerPersistenceMixin:
                 entry_price=signal.entry_price,
                 stop_loss_price=signal.stop_loss_price,
                 take_profit_price=signal.take_profit_price,
+                reclaim_outcomes=reclaim_outcomes,
             )
             await session.commit()
             return signal_id

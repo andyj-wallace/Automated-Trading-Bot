@@ -453,9 +453,11 @@ async def test_watchdog_silent_when_market_closed(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _patch_stop_writes(monkeypatch, *, fail_first: bool = False, gate=None) -> list:
+def _patch_stop_writes(
+    monkeypatch, *, fail_first: bool = False, fail_times: int = 0, gate=None
+) -> list:
     calls: list[tuple[uuid.UUID, Decimal]] = []
-    state = {"fail": fail_first}
+    state = {"fails": max(fail_times, 1 if fail_first else 0)}
 
     class Repo:
         def __init__(self, session) -> None:
@@ -465,8 +467,8 @@ def _patch_stop_writes(monkeypatch, *, fail_first: bool = False, gate=None) -> l
             calls.append((trade_id, stop_price))
             if gate is not None:
                 await gate.wait()
-            if state["fail"]:
-                state["fail"] = False
+            if state["fails"] > 0:
+                state["fails"] -= 1
                 raise RuntimeError("db down")
 
     monkeypatch.setattr("app.db.repositories.trade_repo.TradeRepo", Repo)
@@ -546,3 +548,122 @@ async def test_no_follow_up_write_once_trade_is_untracked(monkeypatch) -> None:
     gate.set()
     await _settle(monitor)
     assert calls == [(trade_id, Decimal("101"))]
+
+
+def _capture_errors(monkeypatch) -> list:
+    errors: list[dict] = []
+    monkeypatch.setattr(
+        "app.core.execution.position_monitor.system_logger.error",
+        lambda msg, *a, **kw: errors.append(kw.get("extra", {})),
+    )
+    return errors
+
+
+def _backoff_monitor(now: datetime, seconds: float = 5.0):
+    clock = {"now": now}
+    monitor = _monitor(clock=lambda: clock["now"], stop_persist_retry_seconds=seconds)
+    monitor._session_factory = _Session
+    return monitor, clock
+
+
+async def test_failing_write_backs_off_instead_of_retrying_every_tick(monkeypatch) -> None:
+    calls = _patch_stop_writes(monkeypatch, fail_times=2)
+    errors = _capture_errors(monkeypatch)
+    monitor, clock = _backoff_monitor(_OPEN_UTC)
+    trade_id = _track(monitor, entry="100", stop="95", tp="220")
+    await monitor.on_price_update(_tick("106"))
+    await _settle(monitor)
+    assert calls == [(trade_id, Decimal("101"))]
+    assert len(errors) == 1 and errors[0]["retry_in_seconds"] == 5.0
+    assert monitor._tracked[trade_id].next_persist_after == _OPEN_UTC + timedelta(seconds=5)
+
+    for price in ("106.6", "107", "107.5"):  # each rise alone would qualify for a write
+        await monitor.on_price_update(_tick(price))
+        await _settle(monitor)
+    clock["now"] = _OPEN_UTC + timedelta(seconds=4.9)
+    await monitor.on_price_update(_tick("107.5"))
+    await _settle(monitor)
+    assert len(calls) == 1
+    assert len(errors) == 1
+
+    clock["now"] = _OPEN_UTC + timedelta(seconds=5.1)
+    await monitor.on_price_update(_tick("107.5"))
+    await _settle(monitor)
+    assert calls[-1] == (trade_id, Decimal("102.5"))
+    assert len(calls) == 2 and len(errors) == 2  # still failing: a new window starts
+    assert monitor._tracked[trade_id].next_persist_after == _OPEN_UTC + timedelta(seconds=10.1)
+    await monitor.on_price_update(_tick("107.5"))
+    await _settle(monitor)
+    assert len(calls) == 2
+
+
+async def test_successful_retry_after_backoff_clears_it(monkeypatch) -> None:
+    calls = _patch_stop_writes(monkeypatch, fail_first=True)
+    monitor, clock = _backoff_monitor(_OPEN_UTC)
+    trade_id = _track(monitor, entry="100", stop="95", tp="220")
+    await monitor.on_price_update(_tick("106"))
+    await _settle(monitor)
+    clock["now"] = _OPEN_UTC + timedelta(seconds=6)
+    await monitor.on_price_update(_tick("106"))
+    await _settle(monitor)
+    assert calls == [(trade_id, Decimal("101")), (trade_id, Decimal("101"))]
+    tracked = monitor._tracked[trade_id]
+    assert tracked.persisted_stop == Decimal("101")
+    assert tracked.next_persist_after is None
+    assert tracked.persist_in_flight is False
+
+
+async def test_stop_hit_during_backoff_still_closes(monkeypatch) -> None:
+    _patch_stop_writes(monkeypatch, fail_first=True)
+    monitor, _ = _backoff_monitor(_OPEN_UTC)
+    trade_id = _track(monitor, entry="100", stop="95", tp="220")
+    await monitor.on_price_update(_tick("106"))  # trails the stop to 101; the write fails
+    await _settle(monitor)
+    assert monitor._tracked[trade_id].next_persist_after is not None
+    await monitor.on_price_update(_tick("100.5"))
+    await _settle(monitor)
+    monitor._order_manager.close_position.assert_awaited_once_with(trade_id, "STOP_LOSS")
+
+
+async def test_default_without_backoff_retries_failing_write_every_tick(monkeypatch) -> None:
+    calls = _patch_stop_writes(monkeypatch, fail_times=3)
+    errors = _capture_errors(monkeypatch)
+    monitor = _monitor()
+    monitor._session_factory = _Session
+    trade_id = _track(monitor, entry="100", stop="95", tp="220")
+    for _ in range(3):
+        await monitor.on_price_update(_tick("106"))
+        await _settle(monitor)
+    assert calls == [(trade_id, Decimal("101"))] * 3
+    assert [e["retry_in_seconds"] for e in errors] == [0.0, 0.0, 0.0]
+    assert monitor._tracked[trade_id].next_persist_after is None
+
+
+async def test_rise_during_write_saved_right_after_with_backoff(monkeypatch) -> None:
+    gate = asyncio.Event()
+    calls = _patch_stop_writes(monkeypatch, gate=gate)
+    monitor, _ = _backoff_monitor(_OPEN_UTC)
+    trade_id = _track(monitor, entry="100", stop="95", tp="220")
+    await monitor.on_price_update(_tick("106"))
+    await monitor.on_price_update(_tick("106.6"))
+    await asyncio.sleep(0)
+    gate.set()
+    await _settle(monitor)
+    assert calls == [(trade_id, Decimal("101")), (trade_id, Decimal("101.6"))]
+    assert monitor._tracked[trade_id].persisted_stop == Decimal("101.6")
+    assert monitor._tracked[trade_id].next_persist_after is None
+
+
+async def test_no_follow_up_write_once_untracked_with_backoff(monkeypatch) -> None:
+    gate = asyncio.Event()
+    calls = _patch_stop_writes(monkeypatch, gate=gate)
+    monitor, _ = _backoff_monitor(_OPEN_UTC)
+    trade_id = _track(monitor, entry="100", stop="95", tp="220")
+    await monitor.on_price_update(_tick("106"))
+    await monitor.on_price_update(_tick("106.6"))
+    await asyncio.sleep(0)
+    tracked = monitor._tracked.pop(trade_id)
+    gate.set()
+    await _settle(monitor)
+    assert calls == [(trade_id, Decimal("101"))]
+    assert tracked.next_persist_after is None

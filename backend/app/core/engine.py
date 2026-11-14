@@ -40,7 +40,7 @@ class TradingEngine:
         lock_retry_interval: float = 5.0,
     ) -> None:
         from app.core.execution.order_manager import OrderManager
-        from app.core.execution.position_monitor import PositionMonitor
+        from app.core.execution.position_monitor import STOP_PERSIST_RETRY_SECONDS, PositionMonitor
         from app.core.execution.reconciler import Reconciler
         from app.core.risk.manager import RiskManager
         from app.core.risk.monitor import RiskMonitor, RiskMonitorConfig
@@ -96,6 +96,7 @@ class TradingEngine:
             is_market_open=is_market_open,
             clock=clock,
             resync_interval_seconds=monitor_resync_interval,
+            stop_persist_retry_seconds=STOP_PERSIST_RETRY_SECONDS,
         )
         self.feed.add_listener(self.position_monitor.on_price_update)
         self.reconciler = Reconciler(

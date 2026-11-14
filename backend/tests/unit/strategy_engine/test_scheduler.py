@@ -699,3 +699,143 @@ async def test_sell_market_closed_outcome():
     trade = _own_trade()
     await _run(sched, _sell_strategy())
     assert sched._signals.outcomes == [("EXIT_MARKET_CLOSED", None, trade.id)]
+
+
+# --- a failed or deferred signal exit is retried the same day -----------------
+
+
+class RowSignalRepo(FakeSignalRepo):
+    """One row per dedupe key with its outcome; honors reclaim_outcomes like SignalRepo.claim."""
+
+    def __init__(self):
+        super().__init__([])
+        self.rows: dict[tuple, dict] = {}
+        self.by_id: dict[uuid.UUID, dict] = {}
+
+    async def claim(self, *, reclaim_outcomes=(), **kwargs):
+        self.claims.append({**kwargs, "reclaim_outcomes": reclaim_outcomes})
+        key = (kwargs["strategy_id"], kwargs["symbol"].upper(), kwargs["bar_date"], kwargs["action"])
+        row = self.rows.get(key)
+        if row is None:
+            row = self.rows[key] = {"id": uuid.uuid4(), "outcome": "CLAIMED"}
+            self.by_id[row["id"]] = row
+            return row["id"]
+        if row["outcome"] in reclaim_outcomes:
+            row.update(outcome="CLAIMED", detail=None, trade_id=None)
+            return row["id"]
+        return None
+
+    async def set_outcome(self, signal_id, outcome, detail=None, trade_id=None):
+        await super().set_outcome(signal_id, outcome, detail, trade_id)
+        self.by_id[signal_id].update(outcome=outcome, detail=detail, trade_id=trade_id)
+
+
+def _with_rows(sched) -> RowSignalRepo:
+    rows = RowSignalRepo()
+    sched._signal_repo_factory = lambda _s: rows
+    sched._signals = rows
+    return rows
+
+
+def _system_alerts(sched) -> list[dict]:
+    return [
+        json.loads(c.args[1])["payload"]
+        for c in sched._cache.publish.await_args_list
+        if c.args[0] == "system_alerts"
+    ]
+
+
+async def test_sell_close_error_is_retried_next_run_and_alerts():
+    sched = _make()
+    rows = _with_rows(sched)
+    sched._order_manager.close_position = AsyncMock(
+        side_effect=[RuntimeError("boom"), RuntimeError("boom"), CloseOutcome.CLOSED]
+    )
+    trade = _own_trade()
+    strategy = _sell_strategy()
+    for _ in range(4):
+        await _run(sched, strategy)
+    assert sched._order_manager.close_position.await_count == 3
+    assert [o[0] for o in rows.outcomes] == ["EXIT_FAILED", "EXIT_FAILED", "EXIT_CLOSED"]
+    assert len(rows.rows) == 1
+    alerts = _system_alerts(sched)
+    assert len(alerts) == 1
+    assert alerts[0]["alert_type"] == "CLOSE_FAILED"
+    assert alerts[0]["symbol"] == "AAPL"
+    assert alerts[0]["trade_id"] == str(trade.id)
+    assert alerts[0]["exit_reason"] == "SIGNAL_EXIT"
+    assert alerts[0]["error"] == "boom"
+
+
+async def test_sell_failed_exit_left_closing_goes_to_reconciler():
+    sched = _make()
+    rows = _with_rows(sched)
+    trade = _own_trade()
+
+    async def fail_leaving_closing(*_args):
+        trade.status = TradeStatus.CLOSING
+        return CloseOutcome.FAILED
+
+    sched._order_manager.close_position = AsyncMock(side_effect=fail_leaving_closing)
+    strategy = _sell_strategy()
+    await _run(sched, strategy)
+    await _run(sched, strategy)
+    sched._order_manager.close_position.assert_awaited_once()
+    assert rows.outcomes == [("EXIT_FAILED", None, trade.id)]
+    assert _system_alerts(sched) == []
+
+
+@pytest.mark.parametrize("first", [CloseOutcome.MARKET_CLOSED, CloseOutcome.FAILED])
+async def test_sell_deferred_or_failed_exit_is_retried_next_run(first):
+    sched = _make()
+    rows = _with_rows(sched)
+    sched._order_manager.close_position = AsyncMock(side_effect=[first, CloseOutcome.CLOSED])
+    trade = _own_trade()
+    strategy = _sell_strategy()
+    await _run(sched, strategy)
+    await _run(sched, strategy)
+    assert sched._order_manager.close_position.await_count == 2
+    assert rows.outcomes == [
+        (f"EXIT_{first.value}", None, trade.id),
+        ("EXIT_CLOSED", None, trade.id),
+    ]
+    assert _system_alerts(sched) == []
+
+
+@pytest.mark.parametrize(
+    "first", [CloseOutcome.CLOSED, CloseOutcome.PENDING_EXIT, CloseOutcome.NOT_OPEN]
+)
+async def test_sell_settled_exit_blocks_second_sell_same_day(first):
+    sched = _make()
+    rows = _with_rows(sched)
+    sched._order_manager.close_position = AsyncMock(return_value=first)
+    _own_trade()
+    strategy = _sell_strategy()
+    await _run(sched, strategy)
+    await _run(sched, strategy)
+    sched._order_manager.close_position.assert_awaited_once()
+    assert [o[0] for o in rows.outcomes] == [f"EXIT_{first.value}"]
+    assert rows.claims[1]["reclaim_outcomes"] == ("EXIT_FAILED", "EXIT_MARKET_CLOSED")
+
+
+async def test_sell_in_flight_claim_blocks_second_sell():
+    sched = _make()
+    rows = _with_rows(sched)
+    await rows.claim(strategy_id=STRATEGY_ID, symbol="AAPL", bar_date=FRIDAY, action="SELL")
+    sched._order_manager.close_position = AsyncMock(return_value=CloseOutcome.CLOSED)
+    _own_trade()
+    await _run(sched, _sell_strategy())
+    sched._order_manager.close_position.assert_not_awaited()
+    assert rows.outcomes == []
+
+
+async def test_buy_claim_does_not_reclaim_failed_order():
+    sched = _make()
+    rows = _with_rows(sched)
+    sched._order_manager.submit_order = AsyncMock(side_effect=RuntimeError("boom"))
+    strategy = _buy_strategy()
+    await _run(sched, strategy)
+    await _run(sched, strategy)
+    sched._order_manager.submit_order.assert_awaited_once()
+    assert [o[0] for o in rows.outcomes] == ["ORDER_FAILED"]
+    assert all(not c["reclaim_outcomes"] for c in rows.claims)

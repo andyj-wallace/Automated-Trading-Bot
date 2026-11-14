@@ -8,11 +8,14 @@ from decimal import Decimal
 
 from app.brokers.base import PriceBar
 from app.core import market_calendar
+from app.core.events import publish_system_alert
 from app.core.risk.manager import RiskRejectionError, TradeRequest
 from app.core.strategy_engine.base import RiskParams, Signal
 from app.core.strategy_engine.indicators import avg_dollar_volume
 from app.db.models.trade import TradeStatus
 from app.monitoring.logger import trading_logger
+
+_RETRYABLE_SELL_OUTCOMES = ("EXIT_FAILED", "EXIT_MARKET_CLOSED")
 
 
 class SchedulerSubmitMixin:
@@ -85,7 +88,11 @@ class SchedulerSubmitMixin:
             return
 
         signal_id = await self._claim_signal(
-            strategy_id, symbol, bars[-1].timestamp.date(), signal
+            strategy_id,
+            symbol,
+            bars[-1].timestamp.date(),
+            signal,
+            reclaim_outcomes=_RETRYABLE_SELL_OUTCOMES,
         )
         if signal_id is None:
             return
@@ -94,6 +101,25 @@ class SchedulerSubmitMixin:
             outcome = await self._order_manager.close_position(trade.id, "SIGNAL_EXIT")
         except Exception as exc:
             await self._set_outcome(signal_id, "EXIT_FAILED", detail=str(exc), trade_id=trade.id)
+            details = {
+                "trade_id": str(trade.id),
+                "symbol": symbol,
+                "exit_reason": "SIGNAL_EXIT",
+                "error": str(exc),
+            }
+            alert_key = ("signal_exit_failed", str(trade.id), market_calendar.trading_date(self._clock()))
+            if alert_key in self._warned:
+                trading_logger.warning("StrategyScheduler: signal exit failed again", extra=details)
+                return
+            self._warned.add(alert_key)
+            await publish_system_alert(
+                self._cache,
+                "CLOSE_FAILED",
+                f"Signal exit for {symbol} failed. The strategy retries it on its next run while "
+                "the trade is still open; if the exit had already started, the reconciler "
+                "finishes it.",
+                **details,
+            )
             return
         await self._set_outcome(signal_id, f"EXIT_{outcome.value}", trade_id=trade.id)
 

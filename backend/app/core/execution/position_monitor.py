@@ -20,10 +20,11 @@ Trailing / breakeven stop (long trades only):
   never updated after creation (see Trade model), so the original
   risk-approved stop remains the permanent audit record. The trailed stop is
   kept in PositionMonitor's tracked copy and saved to the DB's
-  current_stop_price when it rises by at least 0.1R (retried on later ticks
-  if the write fails). The IBKR stop order is not moved. Closes still report
-  exit_reason="STOP_LOSS" (logged with both the original and effective stop
-  so a trailed exit is distinguishable in system.log).
+  current_stop_price when it rises by at least 0.1R. After a failed write the
+  next attempt waits `stop_persist_retry_seconds` (only the write is delayed,
+  never stop/target checks or exits). The IBKR stop order is not moved.
+  Closes still report exit_reason="STOP_LOSS" (logged with both the original
+  and effective stop so a trailed exit is distinguishable in system.log).
 
 Stale-trade timeout:
   A trade that never reaches its stop or target just sits open indefinitely,
@@ -58,6 +59,8 @@ from app.core.tasks import PeriodicTask, spawn
 from app.db.models.trade import Trade
 from app.monitoring.logger import system_logger, trading_logger
 
+STOP_PERSIST_RETRY_SECONDS = 5.0
+
 
 @dataclass
 class _TrackedTrade:
@@ -81,6 +84,7 @@ class _TrackedTrade:
     exit_deadline: datetime | None = None
     persisted_stop: Decimal | None = None  # last stop confirmed in the DB; None means initial stop
     persist_in_flight: bool = False  # True while a stop write is running
+    next_persist_after: datetime | None = None  # no stop write before this time after a failure
 
 
 class PositionMonitor:
@@ -113,6 +117,7 @@ class PositionMonitor:
         watchdog_interval_seconds: float = 30.0,
         price_stale_seconds: int = 120,
         time_exit_interval_seconds: float = 30.0,
+        stop_persist_retry_seconds: float = 0.0,
     ) -> None:
         self._cache = cache
         self._session_factory = session_factory
@@ -134,6 +139,7 @@ class PositionMonitor:
         self._watchdog_interval_seconds = watchdog_interval_seconds
         self._price_stale_seconds = price_stale_seconds
         self._time_exit_interval_seconds = time_exit_interval_seconds
+        self._stop_persist_retry_seconds = stop_persist_retry_seconds
         self._started_at: datetime | None = None
         self._stale_alerted: set[tuple[str, date]] = set()
 
@@ -311,6 +317,8 @@ class PositionMonitor:
         """Start a background write of the trailed stop once it has risen by at least 0.1R."""
         if tracked.direction != "BUY" or tracked.persist_in_flight:
             return
+        if tracked.next_persist_after is not None and self._clock() < tracked.next_persist_after:
+            return
         r = tracked.entry_price - tracked.initial_stop_loss_price
         if r <= 0:
             return
@@ -328,7 +336,7 @@ class PositionMonitor:
             )
 
     async def _persist_stop(self, tracked: _TrackedTrade, stop_price: Decimal) -> None:
-        """Save a trailed stop; a failed write retries on a later tick, a rise during it right after."""
+        """Save a trailed stop; a failure retries after the backoff, a rise during it just after."""
         from app.db.repositories.trade_repo import TradeRepo
 
         try:
@@ -336,14 +344,22 @@ class PositionMonitor:
                 await TradeRepo(session).raise_current_stop(tracked.trade_id, stop_price)
                 await session.commit()
         except Exception as exc:
+            retry_in = self._stop_persist_retry_seconds
+            if retry_in > 0:
+                tracked.next_persist_after = self._clock() + timedelta(seconds=retry_in)
             system_logger.error(
                 "PositionMonitor: persisting trailing stop failed",
-                extra={"trade_id": str(tracked.trade_id), "error": str(exc)},
+                extra={
+                    "trade_id": str(tracked.trade_id),
+                    "error": str(exc),
+                    "retry_in_seconds": retry_in,
+                },
             )
             return
         finally:
             tracked.persist_in_flight = False
         tracked.persisted_stop = stop_price
+        tracked.next_persist_after = None
         if self._tracked.get(tracked.trade_id) is tracked:
             self._maybe_persist_stop(tracked)
 

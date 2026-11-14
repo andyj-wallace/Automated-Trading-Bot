@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -17,7 +18,8 @@ from sqlalchemy.orm import sessionmaker
 from app.brokers.mock.client import MockBroker
 from app.core.execution.order_manager import OrderManager
 from app.core.risk.manager import RiskManager, RiskRejectionError, TradeRequest
-from app.db.models.trade import TradeStatus
+from app.core.strategy_engine.scheduler_submit import _RETRYABLE_SELL_OUTCOMES
+from app.db.models.trade import TradeDirection, TradeStatus
 from app.db.repositories.signal_repo import SignalRepo
 from app.db.repositories.strategy_repo import StrategyRepo
 from app.db.repositories.trade_repo import TradeRepo
@@ -136,3 +138,86 @@ async def test_order_manager_never_trades_on_margin(session_factory):
     assert exc.value.reason.startswith("NOTIONAL_LIMIT_EXCEEDED")
     await manager.submit_order(request("MSFT", "200"))  # $100,000 total: allowed
     await broker.disconnect()
+
+
+async def _claimed_sell(session_factory) -> tuple[dict, uuid.UUID, uuid.UUID]:
+    """Create a strategy and a trade, claim a SELL key; return (key, signal_id, trade_id)."""
+    async with session_factory() as s:
+        strategy = await StrategyRepo(s).create(name="reclaim", type="moving_average")
+        trade = await TradeRepo(s).create(
+            symbol="AAPL",
+            direction=TradeDirection.BUY,
+            quantity=Decimal("10"),
+            entry_price=Decimal("200"),
+            stop_loss_price=Decimal("195"),
+            take_profit_price=Decimal("210"),
+            reward_to_risk_ratio=Decimal("2"),
+            risk_amount=Decimal("50"),
+            account_balance_at_entry=Decimal("100000"),
+            strategy_id=strategy.id,
+        )
+        await s.commit()
+    key = dict(strategy_id=strategy.id, symbol="AAPL", bar_date=date(2026, 10, 16), action="SELL")
+    async with session_factory() as s:
+        signal_id = await SignalRepo(s).claim(**key)
+        await s.commit()
+    assert signal_id is not None
+    return key, signal_id, trade.id
+
+
+async def _set_outcome(session_factory, signal_id, outcome, trade_id) -> None:
+    async with session_factory() as s:
+        await SignalRepo(s).set_outcome(signal_id, outcome, detail="why", trade_id=trade_id)
+        await s.commit()
+
+
+async def _reclaim(session_factory, key, reclaim_outcomes=_RETRYABLE_SELL_OUTCOMES):
+    async with session_factory() as s:
+        signal_id = await SignalRepo(s).claim(**key, reclaim_outcomes=reclaim_outcomes)
+        await s.commit()
+    return signal_id
+
+
+@pytest.mark.parametrize("outcome", ["EXIT_FAILED", "EXIT_MARKET_CLOSED"])
+async def test_retryable_sell_outcome_is_reclaimed(session_factory, outcome):
+    key, signal_id, trade_id = await _claimed_sell(session_factory)
+    await _set_outcome(session_factory, signal_id, outcome, trade_id)
+
+    assert await _reclaim(session_factory, key) == signal_id
+
+    async with session_factory() as s:
+        rows = await SignalRepo(s).list(strategy_id=key["strategy_id"])
+    assert [(r.id, r.outcome, r.detail, r.trade_id) for r in rows] == [
+        (signal_id, "CLAIMED", None, None)
+    ]
+
+
+@pytest.mark.parametrize(
+    "outcome", ["CLAIMED", "EXIT_CLOSED", "EXIT_PENDING_EXIT", "EXIT_NOT_OPEN"]
+)
+async def test_settled_or_in_flight_sell_is_not_reclaimed(session_factory, outcome):
+    key, signal_id, trade_id = await _claimed_sell(session_factory)
+    if outcome != "CLAIMED":
+        await _set_outcome(session_factory, signal_id, outcome, trade_id)
+
+    assert await _reclaim(session_factory, key) is None
+
+    async with session_factory() as s:
+        rows = await SignalRepo(s).list(strategy_id=key["strategy_id"])
+    assert [r.outcome for r in rows] == [outcome]
+
+
+async def test_claim_without_reclaim_outcomes_never_reclaims(session_factory):
+    key, signal_id, trade_id = await _claimed_sell(session_factory)
+    await _set_outcome(session_factory, signal_id, "EXIT_FAILED", trade_id)
+
+    assert await _reclaim(session_factory, key, reclaim_outcomes=()) is None
+
+
+async def test_concurrent_reclaims_yield_one_claim(session_factory):
+    key, signal_id, trade_id = await _claimed_sell(session_factory)
+    await _set_outcome(session_factory, signal_id, "EXIT_FAILED", trade_id)
+
+    results = await asyncio.gather(*(_reclaim(session_factory, key) for _ in range(2)))
+
+    assert results.count(signal_id) == 1 and results.count(None) == 1
