@@ -77,7 +77,7 @@ PositionMonitor watches the price and closes the trade ◄───────�
 Reconciler compares the bot's trades with IBKR's positions every 2 minutes
 ```
 
-1. On NYSE trading days, 09:45-15:45 ET, the scheduler runs each enabled strategy every 60 seconds on its assigned symbols. Creating or changing a strategy while the bot runs downloads 2 years of daily price history for its symbols and any extra symbols it needs (for example SPY, which tracks the whole US market, for the market filter), and the scheduler uses the new bars the same day.
+1. On NYSE trading days, 09:45-15:45 ET, the scheduler runs each enabled strategy every 60 seconds on its assigned symbols. Creating or changing a strategy while the bot runs downloads 2 years of daily price history for its symbols and any extra symbols it needs (for example SPY, which tracks the whole US market, for the market filter), and the scheduler uses the new bars the same day. The same applies to a history download started from the Watchlist page.
 2. Each strategy, symbol, day and action can act only once.
 3. The risk checks below decide whether to trade and how many shares to buy. Quantities are always whole shares: IBKR's API rejects fractional stock orders.
 4. After the fill, the bot attempts to place a stop order at IBKR in case it goes offline (`BROKER_PROTECTIVE_STOPS`). Confirm that the broker accepted it; placement failure currently alerts without blocking further entries. The profit target stays inside the bot.

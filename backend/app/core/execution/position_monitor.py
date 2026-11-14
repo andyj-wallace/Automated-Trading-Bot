@@ -328,21 +328,24 @@ class PositionMonitor:
             )
 
     async def _persist_stop(self, tracked: _TrackedTrade, stop_price: Decimal) -> None:
-        """Save a trailed stop to current_stop_price; a failed write is retried on a later tick."""
+        """Save a trailed stop; a failed write retries on a later tick, a rise during it right after."""
         from app.db.repositories.trade_repo import TradeRepo
 
         try:
             async with self._session_factory() as session:
                 await TradeRepo(session).raise_current_stop(tracked.trade_id, stop_price)
                 await session.commit()
-            tracked.persisted_stop = stop_price
         except Exception as exc:
             system_logger.error(
                 "PositionMonitor: persisting trailing stop failed",
                 extra={"trade_id": str(tracked.trade_id), "error": str(exc)},
             )
+            return
         finally:
             tracked.persist_in_flight = False
+        tracked.persisted_stop = stop_price
+        if self._tracked.get(tracked.trade_id) is tracked:
+            self._maybe_persist_stop(tracked)
 
     # ------------------------------------------------------------------
     # Internal: stale-trade timeout sweep

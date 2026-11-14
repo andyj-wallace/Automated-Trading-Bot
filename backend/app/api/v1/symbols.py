@@ -33,6 +33,14 @@ def _kick_feed_sync(request: Request) -> None:
         engine.spawn(feed.sync(), "feed-sync")
 
 
+def _invalidate_scheduler_bars(request: Request, ticker: str) -> None:
+    """Make the scheduler read freshly stored bars today instead of its cached copy."""
+    engine = getattr(request.app.state, "engine", None)
+    scheduler = getattr(engine, "scheduler", None)
+    if scheduler is not None:
+        scheduler.invalidate_bars(ticker)
+
+
 @router.get("")
 async def list_symbols(
     active_only: bool = Query(False, description="Return only active symbols"),
@@ -142,6 +150,7 @@ async def remove_symbol(
 
 @router.post("/{ticker}/fetch-history")
 async def fetch_symbol_history(
+    request: Request,
     ticker: str = Path(..., description="Ticker symbol to fetch history for"),
     db: AsyncSession = Depends(get_db),
     broker: BaseBroker = Depends(get_broker),
@@ -151,6 +160,8 @@ async def fetch_symbol_history(
     fetcher = HistoricalDataFetcher(broker)
     count = await fetcher.fetch_and_store(ticker, db)
     await db.commit()
+    if count > 0:
+        _invalidate_scheduler_bars(request, ticker)
 
     if count == 0:
         return JSONResponse(

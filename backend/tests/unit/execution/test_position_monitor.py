@@ -32,7 +32,7 @@ def _tick(price: str, ticker: str = "AAPL") -> PriceUpdate:
 
 
 async def _settle(monitor: PositionMonitor) -> None:
-    if monitor._tasks:
+    while monitor._tasks:
         await asyncio.gather(*list(monitor._tasks))
 
 
@@ -521,11 +521,28 @@ async def test_no_duplicate_write_while_in_flight(monkeypatch) -> None:
     calls = _patch_stop_writes(monkeypatch, gate=gate)
     monitor = _monitor()
     monitor._session_factory = _Session
-    _track(monitor, entry="100", stop="95", tp="220")
+    trade_id = _track(monitor, entry="100", stop="95", tp="220")
     await monitor.on_price_update(_tick("106"))
     await monitor.on_price_update(_tick("106.6"))
     await asyncio.sleep(0)
-    assert len(calls) == 1
+    assert calls == [(trade_id, Decimal("101"))]
     gate.set()
     await _settle(monitor)
-    assert len(calls) == 1
+    # The rise to 101.6 during the write is saved right after it, one write at a time.
+    assert calls == [(trade_id, Decimal("101")), (trade_id, Decimal("101.6"))]
+    assert monitor._tracked[trade_id].persisted_stop == Decimal("101.6")
+
+
+async def test_no_follow_up_write_once_trade_is_untracked(monkeypatch) -> None:
+    gate = asyncio.Event()
+    calls = _patch_stop_writes(monkeypatch, gate=gate)
+    monitor = _monitor()
+    monitor._session_factory = _Session
+    trade_id = _track(monitor, entry="100", stop="95", tp="220")
+    await monitor.on_price_update(_tick("106"))
+    await monitor.on_price_update(_tick("106.6"))
+    await asyncio.sleep(0)
+    monitor._tracked.pop(trade_id)
+    gate.set()
+    await _settle(monitor)
+    assert calls == [(trade_id, Decimal("101"))]

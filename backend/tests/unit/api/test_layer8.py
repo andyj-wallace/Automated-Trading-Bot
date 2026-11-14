@@ -12,6 +12,7 @@ need a real database connection.
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -259,6 +260,27 @@ class TestSymbolsEndpoints:
 
         assert response.status_code == 200
         assert response.json()["data"]["deleted"] is True
+
+    def test_fetch_history_invalidates_scheduler_bars(self, client, monkeypatch):
+        scheduler = MagicMock()
+        monkeypatch.setattr(app.state, "engine", SimpleNamespace(scheduler=scheduler), raising=False)
+        with patch("app.api.v1.symbols.HistoricalDataFetcher") as MockFetcher:
+            MockFetcher.return_value.fetch_and_store = AsyncMock(return_value=2)
+            response = client.post("/api/v1/symbols/aapl/fetch-history")
+
+        assert response.status_code == 200
+        assert response.json()["data"] == {"ticker": "AAPL", "bars_stored": 2}
+        scheduler.invalidate_bars.assert_called_once_with("AAPL")
+
+    def test_fetch_history_with_no_bars_keeps_scheduler_cache(self, client, monkeypatch):
+        scheduler = MagicMock()
+        monkeypatch.setattr(app.state, "engine", SimpleNamespace(scheduler=scheduler), raising=False)
+        with patch("app.api.v1.symbols.HistoricalDataFetcher") as MockFetcher:
+            MockFetcher.return_value.fetch_and_store = AsyncMock(return_value=0)
+            response = client.post("/api/v1/symbols/AAPL/fetch-history")
+
+        assert response.status_code == 422
+        scheduler.invalidate_bars.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

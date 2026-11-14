@@ -18,6 +18,13 @@ def test_trend_pullback_min_history_uses_regime_period():
     assert TrendPullbackStrategy(config={"regime_period": 300}).min_history_bars() == 300
 
 
+def test_trend_pullback_min_history_ignores_disabled_regime():
+    strategy = TrendPullbackStrategy(
+        config={"regime_symbol": "", "fast_period": 5, "mid_period": 10, "slow_period": 20}
+    )
+    assert strategy.min_history_bars() == 21
+
+
 def test_bull_bear_min_history_default():
     assert BullBearStrategy(config={}).min_history_bars() == 201
 

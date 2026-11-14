@@ -107,9 +107,9 @@ class TrendPullbackStrategy(BaseStrategy):
         )
 
     def min_history_bars(self) -> int:
-        """Bars generate_signal needs, or the regime period if that is longer."""
+        """Bars generate_signal needs, or the regime period if the regime filter is on and longer."""
         need = max(self.slow_period, self.atr_period + 1, self.pullback_lookback + 2) + 1
-        return max(need, self.regime_period)
+        return max(need, self.regime_period) if self.regime_symbol else need
 
     def required_extra_symbols(self) -> list[str]:
         return [self.regime_symbol] if self.regime_symbol else []
