@@ -20,10 +20,10 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
-from app.brokers.base import BaseBroker
+from app.brokers.base import BaseBroker, Execution
 from app.core import market_calendar
 from app.core.events import publish_system_alert
-from app.db.models.trade import ExitReason, Trade, TradeStatus
+from app.db.models.trade import ExitReason, Trade, TradeDirection, TradeStatus
 from app.db.repositories.fill_repo import LegTotals
 from app.db.repositories.trade_repo import TradeRepo
 from app.monitoring.logger import system_logger
@@ -118,7 +118,9 @@ class Reconciler:
                         continue
                     trade = fresh
                 try:
-                    await self._reconcile_trade(trade, positions, now, report, prev_filled, totals)
+                    await self._reconcile_trade(
+                        trade, positions, now, report, prev_filled, totals, executions
+                    )
                 except Exception:
                     system_logger.exception(
                         "Reconciler: rule failed", extra={"trade_id": str(trade.id)}
@@ -157,12 +159,15 @@ class Reconciler:
         report: ReconcileReport,
         prev_filled: Decimal | None = None,
         totals: dict[str, LegTotals] | None = None,
+        executions: list[Execution] | None = None,
     ) -> None:
         age = now - trade.executed_at
         if trade.status in (TradeStatus.PENDING, TradeStatus.SUBMITTED):
             await self._reconcile_entry(trade, age, report)
         elif trade.status == TradeStatus.OPEN:
-            await self._reconcile_open(trade, age, positions, now, report, prev_filled, totals)
+            await self._reconcile_open(
+                trade, age, positions, now, report, prev_filled, totals, executions
+            )
         elif trade.status == TradeStatus.CLOSING:
             await self._reconcile_closing(trade, positions, now, report)
 
@@ -201,6 +206,7 @@ class Reconciler:
         report: ReconcileReport,
         prev_filled: Decimal | None = None,
         totals: dict[str, LegTotals] | None = None,
+        executions: list[Execution] | None = None,
     ) -> None:
         if age < MIN_AGE:
             return
@@ -222,24 +228,39 @@ class Reconciler:
             if entry is not None and entry.status == "WORKING":
                 await self._cancel_quietly(entry.broker_order_id)
         held = positions.get(trade.symbol.upper(), Decimal("0"))
-        expected = trade.filled_quantity if trade.filled_quantity else trade.quantity
-        if held > 0:
+        if held != 0:
             self._zero_seen.discard(trade.id)
         if held == 0:
             if self._confirmed_flat(trade.id):
                 await self._finalize_from_broker(trade, now, report)
-        elif 0 < held < expected:
-            self._zero_seen.discard(trade.id)
+            return
+        signed = -held if trade.direction == TradeDirection.SELL else held
+        open_qty = self._order_manager.open_quantity(trade, totals)
+        if signed < 0:
+            kind = "DIRECTION"
+        elif signed < open_qty:
+            kind = "MISSING"
+        elif signed > open_qty:
+            kind = "EXCESS"
+        else:
+            kind = None
+        if kind is not None:
             await self._alert_once(
                 "QUANTITY_MISMATCH",
-                trade.symbol,
+                f"{trade.id}:{kind}",
                 now,
-                f"{trade.symbol}: broker holds {held} but the trade expects {expected}",
+                f"{trade.symbol}: broker holds {held} but the trade has {open_qty} open ({kind})",
                 trade_id=str(trade.id),
+                symbol=trade.symbol,
+                kind=kind,
                 broker_quantity=str(held),
-                expected_quantity=str(expected),
+                expected_quantity=str(open_qty),
             )
             report.add("quantity_mismatch")
+        if kind in (None, "EXCESS") and await self._order_manager.ensure_protective_stop(
+            trade.id, executions
+        ):
+            report.add("stop_replaced")
 
     async def _reconcile_closing(
         self, trade: Trade, positions: dict[str, Decimal], now: datetime, report: ReconcileReport
