@@ -10,7 +10,7 @@ Used automatically when ENVIRONMENT=development (see app/dependencies.py).
 import random
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from app.brokers.base import (
     AccountSummary,
@@ -50,6 +50,7 @@ class MockBroker(BaseBroker):
         self.order_results: dict[str, OrderResult] = {}
         self.fills: list[tuple[str, Decimal, Decimal]] = []
         self.executions: list[Execution] = []
+        self._exec_prefix = uuid4().hex[:12]  # keeps exec ids unique across instances
         self._next_exec_id = 1
         self._ref_by_order_id: dict[str, str] = {}
         self.placed_orders: list[OrderRequest] = []
@@ -229,7 +230,7 @@ class MockBroker(BaseBroker):
     ) -> None:
         """Record a fill in both the legacy fills list and the execution list."""
         self.fills.append((order_ref, quantity, price))
-        exec_id = f"mock-{self._next_exec_id}"
+        exec_id = f"mock-{self._exec_prefix}-{self._next_exec_id}"
         self._next_exec_id += 1
         self.executions.append(
             Execution(
