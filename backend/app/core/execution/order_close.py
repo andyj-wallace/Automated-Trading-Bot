@@ -108,21 +108,21 @@ class OrderCloseMixin:
                 error=str(exc),
             )
 
-        if trade.stop_order_id:
-            try:
-                stop = await self._cancel_and_wait(f"{trade_id}:stop", trade.stop_order_id)
-            except Exception as exc:
-                return await fail(
-                    "CLOSE_FAILED",
-                    f"Could not cancel protective stop for {symbol}; exit not sent",
-                    error=str(exc),
-                )
-            if stop is not None and not stop.is_terminal:
-                return await fail(
-                    "CLOSE_FAILED",
-                    f"Protective stop for {symbol} is still live after cancel; exit not sent",
-                    status=stop.status,
-                )
+        # Look the stop up by ref, not by the saved id: a failed id write can leave that id stale or empty.
+        try:
+            stop = await self._cancel_and_wait(f"{trade_id}:stop", trade.stop_order_id)
+        except Exception as exc:
+            return await fail(
+                "CLOSE_FAILED",
+                f"Could not cancel protective stop for {symbol}; exit not sent",
+                error=str(exc),
+            )
+        if stop is not None and not stop.is_terminal:
+            return await fail(
+                "CLOSE_FAILED",
+                f"Protective stop for {symbol} is still live after cancel; exit not sent",
+                status=stop.status,
+            )
 
         try:
             totals, fresh = await self._sync_close_state(trade_id)
@@ -168,6 +168,7 @@ class OrderCloseMixin:
             entry,
             fail,
             fallback,
+            previous_exit_id=existing.broker_order_id if existing is not None else None,
         )
 
     async def _send_close_order(
@@ -182,6 +183,7 @@ class OrderCloseMixin:
         entry: OrderResult | None,
         fail: Callable[..., Awaitable[CloseOutcome]],
         fallback: Decimal,
+        previous_exit_id: str | None = None,
     ) -> CloseOutcome:
         """Sell min(open, broker-held) whole shares, then finalize, wait or report the result."""
         from app.db.models.trade import TradeDirection
@@ -221,8 +223,11 @@ class OrderCloseMixin:
             order_type="MKT",
             order_ref=exit_ref,
         )
+        # A retry reuses the exit ref, so a lookup after a failed submit must not adopt the old exit.
         order_result, broker_error = await self._place_order_with_retry(
-            close_request, context="close order"
+            close_request,
+            context="close order",
+            exclude_order_ids=frozenset({previous_exit_id}) if previous_exit_id else frozenset(),
         )
         if order_result is None:
             return await fail(

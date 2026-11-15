@@ -323,14 +323,21 @@ class IBKRClient(IBKRMarketDataMixin, IBKRConnectionStatusMixin, BaseBroker):
         return mapper.map_order_result(order.trade_id, trade)
 
     async def find_order_by_ref(self, order_ref: str) -> OrderResult | None:
-        """State of the latest order with this orderRef (session trades, then open orders)."""
+        """State of the order with this orderRef: the latest live one, else the latest one.
+
+        After a reconnect IBKR can list a cancelled old stop after its live replacement,
+        so list order alone does not identify the current order.
+        """
         self._require_connected()
         matches = [t for t in self._ib.trades() if t.order.orderRef == order_ref]
         if not matches:
             await self._ib.reqAllOpenOrdersAsync()
             matches = [t for t in self._ib.trades() if t.order.orderRef == order_ref]
         if matches:
-            return mapper.map_order_result(mapper.trade_id_from_ref(order_ref), matches[-1])
+            trade_id = mapper.trade_id_from_ref(order_ref)
+            results = [mapper.map_order_result(trade_id, t) for t in matches]
+            live = [r for r in results if not r.is_terminal]
+            return (live or results)[-1]
         return await self.get_execution_summary(order_ref)
 
     async def get_execution_summary(self, order_ref: str) -> OrderResult | None:

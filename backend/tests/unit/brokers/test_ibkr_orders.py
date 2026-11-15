@@ -265,6 +265,18 @@ async def test_find_order_by_ref_returns_latest_session_trade():
     assert ib.open_orders_requested == 0
 
 
+async def test_find_order_by_ref_prefers_live_order_over_later_terminal_one():
+    """After a reconnect the cancelled old stop can arrive after its live replacement."""
+    ref = f"{TID}:stop"
+    live, old = _LiveTrade("Submitted", ref), _LiveTrade("Cancelled", ref)
+    live.order.orderId, old.order.orderId = 12, 11
+    ib = _FakeIB()
+    ib._trades = [live, old]
+    result = await _client(ib).find_order_by_ref(ref)
+    assert result.status == "WORKING"
+    assert result.broker_order_id == "12"
+
+
 async def test_find_order_by_ref_none_when_unknown():
     ib = _FakeIB()
     c = _client(ib)

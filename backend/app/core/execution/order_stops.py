@@ -45,6 +45,7 @@ class ProtectiveStopMixin:
 
         symbol = trade.symbol
         stop_ref = f"{trade_id}:stop"
+        old_ids: set[str] = {replace_stop_id} if replace_stop_id else set()
         try:
             quantity = int(self.open_quantity(trade, await self._journal_totals(trade_id)))
             if quantity <= 0:
@@ -53,10 +54,13 @@ class ProtectiveStopMixin:
             if (
                 existing is not None
                 and existing.status == "WORKING"
-                and existing.broker_order_id != replace_stop_id
+                and existing.broker_order_id not in old_ids
             ):
                 await self._record_stop_order(trade_id, existing.broker_order_id, trade.stop_loss_price)
                 return True
+            if existing is not None and existing.broker_order_id:
+                # Whatever already sits under this ref is dead; a new stop must have a new id.
+                old_ids.add(existing.broker_order_id)
             request = OrderRequest(
                 trade_id=trade_id,
                 symbol=symbol,
@@ -70,12 +74,12 @@ class ProtectiveStopMixin:
             result, error = await self._place_order_with_retry(
                 request,
                 context="protective stop",
-                exclude_order_ids=frozenset({replace_stop_id}) if replace_stop_id else frozenset(),
+                exclude_order_ids=frozenset(old_ids),
             )
         except Exception as exc:
             result, error = None, exc
 
-        replaced_old_stop = result is not None and result.broker_order_id == replace_stop_id
+        replaced_old_stop = result is not None and result.broker_order_id in old_ids
         if result is None or result.status in ("REJECTED", "ERROR") or replaced_old_stop:
             await publish_system_alert(
                 self._cache,

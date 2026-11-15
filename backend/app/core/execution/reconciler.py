@@ -335,21 +335,24 @@ class Reconciler:
                 )
                 return
 
-            if trade.stop_order_id:
-                stop = await self._order_manager._cancel_and_wait(
-                    f"{trade.id}:stop", trade.stop_order_id
-                )
-                if stop is not None and not stop.is_terminal:
+            # Any stop or exit order still live would sell shares the account no longer holds.
+            # Look both up by ref: a saved id can be stale or missing after a failed write.
+            found_order = False
+            for leg, saved_id in (("stop", trade.stop_order_id), ("exit", trade.exit_order_id)):
+                order = await self._order_manager._cancel_and_wait(f"{trade.id}:{leg}", saved_id)
+                if order is not None and not order.is_terminal:
                     await self._alert_once(
                         "CLOSE_FAILED",
-                        f"{trade.id}:stop_live",
+                        f"{trade.id}:{leg}_live",
                         now,
-                        f"{trade.symbol}: broker stop still live after cancel; trade kept open",
+                        f"{trade.symbol}: broker {leg} order still live after cancel; trade kept open",
                         trade_id=str(trade.id),
                         symbol=trade.symbol,
                     )
-                    report.add("finalize_stop_live")
+                    report.add(f"finalize_{leg}_live")
                     return
+                found_order = found_order or order is not None
+            if found_order:
                 totals = await self._order_manager.sync_fills(trade.id)
                 trade = await self._reload_active(trade.id)
                 if trade is None:

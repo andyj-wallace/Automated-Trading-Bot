@@ -86,7 +86,7 @@ class FillSyncMixin:
             last = current
             step = "cancel"
             await asyncio.wait_for(
-                self._broker.cancel_order(broker_order_id or current.broker_order_id),
+                self._broker.cancel_order(current.broker_order_id or broker_order_id),
                 timeout=max(deadline - loop.time(), 0.01),
             )
             while True:
