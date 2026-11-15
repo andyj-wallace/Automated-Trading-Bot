@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import json
 import uuid
 from collections.abc import Awaitable, Callable
 from decimal import Decimal
@@ -35,8 +37,9 @@ class OrderCloseMixin:
         Close a position with one market order, at most once per trade.
 
         OPEN -> CLOSING (atomic, stores the intended exit_reason) -> order ref
-        "<id>:exit" -> CLOSED only after a real fill. Raises ValueError for an
-        unknown reason string. Never touches state while the market is closed.
+        "<id>:exit" -> CLOSED only after the fill journal shows every share out.
+        Sells only the shares still open. Raises ValueError for an unknown reason
+        string. Never touches state while the market is closed.
         """
         if not self._session_factory:
             raise RuntimeError("close_position requires a session_factory")
@@ -46,50 +49,41 @@ class OrderCloseMixin:
 
         exit_reason = ExitReason(reason)
 
-        if not self._is_market_open():
-            return CloseOutcome.MARKET_CLOSED
+        async with self._trade_lock(trade_id):
+            if not self._is_market_open():
+                return CloseOutcome.MARKET_CLOSED
 
-        async with self._session_factory() as session:
-            trade = await TradeRepo(session).begin_close(
-                trade_id, exit_reason, allow_from_closing=allow_from_closing
+            async with self._session_factory() as session:
+                trade = await TradeRepo(session).begin_close(
+                    trade_id, exit_reason, allow_from_closing=allow_from_closing
+                )
+                await session.commit()
+            if trade is None:
+                trading_logger.warning(
+                    "close_position: trade not found or not eligible to close",
+                    extra={"trade_id": str(trade_id), "exit_reason": reason},
+                )
+                return CloseOutcome.NOT_OPEN
+
+            symbol = trade.symbol
+            close_direction = "SELL" if trade.direction == TradeDirection.BUY else "BUY"
+            exit_ref = f"{trade_id}:exit"
+
+            async def fail(alert_type: str, message: str, **details) -> CloseOutcome:
+                await publish_system_alert(
+                    self._cache,
+                    alert_type,
+                    message,
+                    trade_id=str(trade_id),
+                    symbol=symbol,
+                    exit_reason=reason,
+                    **details,
+                )
+                return CloseOutcome.FAILED
+
+            return await self._close_open_trade(
+                trade_id, exit_reason, trade, symbol, close_direction, exit_ref, fail
             )
-            await session.commit()
-        if trade is None:
-            trading_logger.warning(
-                "close_position: trade not found or not eligible to close",
-                extra={"trade_id": str(trade_id), "exit_reason": reason},
-            )
-            return CloseOutcome.NOT_OPEN
-
-        symbol = trade.symbol
-        close_direction = "SELL" if trade.direction == TradeDirection.BUY else "BUY"
-        total_quantity = trade.filled_quantity if trade.filled_quantity else trade.quantity
-        stop_order_id = trade.stop_order_id
-        exit_ref = f"{trade_id}:exit"
-
-        async def fail(alert_type: str, message: str, **details) -> CloseOutcome:
-            await publish_system_alert(
-                self._cache,
-                alert_type,
-                message,
-                trade_id=str(trade_id),
-                symbol=symbol,
-                exit_reason=reason,
-                **details,
-            )
-            return CloseOutcome.FAILED
-
-        return await self._close_open_trade(
-            trade_id,
-            exit_reason,
-            trade,
-            symbol,
-            close_direction,
-            total_quantity,
-            stop_order_id,
-            exit_ref,
-            fail,
-        )
 
     async def _close_open_trade(
         self,
@@ -98,54 +92,82 @@ class OrderCloseMixin:
         trade,
         symbol: str,
         close_direction: str,
-        total_quantity: Decimal,
-        stop_order_id: str | None,
         exit_ref: str,
         fail: Callable[..., Awaitable[CloseOutcome]],
     ) -> CloseOutcome:
-        """Clear the protective stop, book an exit already at the broker, then send the close."""
-        from app.db.models.trade import ExitReason
+        """Cancel the entry and stop, journal their fills, then sell only what is still open."""
+        entry_ref = f"{trade_id}:entry"
+        try:
+            entry = await self._broker.find_order_by_ref(entry_ref)
+            if entry is not None and entry.status == "WORKING":
+                entry = await self._cancel_and_wait(entry_ref)
+        except Exception as exc:
+            return await fail(
+                "CLOSE_FAILED",
+                f"Could not cancel entry order for {symbol}; exit not sent",
+                error=str(exc),
+            )
 
-        # A protective stop must be gone (or found filled) before we sell.
-        if stop_order_id:
+        if trade.stop_order_id:
             try:
-                stop_fill = await self._cancel_protective_stop(trade_id, stop_order_id)
+                stop = await self._cancel_and_wait(f"{trade_id}:stop", trade.stop_order_id)
             except Exception as exc:
                 return await fail(
                     "CLOSE_FAILED",
                     f"Could not cancel protective stop for {symbol}; exit not sent",
                     error=str(exc),
                 )
-            if stop_fill is not None:
-                done = await self.finalize_close(
-                    trade_id, ExitReason.STOP_LOSS, stop_fill, stop_fill.avg_fill_price
+            if stop is not None and not stop.is_terminal:
+                return await fail(
+                    "CLOSE_FAILED",
+                    f"Protective stop for {symbol} is still live after cancel; exit not sent",
+                    status=stop.status,
                 )
-                return CloseOutcome.CLOSED if done else CloseOutcome.FAILED
+
+        try:
+            totals, fresh = await self._sync_close_state(trade_id)
+        except Exception as exc:
+            return await fail(
+                "CLOSE_FAILED",
+                f"Could not journal fills for {symbol}; exit not sent",
+                error=str(exc),
+            )
 
         try:
             existing = await self._broker.find_order_by_ref(exit_ref)
-            sold_summary = await self._broker.get_execution_summary(exit_ref)
         except Exception as exc:
             return await fail(
                 "CLOSE_FAILED",
                 f"Could not query broker for existing exit of {symbol}; exit not sent",
                 error=str(exc),
             )
-
         if existing is not None and existing.status == "WORKING":
             await self._record_exit_order(trade_id, existing.broker_order_id)
             return CloseOutcome.PENDING_EXIT
 
-        sold = sold_summary.filled_quantity if sold_summary else Decimal("0")
-        remaining = total_quantity - sold
-        if remaining <= 0 and sold_summary is not None:
-            done = await self.finalize_close(
-                trade_id, exit_reason, sold_summary, sold_summary.avg_fill_price
+        open_qty = self.open_quantity(fresh, totals)
+        fallback = await self._fallback_price(symbol, fresh)
+        if open_qty <= 0:
+            if entry is None or entry.is_terminal:
+                reason = self._exit_reason_for(totals, exit_reason)
+                done = await self.finalize_close(trade_id, reason, None, fallback)
+                return CloseOutcome.CLOSED if done else CloseOutcome.FAILED
+            return await fail(
+                "CLOSE_FAILED",
+                f"Entry for {symbol} is still live; trade left CLOSING",
             )
-            return CloseOutcome.CLOSED if done else CloseOutcome.FAILED
 
         return await self._send_close_order(
-            trade_id, exit_reason, trade, symbol, close_direction, remaining, exit_ref, fail
+            trade_id,
+            exit_reason,
+            fresh,
+            symbol,
+            close_direction,
+            open_qty,
+            exit_ref,
+            entry,
+            fail,
+            fallback,
         )
 
     async def _send_close_order(
@@ -155,11 +177,13 @@ class OrderCloseMixin:
         trade,
         symbol: str,
         close_direction: str,
-        remaining: Decimal,
+        open_qty: Decimal,
         exit_ref: str,
+        entry: OrderResult | None,
         fail: Callable[..., Awaitable[CloseOutcome]],
+        fallback: Decimal,
     ) -> CloseOutcome:
-        """Check the broker still holds the shares, place the market exit, and act on its status."""
+        """Sell min(open, broker-held) whole shares, then finalize, wait or report the result."""
         from app.db.models.trade import TradeDirection
 
         try:
@@ -182,13 +206,18 @@ class OrderCloseMixin:
                 "CLOSE_FAILED",
                 f"Broker holds no {symbol}; nothing sold. The reconciler will book the exit.",
             )
-        remaining = min(remaining, held)
+        sell_qty = Decimal(int(min(open_qty, held)))
+        if sell_qty <= 0:
+            return await fail(
+                "CLOSE_FAILED",
+                f"Open quantity for {symbol} is under one whole share; nothing sold",
+            )
 
         close_request = OrderRequest(
             trade_id=trade_id,
             symbol=symbol,
             direction=close_direction,
-            quantity=remaining,
+            quantity=sell_qty,
             order_type="MKT",
             order_ref=exit_ref,
         )
@@ -203,18 +232,22 @@ class OrderCloseMixin:
                 error=str(broker_error),
             )
 
-        if order_result.status == "FILLED":
-            try:
-                summary = await self._broker.get_execution_summary(exit_ref)
-            except Exception:
-                summary = None
-            fill = summary or order_result
-            done = await self.finalize_close(trade_id, exit_reason, fill, fill.avg_fill_price)
+        try:
+            totals, fresh = await self._sync_close_state(trade_id)
+        except Exception as exc:
+            return await fail(
+                "CLOSE_FAILED",
+                f"Exit for {symbol} was sent but its fills could not be journaled; trade left CLOSING",
+                error=str(exc),
+            )
+        if self.open_quantity(fresh, totals) <= 0 and (entry is None or entry.is_terminal):
+            reason = self._exit_reason_for(totals, exit_reason)
+            done = await self.finalize_close(trade_id, reason, None, fallback)
             return CloseOutcome.CLOSED if done else CloseOutcome.FAILED
         if order_result.status == "WORKING":
             await self._record_exit_order(trade_id, order_result.broker_order_id)
             return CloseOutcome.PENDING_EXIT
-        if order_result.status == "PARTIAL":
+        if order_result.filled_quantity > 0:
             return await fail(
                 "CLOSE_PARTIAL",
                 f"Exit for {symbol} only partly filled; trade left CLOSING",
@@ -225,6 +258,33 @@ class OrderCloseMixin:
             f"Exit order for {symbol} was {order_result.status}; trade left CLOSING",
             error=order_result.error_message,
         )
+
+    async def _sync_close_state(self, trade_id: uuid.UUID):
+        """Journal the broker's executions, then re-read the trade (sync_fills uses its own session)."""
+        from app.db.repositories.trade_repo import TradeRepo
+
+        totals = await self.sync_fills(trade_id)
+        async with self._session_factory() as session:
+            fresh = await TradeRepo(session).get_by_id(trade_id)
+        if fresh is None:
+            raise RuntimeError(f"trade {trade_id} not found")
+        return totals, fresh
+
+    @staticmethod
+    def _exit_reason_for(totals, requested):
+        """STOP_LOSS when a protective stop filled any shares, else the requested reason."""
+        from app.db.models.trade import ExitReason
+
+        return ExitReason.STOP_LOSS if totals["STOP"].quantity > 0 else requested
+
+    async def _fallback_price(self, symbol: str, trade) -> Decimal:
+        """Cached last price for the symbol, else the entry price; values shares with no exit fill."""
+        with contextlib.suppress(Exception):
+            if self._cache is not None:
+                raw = await self._cache.get(f"price:{symbol.upper()}")
+                if raw:
+                    return Decimal(str(json.loads(raw)["price"]))
+        return trade.entry_fill_price or trade.entry_price
 
     async def finalize_close(
         self,
