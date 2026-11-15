@@ -15,10 +15,29 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.trade import ACTIVE_RISK_STATUSES, ExitReason, Trade, TradeDirection, TradeStatus
+
+
+def _entry_fill_values(
+    fill_price: Decimal, filled_qty: Decimal, commission: Decimal | None
+) -> dict:
+    """SET values for an entry fill; each column keeps its journal-synced value when larger."""
+    new_commission = (
+        Trade.entry_commission
+        if commission is None
+        else func.greatest(func.coalesce(Trade.entry_commission, 0), commission)
+    )
+    return {
+        "filled_quantity": func.greatest(func.coalesce(Trade.filled_quantity, 0), filled_qty),
+        "entry_fill_price": case(
+            (Trade.filled_quantity > filled_qty, Trade.entry_fill_price),
+            else_=fill_price,
+        ),
+        "entry_commission": new_commission,
+    }
 
 
 class TradeRepo:
@@ -272,19 +291,63 @@ class TradeRepo:
         filled_qty: Decimal,
         commission: Decimal | None = None,
     ) -> Trade | None:
-        """Persist the entry fill separately from the audit-immutable columns."""
+        """Persist the entry fill separately from the audit-immutable columns.
+
+        Never lowers journal-synced values: quantity only rises, and the fill
+        price is kept while the stored quantity is above the incoming one.
+        """
         stmt = (
             update(Trade)
             .where(Trade.id == trade_id)
             .values(
                 entry_order_id=order_id,
-                entry_fill_price=fill_price,
-                filled_quantity=filled_qty,
-                entry_commission=commission,
+                **_entry_fill_values(fill_price, filled_qty, commission),
             )
             .returning(Trade)
         )
         return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def raise_entry_fill(
+        self,
+        trade_id: uuid.UUID,
+        filled_quantity: Decimal,
+        fill_price: Decimal,
+        commission: Decimal,
+    ) -> bool:
+        """Raise the stored entry fill (quantity up, or same quantity with a later commission).
+
+        Returns True when either guarded update changed a row.
+        """
+        raised_quantity = await self.session.execute(
+            update(Trade)
+            .where(
+                Trade.id == trade_id,
+                or_(
+                    Trade.filled_quantity.is_(None),
+                    Trade.filled_quantity < filled_quantity,
+                ),
+            )
+            .values(
+                filled_quantity=filled_quantity,
+                entry_fill_price=fill_price,
+                entry_commission=func.greatest(
+                    func.coalesce(Trade.entry_commission, 0), commission
+                ),
+            )
+        )
+        raised_commission = await self.session.execute(
+            update(Trade)
+            .where(
+                Trade.id == trade_id,
+                Trade.filled_quantity == filled_quantity,
+                or_(
+                    Trade.entry_commission.is_(None),
+                    Trade.entry_commission < commission,
+                ),
+            )
+            .values(entry_commission=commission)
+        )
+        return raised_quantity.rowcount > 0 or raised_commission.rowcount > 0
 
     async def begin_close(
         self,
@@ -362,9 +425,7 @@ class TradeRepo:
             .values(
                 status=TradeStatus.OPEN,
                 entry_order_id=order_id,
-                entry_fill_price=fill_price,
-                filled_quantity=filled_qty,
-                entry_commission=commission,
+                **_entry_fill_values(fill_price, filled_qty, commission),
             )
             .returning(Trade)
             .execution_options(populate_existing=True)
