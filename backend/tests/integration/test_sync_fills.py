@@ -193,7 +193,9 @@ async def test_journal_fills_fills_null_commission_and_changes_no_trade_column(
     om = _order_manager(broker, session_factory)
     tid = await _submit_open(om, broker, quantity=Decimal("4"), price=Decimal("10.00"),
                              stop=Decimal("9.50"))
-    assert await om.journal_fills(tid, [broker.executions[-1]]) == 1  # commission still None
+    # The entry path already journaled this fill (commission still None).
+    assert await om.journal_fills(tid, [broker.executions[-1]]) == 0
+    assert (await om._journal_totals(tid))["ENTRY"].commission == Decimal("0")
     before = await _trade_columns(session_factory, tid)
     priced = broker.executions[-1].model_copy(update={"commission": Decimal("1.00")})
 

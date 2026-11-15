@@ -72,7 +72,7 @@ Proposed work toward the supplied hybrid architecture. The [review](docs/archite
 5. [ ] **Bounded LLM research and explanations.** Begin with cited research/event interpretation and structured outputs, with cached results, timeouts, schema validation, versioned prompts/models and a spending ceiling. Keep broker mutation credentials/capabilities in execution. Done when invalid or unavailable required research blocks the dependent proposal under deterministic policy, and no agent can bypass authorization or reset safeguards.
 6. [ ] **Full decision replay and promotion evidence.** Link input snapshots, model/research outputs, proposals, risk evaluations, authorizations, fills, fees and reconciliation. Done when a recorded decision can be reconstructed, duplicate delivery is idempotent and a promotion/rollback decision has reproducible supporting evidence.
 
-For Claude's handoff, propose fill accounting and reconciliation as the first work package; another developer can own readiness and authorization. Agree on the order-state/journal contract before editing shared execution modules. These are proposed assignments, not evidence of a delivered handoff.
+Fill accounting and reconciliation are done; the order-state and fill-journal contract lives in `brokers/base.py` and `trade_fills`. For Claude's handoff, another developer can own readiness and authorization; agree on that contract before editing shared execution modules. These are proposed assignments, not evidence of a delivered handoff.
 
 ## Optional
 

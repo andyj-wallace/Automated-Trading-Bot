@@ -139,7 +139,7 @@ The margin check represents the current implementation. Confirm the broker/accou
 
 These examples are estimates from the configured cost model, using 5 bps slippage per leg. They do not establish a minimum starting balance or a profitable strategy. Actual eligibility depends on price, stop distance, available cash and fees. At $1,000 in the Tiered example, $10 of price-to-stop risk plus $1.34 of modeled friction gives an estimated $11.34 loss at the stop, before gaps.
 
-`trades.pnl` is recorded profit after commissions, subject to the fill-accounting limitations in the review. The daily summary compares estimated and actual fees. `TRADING_CAPITAL_LIMIT` caps sizing equity; it does not create a separate small-account cash/equity ledger. A large paper account capped at $100 can still report $100 of sizing equity after a $10 loss. The My Trades page shows the real broker balance. `GET /api/v1/trading/status` reports growth mode as `growth_mode`.
+`trades.pnl` is recorded profit after commissions, built from every fill in the `trade_fills` journal. A commission that IBKR reports after a trade has closed updates the journal but not `pnl`. The daily summary compares estimated and actual fees. `TRADING_CAPITAL_LIMIT` caps sizing equity; it does not create a separate small-account cash/equity ledger. A large paper account capped at $100 can still report $100 of sizing equity after a $10 loss. The My Trades page shows the real broker balance. `GET /api/v1/trading/status` reports growth mode as `growth_mode`.
 
 The break-even threshold is a cost filter; it does not predict the strategy's win rate. Include data, hosting and AI expenses in validation: a hypothetical $10/month costs $120/year, or 12% of $1,000 of capital before trading costs.
 
