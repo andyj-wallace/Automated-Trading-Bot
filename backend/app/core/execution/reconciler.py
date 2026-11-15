@@ -24,6 +24,7 @@ from app.brokers.base import BaseBroker
 from app.core import market_calendar
 from app.core.events import publish_system_alert
 from app.db.models.trade import ExitReason, Trade, TradeStatus
+from app.db.repositories.fill_repo import LegTotals
 from app.db.repositories.trade_repo import TradeRepo
 from app.monitoring.logger import system_logger
 
@@ -87,6 +88,12 @@ class Reconciler:
                 system_logger.exception("Reconciler: could not read broker positions")
                 report.skipped = "positions unavailable"
                 return report
+            try:
+                executions = await self._broker.get_executions()
+            except Exception:
+                system_logger.exception("Reconciler: could not read broker executions")
+                report.skipped = "executions unavailable"
+                return report
 
             async with self._session_factory() as session:
                 repo = TradeRepo(session)
@@ -94,12 +101,38 @@ class Reconciler:
                 recent_closed = await repo.list(status=TradeStatus.CLOSED, limit=50)
 
             for trade in active:
+                prev_filled: Decimal | None = None
+                totals = None
+                if now - trade.executed_at >= MIN_AGE:
+                    try:
+                        prev_filled = trade.filled_quantity
+                        totals = await self._order_manager.sync_fills(trade.id, executions)
+                        async with self._session_factory() as session:
+                            fresh = await TradeRepo(session).get_by_id(trade.id)
+                    except Exception:
+                        system_logger.exception(
+                            "Reconciler: fill sync failed", extra={"trade_id": str(trade.id)}
+                        )
+                        continue
+                    if fresh is None:
+                        continue
+                    trade = fresh
                 try:
-                    await self._reconcile_trade(trade, positions, now, report)
+                    await self._reconcile_trade(trade, positions, now, report, prev_filled, totals)
                 except Exception:
                     system_logger.exception(
                         "Reconciler: rule failed", extra={"trade_id": str(trade.id)}
                     )
+
+            for closed in recent_closed:
+                try:
+                    await self._order_manager.journal_fills(closed.id, executions)
+                except Exception:
+                    system_logger.exception(
+                        "Reconciler: journaling late fills failed",
+                        extra={"trade_id": str(closed.id)},
+                    )
+
             active_ids = {t.id for t in active}
             self._closing_first_seen = {
                 k: v for k, v in self._closing_first_seen.items() if k in active_ids
@@ -117,13 +150,19 @@ class Reconciler:
     # ------------------------------------------------------------------
 
     async def _reconcile_trade(
-        self, trade: Trade, positions: dict[str, Decimal], now: datetime, report: ReconcileReport
+        self,
+        trade: Trade,
+        positions: dict[str, Decimal],
+        now: datetime,
+        report: ReconcileReport,
+        prev_filled: Decimal | None = None,
+        totals: dict[str, LegTotals] | None = None,
     ) -> None:
         age = now - trade.executed_at
         if trade.status in (TradeStatus.PENDING, TradeStatus.SUBMITTED):
             await self._reconcile_entry(trade, age, report)
         elif trade.status == TradeStatus.OPEN:
-            await self._reconcile_open(trade, age, positions, now, report)
+            await self._reconcile_open(trade, age, positions, now, report, prev_filled, totals)
         elif trade.status == TradeStatus.CLOSING:
             await self._reconcile_closing(trade, positions, now, report)
 
@@ -132,8 +171,8 @@ class Reconciler:
             return
         entry = await self._broker.find_order_by_ref(f"{trade.id}:entry")
 
-        if entry is not None and entry.status in ("FILLED", "PARTIAL") and entry.filled_quantity > 0:
-            if entry.status == "PARTIAL":
+        if entry is not None and entry.status in ("FILLED", "PARTIAL", "WORKING") and entry.filled_quantity > 0:
+            if entry.status == "WORKING":
                 await self._cancel_quietly(entry.broker_order_id)
             fill = await self._broker.get_execution_summary(f"{trade.id}:entry") or entry
             if await self._order_manager.adopt_entry_fill(trade.id, fill):
@@ -160,9 +199,28 @@ class Reconciler:
         positions: dict[str, Decimal],
         now: datetime,
         report: ReconcileReport,
+        prev_filled: Decimal | None = None,
+        totals: dict[str, LegTotals] | None = None,
     ) -> None:
         if age < MIN_AGE:
             return
+        if totals is not None and prev_filled is not None and totals["ENTRY"].quantity > prev_filled:
+            await self._alert_once(
+                "LATE_ENTRY_FILL",
+                str(trade.id),
+                now,
+                f"{trade.symbol}: entry filled more after the trade opened "
+                f"({prev_filled} to {totals['ENTRY'].quantity} shares)",
+                trade_id=str(trade.id),
+                symbol=trade.symbol,
+                previous_quantity=str(prev_filled),
+                filled_quantity=str(totals["ENTRY"].quantity),
+            )
+            report.add("late_entry_fill")
+        if age >= SUBMITTED_TIMEOUT and self._is_market_open():
+            entry = await self._broker.find_order_by_ref(f"{trade.id}:entry")
+            if entry is not None and entry.status == "WORKING":
+                await self._cancel_quietly(entry.broker_order_id)
         held = positions.get(trade.symbol.upper(), Decimal("0"))
         expected = trade.filled_quantity if trade.filled_quantity else trade.quantity
         if held > 0:
