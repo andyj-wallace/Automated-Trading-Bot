@@ -238,7 +238,7 @@ async def test_on_fill_rejects_rejected_status(
     handler: TradeHandler, monkeypatch
 ) -> None:
     req = _request()
-    result = _make_order_result(req, status="REJECTED")
+    result = _make_order_result(req, status="REJECTED", filled_quantity=Decimal("0"))
     validation = _make_validation(req)
     session = MagicMock()
 
@@ -251,7 +251,7 @@ async def test_on_fill_rejects_error_status(
     handler: TradeHandler, monkeypatch
 ) -> None:
     req = _request()
-    result = _make_order_result(req, status="ERROR")
+    result = _make_order_result(req, status="ERROR", filled_quantity=Decimal("0"))
     validation = _make_validation(req)
     session = MagicMock()
 
@@ -274,3 +274,33 @@ async def test_on_fill_accepts_partial_fill(
     trade = await handler.on_fill(req, validation, result, session)
     assert trade is not None
     assert len(cache.published) == 1
+
+
+@pytest.mark.asyncio
+async def test_on_fill_accepts_working_result_with_fills(
+    handler: TradeHandler, cache: FakeCache, monkeypatch
+) -> None:
+    req = _request(quantity=Decimal("10"))
+    result = _make_order_result(req, status="WORKING", filled_quantity=Decimal("4"))
+    validation = _make_validation(req)
+    session, PatchedRepo, _ = _make_mock_session(req, result)
+
+    import app.core.execution.trade_handler as th_module
+    monkeypatch.setattr(th_module, "TradeRepo", PatchedRepo)
+
+    trade = await handler.on_fill(req, validation, result, session)
+    assert trade is not None
+    assert len(cache.published) == 1
+
+
+@pytest.mark.asyncio
+async def test_on_fill_rejects_working_result_without_fills(
+    handler: TradeHandler, monkeypatch
+) -> None:
+    req = _request()
+    result = _make_order_result(req, status="WORKING", filled_quantity=Decimal("0"))
+    validation = _make_validation(req)
+    session = MagicMock()
+
+    with pytest.raises(ValueError, match="non-fill status"):
+        await handler.on_fill(req, validation, result, session)

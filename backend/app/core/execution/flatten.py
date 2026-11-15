@@ -71,8 +71,10 @@ async def _settle_entry(
     try:
         order = await broker.find_order_by_ref(ref)
         if order is not None and order.status == "WORKING":
-            if not await broker.cancel_order(order.broker_order_id):
+            cancelled = await broker.cancel_order(order.broker_order_id)
+            if not cancelled:
                 return "ENTRY_CANCEL_FAILED"
+        if order is not None and not order.is_terminal:
             deadline = clock() + poll_timeout
             while True:
                 remaining = deadline - clock()
@@ -83,13 +85,14 @@ async def _settle_entry(
                 if remaining <= 0:
                     return "ENTRY_CANCEL_FAILED"
                 order = await asyncio.wait_for(broker.find_order_by_ref(ref), remaining)
-                if order is None or order.status != "WORKING":
+                if order is None or order.is_terminal:
                     break
-        if order is not None and order.filled_quantity > 0:
-            fill: OrderResult = await broker.get_execution_summary(ref) or order
-            await order_manager.adopt_entry_fill(trade.id, fill)
-            return "ENTRY_ADOPTED"
-        return "ENTRY_CANCELLED"
+        if order is None or order.filled_quantity <= 0:
+            return "ENTRY_CANCELLED"
+        await order_manager.sync_fills(trade.id)
+        fill: OrderResult = await broker.get_execution_summary(ref) or order
+        await order_manager.adopt_entry_fill(trade.id, fill)
+        return "ENTRY_ADOPTED"
     except Exception as exc:
         system_logger.error(
             "Flatten: entry settle failed",

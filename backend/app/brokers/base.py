@@ -57,15 +57,36 @@ class OrderRequest(BaseModel):
 
 
 class OrderResult(BaseModel):
+    """Broker state of one order. WORKING is live at the broker; ERROR is state unknown."""
+
     trade_id: UUID
     broker_order_id: str
     status: Literal["FILLED", "PARTIAL", "WORKING", "REJECTED", "ERROR"]
-    filled_quantity: Decimal
+    filled_quantity: Decimal  # cumulative
     avg_fill_price: Decimal
+    ordered_quantity: Decimal | None = None  # total shares the order asked for
     order_ref: str = ""
     error_message: str | None = None
     commission: Decimal = Decimal("0")
     timestamp: datetime
+
+    @property
+    def is_terminal(self) -> bool:
+        """True when the order is finished at the broker (no shares left working)."""
+        return self.status in ("FILLED", "PARTIAL", "REJECTED")
+
+
+class Execution(BaseModel):
+    """One broker fill (execution) of an order."""
+
+    exec_id: str
+    order_ref: str
+    broker_order_id: str
+    side: Literal["BUY", "SELL"]
+    quantity: Decimal
+    price: Decimal
+    commission: Decimal | None = None  # None until the broker reports it
+    executed_at: datetime  # UTC, timezone-aware
 
 
 class PriceUpdate(BaseModel):
@@ -180,6 +201,10 @@ class BaseBroker(ABC):
         All fills carrying this order_ref aggregated into one FILLED result
         (total shares, volume-weighted price), or None if there are no fills.
         """
+
+    @abstractmethod
+    async def get_executions(self) -> list[Execution]:
+        """Every execution the broker currently reports."""
 
     @abstractmethod
     async def unsubscribe_price_feed(self, ticker: str) -> None:

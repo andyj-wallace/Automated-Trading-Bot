@@ -49,6 +49,7 @@ def harness():
     order_manager = SimpleNamespace(
         wait_for_entries_idle=AsyncMock(return_value=True),
         adopt_entry_fill=AsyncMock(return_value=True),
+        sync_fills=AsyncMock(return_value={}),
         close_position=AsyncMock(return_value=CloseOutcome.CLOSED),
     )
     repo = SimpleNamespace(
@@ -189,3 +190,82 @@ async def test_already_filled_entry_adopted_without_cancel(harness):
         {"trade_id": str(b.id), "symbol": "MSFT", "outcome": "ENTRY_ADOPTED"},
         {"trade_id": str(b.id), "symbol": "MSFT", "outcome": "CLOSED"},
     ]
+
+
+async def test_partly_filled_entry_waits_for_terminal_before_adopting(harness):
+    h = harness
+    b = _row("MSFT", TradeStatus.SUBMITTED)
+    events: list[str] = []
+    h.repo.get_active_trades.return_value = [b]
+    script = _scripted(
+        {
+            f"{b.id}:entry": [
+                _order("WORKING", 4, "B1", b.id),
+                _order("WORKING", 4, "B1", b.id),
+                _order("WORKING", 4, "B1", b.id),
+                _order("PARTIAL", 4, "B1", b.id),
+            ]
+        }
+    )
+
+    async def lookup(ref: str):
+        events.append("poll")
+        return await script(ref)
+
+    async def sync(trade_id):
+        events.append("sync")
+        return {}
+
+    async def adopt(trade_id, fill):
+        events.append("adopt")
+        h.open_rows.append(b)
+        return True
+
+    h.broker.find_order_by_ref.side_effect = lookup
+    h.order_manager.sync_fills.side_effect = sync
+    h.order_manager.adopt_entry_fill.side_effect = adopt
+
+    results = await _run(h)
+
+    h.broker.cancel_order.assert_awaited_once_with("B1")
+    assert events == ["poll", "poll", "poll", "poll", "sync", "adopt"]
+    adopted = h.order_manager.adopt_entry_fill.await_args.args[1]
+    assert adopted.status == "PARTIAL"
+    assert adopted.filled_quantity == Decimal("4")
+    assert results == [
+        {"trade_id": str(b.id), "symbol": "MSFT", "outcome": "ENTRY_ADOPTED"},
+        {"trade_id": str(b.id), "symbol": "MSFT", "outcome": "CLOSED"},
+    ]
+
+
+async def test_entry_still_error_at_timeout_fails_without_adoption(harness):
+    h = harness
+    b = _row("MSFT", TradeStatus.SUBMITTED)
+    now = [0.0]
+
+    async def tick(seconds: float) -> None:
+        now[0] += seconds
+
+    async def lookup(ref: str):
+        return _order("ERROR", 4, "B1", b.id)
+
+    h.repo.get_active_trades.return_value = [b]
+    h.broker.find_order_by_ref.side_effect = lookup
+
+    results = await flatten_positions(
+        h.trading_state,
+        h.order_manager,
+        h.broker,
+        h.repo,
+        poll_timeout=1.0,
+        poll_interval=0.25,
+        sleep=tick,
+        clock=lambda: now[0],
+    )
+
+    assert results == [
+        {"trade_id": str(b.id), "symbol": "MSFT", "outcome": "ENTRY_CANCEL_FAILED"},
+    ]
+    h.order_manager.sync_fills.assert_not_awaited()
+    h.order_manager.adopt_entry_fill.assert_not_awaited()
+    h.order_manager.close_position.assert_not_awaited()

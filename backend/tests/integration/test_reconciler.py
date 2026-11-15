@@ -461,10 +461,14 @@ async def test_close_sells_only_what_the_broker_holds(broker, session_factory, c
     await manager.submit_order(req)
     broker.set_position("AAPL", Decimal("4"))
 
-    assert await manager.close_position(req.trade_id, "MANUAL") == CloseOutcome.CLOSED
+    # Only 4 of the 10 shares are held, so the exit sells 4, leaves 6 open and the trade stays CLOSING.
+    assert await manager.close_position(req.trade_id, "MANUAL") == CloseOutcome.FAILED
 
     exits = [o for o in broker.placed_orders if o.order_ref.endswith(":exit")]
+    assert len(exits) == 1 and exits[0].direction == "SELL"
     assert [o.quantity for o in exits] == [Decimal("4")]
+    assert (await _get(session_factory, req.trade_id)).status == TradeStatus.CLOSING
+    assert len(cache.alerts("CLOSE_PARTIAL")) == 1
 
 
 async def test_entry_with_unknown_broker_state_stays_submitted_until_reconciled(

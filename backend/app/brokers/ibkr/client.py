@@ -22,6 +22,7 @@ from ib_async import IB, LimitOrder, MarketOrder, Stock, StopOrder
 from app.brokers.base import (
     AccountSummary,
     BaseBroker,
+    Execution,
     OrderRequest,
     OrderResult,
     Position,
@@ -322,14 +323,21 @@ class IBKRClient(IBKRMarketDataMixin, IBKRConnectionStatusMixin, BaseBroker):
         return mapper.map_order_result(order.trade_id, trade)
 
     async def find_order_by_ref(self, order_ref: str) -> OrderResult | None:
-        """State of the latest order with this orderRef (session trades, then open orders)."""
+        """State of the order with this orderRef: the latest live one, else the latest one.
+
+        After a reconnect IBKR can list a cancelled old stop after its live replacement,
+        so list order alone does not identify the current order.
+        """
         self._require_connected()
         matches = [t for t in self._ib.trades() if t.order.orderRef == order_ref]
         if not matches:
             await self._ib.reqAllOpenOrdersAsync()
             matches = [t for t in self._ib.trades() if t.order.orderRef == order_ref]
         if matches:
-            return mapper.map_order_result(mapper.trade_id_from_ref(order_ref), matches[-1])
+            trade_id = mapper.trade_id_from_ref(order_ref)
+            results = [mapper.map_order_result(trade_id, t) for t in matches]
+            live = [r for r in results if not r.is_terminal]
+            return (live or results)[-1]
         return await self.get_execution_summary(order_ref)
 
     async def get_execution_summary(self, order_ref: str) -> OrderResult | None:
@@ -337,6 +345,30 @@ class IBKRClient(IBKRMarketDataMixin, IBKRConnectionStatusMixin, BaseBroker):
         self._require_connected()
         fills = await self._ib.reqExecutionsAsync()
         return mapper.summarize_fills(order_ref, list(fills))
+
+    async def get_executions(self) -> list[Execution]:
+        """Today's executions (fills) for this session's account, one Execution per fill."""
+        self._require_connected()
+        fills = await self._ib.reqExecutionsAsync()
+        return mapper.map_executions(self._with_cached_commissions(list(fills)))
+
+    def _with_cached_commissions(self, fills: list) -> list:
+        """Carry commission reports over from the session's fill cache onto refreshed fills.
+
+        A repeated execution request returns fresh Fill objects with an empty commission
+        report, while later commission reports only update the cached Fill for that execId.
+        """
+        cache = getattr(getattr(self._ib, "wrapper", None), "fills", None)
+        if not isinstance(cache, dict):
+            return fills
+        merged = []
+        for fill in fills:
+            cached = cache.get(getattr(getattr(fill, "execution", None), "execId", None))
+            report = getattr(cached, "commissionReport", None)
+            if report is not None and mapper._reported_commission(cached) is not None:
+                fill = fill._replace(commissionReport=report)
+            merged.append(fill)
+        return merged
 
     async def cancel_order(self, broker_order_id: str) -> bool:
         """

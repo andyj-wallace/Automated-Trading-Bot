@@ -12,7 +12,7 @@ from decimal import Decimal
 from app.brokers.base import OrderRequest, OrderResult
 from app.core.events import publish_system_alert
 from app.core.risk.manager import RiskRejectionError, TradeRequest, ValidationResult
-from app.monitoring.logger import risk_logger, trading_logger
+from app.monitoring.logger import error_logger, risk_logger, trading_logger
 
 
 class OrderEntryMixin:
@@ -113,12 +113,27 @@ class OrderEntryMixin:
         broker_request: OrderRequest,
         state_unknown: bool,
     ) -> bool:
-        """Record a fill, working, unknown or rejected entry; return True if it filled."""
-        filled = order_result.status in ("FILLED", "PARTIAL") and order_result.filled_quantity > 0
+        """Record a filled (in full or in part), working, unknown or rejected entry; return True if it filled."""
+        filled = order_result.filled_quantity > 0
         if self._session_factory:
             if filled:
+                if order_result.status == "WORKING":
+                    order_result = await self._settle_working_entry(request, order_result)
                 await self._record_entry_fill(request.trade_id, order_result)
                 await self._transition(request.trade_id, "OPEN")
+                try:
+                    await self.sync_fills(request.trade_id)
+                except Exception as exc:
+                    # The stop below is still placed: it is sized from the broker's order result
+                    # already recorded above, and it can only reduce risk.
+                    error_logger.error(
+                        "Fill journal sync failed after entry fill; placing the stop anyway",
+                        extra={
+                            "trade_id": str(request.trade_id),
+                            "symbol": request.symbol,
+                            "error": str(exc),
+                        },
+                    )
                 await self._publish_trade_executed(request, validation, order_result)
                 await self.place_protective_stop(
                     request.trade_id, force=request.submit_stop_to_broker
@@ -147,6 +162,41 @@ class OrderEntryMixin:
             else:
                 await self._transition(request.trade_id, "CANCELLED")
         return filled
+
+    async def _settle_working_entry(
+        self, request: TradeRequest, order_result: OrderResult
+    ) -> OrderResult:
+        """Cancel a partly filled working entry; return the freshest result that is not behind it."""
+        chosen = order_result
+        try:
+            final = await self._cancel_and_wait(
+                f"{request.trade_id}:entry", order_result.broker_order_id
+            )
+        except Exception as exc:
+            error_logger.error(
+                "Entry cancel failed after a partial fill; continuing with the fills so far",
+                extra={
+                    "trade_id": str(request.trade_id),
+                    "symbol": request.symbol,
+                    "error": str(exc),
+                },
+            )
+        else:
+            if final is not None and final.filled_quantity >= order_result.filled_quantity:
+                chosen = final
+        if not chosen.is_terminal:
+            await publish_system_alert(
+                self._cache,
+                "ENTRY_REMAINDER_WORKING",
+                f"Entry for {request.symbol} is partly filled; the rest is still working at the broker",
+                trade_id=str(request.trade_id),
+                symbol=request.symbol,
+                filled_quantity=str(chosen.filled_quantity),
+                ordered_quantity=(
+                    str(chosen.ordered_quantity) if chosen.ordered_quantity is not None else None
+                ),
+            )
+        return chosen
 
     async def _snapshot_after_entry(self, request: TradeRequest, filled: bool) -> None:
         """Record a KPI snapshot after a fill; a failure is logged and never fails the order."""
@@ -186,6 +236,7 @@ class OrderEntryMixin:
         broker_request: OrderRequest,
         *,
         context: str,
+        exclude_order_ids: frozenset[str] = frozenset(),
     ) -> tuple[OrderResult | None, BaseException | None]:
         """
         Call broker.place_order() with retry on transient failures.
@@ -195,6 +246,9 @@ class OrderEntryMixin:
         doubling backoff. A clean returned OrderResult (including a broker
         REJECTED status) is not a transient failure and is returned as-is
         on the first attempt.
+
+        A looked-up order whose broker_order_id is in `exclude_order_ids` is
+        not treated as this submission (it is an older order sharing the ref).
 
         Returns (order_result, None) on success, or (None, last_exception)
         if every attempt raised.
@@ -208,6 +262,8 @@ class OrderEntryMixin:
                 last_exc = exc
                 try:
                     existing = await self._find_existing_order(broker_request)
+                    if existing is not None and existing.broker_order_id in exclude_order_ids:
+                        existing = None
                 except Exception as lookup_exc:
                     trading_logger.warning(
                         f"OrderManager: {context} failed and the broker lookup failed too; not resubmitting",

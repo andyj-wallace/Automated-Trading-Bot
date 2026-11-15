@@ -10,11 +10,12 @@ Used automatically when ENVIRONMENT=development (see app/dependencies.py).
 import random
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from app.brokers.base import (
     AccountSummary,
     BaseBroker,
+    Execution,
     OrderRequest,
     OrderResult,
     Position,
@@ -48,11 +49,15 @@ class MockBroker(BaseBroker):
         self.orders: dict[str, OrderRequest] = {}
         self.order_results: dict[str, OrderResult] = {}
         self.fills: list[tuple[str, Decimal, Decimal]] = []
+        self.executions: list[Execution] = []
+        self._exec_prefix = uuid4().hex[:12]  # keeps exec ids unique across instances
+        self._next_exec_id = 1
         self._ref_by_order_id: dict[str, str] = {}
         self.placed_orders: list[OrderRequest] = []
         # One-shot test toggles, cleared after the next place_order().
         self.next_status: str | None = None  # "WORKING" | "PARTIAL" | "REJECTED" | "ERROR"
         self.next_filled_quantity: Decimal | None = None
+        self.next_commission: Decimal | None = None  # commission on the next order's executions
         self.raise_after_next_order: bool = False  # record the order, then raise
 
     # ------------------------------------------------------------------
@@ -146,17 +151,19 @@ class MockBroker(BaseBroker):
             fill_price = self.last_prices.get(symbol, Decimal("100.00"))
 
         status = self.next_status or ("WORKING" if order.order_type == "STP" else "FILLED")
-        if status == "PARTIAL":
-            filled = self.next_filled_quantity if self.next_filled_quantity is not None else (
-                order.quantity / 2
-            )
+        if self.next_filled_quantity is not None and status in ("PARTIAL", "WORKING"):
+            filled = self.next_filled_quantity
+        elif status == "PARTIAL":
+            filled = order.quantity / 2
         elif status == "FILLED":
             filled = order.quantity
         else:
             filled = Decimal("0")
+        commission = self.next_commission
         raise_after = self.raise_after_next_order
         self.next_status = None
         self.next_filled_quantity = None
+        self.next_commission = None
         self.raise_after_next_order = False
 
         self.placed_orders.append(order)
@@ -164,7 +171,9 @@ class MockBroker(BaseBroker):
             self.orders[order.order_ref] = order
         if filled > 0:
             self._apply_fill(symbol, order.direction, filled, fill_price)
-            self.fills.append((order.order_ref, filled, fill_price))
+            self._record_fill(
+                order.order_ref, broker_order_id, order.direction, filled, fill_price, commission
+            )
 
         result = OrderResult(
             trade_id=order.trade_id,
@@ -172,6 +181,7 @@ class MockBroker(BaseBroker):
             status=status,  # type: ignore[arg-type]
             filled_quantity=filled,
             avg_fill_price=fill_price if filled > 0 else Decimal("0"),
+            ordered_quantity=order.quantity,
             order_ref=order.order_ref,
             timestamp=datetime.now(UTC),
         )
@@ -200,8 +210,39 @@ class MockBroker(BaseBroker):
             status="FILLED",
             filled_quantity=total,
             avg_fill_price=avg,
+            ordered_quantity=latest.ordered_quantity,
             order_ref=order_ref,
             timestamp=datetime.now(UTC),
+        )
+
+    async def get_executions(self) -> list[Execution]:
+        self._require_connected()
+        return list(self.executions)
+
+    def _record_fill(
+        self,
+        order_ref: str,
+        broker_order_id: str,
+        direction: str,
+        quantity: Decimal,
+        price: Decimal,
+        commission: Decimal | None = None,
+    ) -> None:
+        """Record a fill in both the legacy fills list and the execution list."""
+        self.fills.append((order_ref, quantity, price))
+        exec_id = f"mock-{self._exec_prefix}-{self._next_exec_id}"
+        self._next_exec_id += 1
+        self.executions.append(
+            Execution(
+                exec_id=exec_id,
+                order_ref=order_ref,
+                broker_order_id=broker_order_id,
+                side=direction,  # type: ignore[arg-type]
+                quantity=quantity,
+                price=price,
+                commission=commission,
+                executed_at=datetime.now(UTC),
+            )
         )
 
     def _apply_fill(
@@ -230,13 +271,14 @@ class MockBroker(BaseBroker):
         )
 
     async def cancel_order(self, broker_order_id: str) -> bool:
-        """Cancel a WORKING order (it then reads as REJECTED); False for unknown/finished orders."""
+        """Cancel a WORKING order: PARTIAL if it has fills, else REJECTED; False otherwise."""
         self._require_connected()
         ref = self._ref_by_order_id.get(broker_order_id)
         result = self.order_results.get(ref) if ref else None
         if result is None or result.status != "WORKING":
             return False
-        self.order_results[ref] = result.model_copy(update={"status": "REJECTED"})
+        new_status = "PARTIAL" if result.filled_quantity > 0 else "REJECTED"
+        self.order_results[ref] = result.model_copy(update={"status": new_status})
         return True
 
     # ------------------------------------------------------------------
@@ -263,6 +305,19 @@ class MockBroker(BaseBroker):
             unrealized_pnl=quantity * (price - cost),
         )
 
+    def set_execution_commission(self, exec_id: str, commission: Decimal) -> None:
+        """Set the commission on one recorded execution; KeyError for an unknown exec_id."""
+        for i, execution in enumerate(self.executions):
+            if execution.exec_id == exec_id:
+                self.executions[i] = execution.model_copy(update={"commission": commission})
+                return
+        raise KeyError(exec_id)
+
+    def clear_executions(self) -> None:
+        """Forget all executions and fills (a new trading day); positions and orders stay."""
+        self.executions.clear()
+        self.fills.clear()
+
     def set_order_state(
         self,
         order_ref: str,
@@ -276,21 +331,27 @@ class MockBroker(BaseBroker):
         Force the broker-side state of an order ref (creates it if unknown).
 
         A larger filled_quantity than before records the difference as a fill so
-        get_execution_summary() reflects it. Positions are not touched; use
-        set_position() for that.
+        get_execution_summary() and get_executions() reflect it. Positions are not
+        touched; use set_position() for that.
         """
         previous = self.order_results.get(order_ref)
+        order = self.orders.get(order_ref)
         prev_filled = previous.filled_quantity if previous else Decimal("0")
         new_filled = filled_quantity if filled_quantity is not None else prev_filled
         price = avg_fill_price if avg_fill_price is not None else (
             previous.avg_fill_price if previous else Decimal("0")
         )
-        if new_filled > prev_filled:
-            self.fills.append((order_ref, new_filled - prev_filled, price))
         order_id = broker_order_id or (previous.broker_order_id if previous else "")
         if not order_id:
             order_id = str(self._next_order_id)
             self._next_order_id += 1
+        if new_filled > prev_filled:
+            # Side comes from the placed order; a ref the mock never placed is treated as BUY.
+            direction = order.direction if order else "BUY"
+            self._record_fill(order_ref, order_id, direction, new_filled - prev_filled, price)
+        ordered = previous.ordered_quantity if previous else (
+            order.quantity if order else None
+        )
         self._ref_by_order_id[order_id] = order_ref
         self.order_results[order_ref] = OrderResult(
             trade_id=UUID(order_ref.split(":")[0]),
@@ -298,6 +359,7 @@ class MockBroker(BaseBroker):
             status=status,  # type: ignore[arg-type]
             filled_quantity=new_filled,
             avg_fill_price=price,
+            ordered_quantity=ordered,
             order_ref=order_ref,
             timestamp=datetime.now(UTC),
         )

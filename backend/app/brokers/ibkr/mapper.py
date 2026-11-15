@@ -13,7 +13,7 @@ from uuid import UUID
 from ib_async import AccountValue, BarData, Trade
 from ib_async import Position as IBPosition
 
-from app.brokers.base import AccountSummary, OrderResult, Position, PriceBar
+from app.brokers.base import AccountSummary, Execution, OrderResult, Position, PriceBar
 
 # ---------------------------------------------------------------------------
 # AccountSummary
@@ -180,7 +180,7 @@ def map_order_result(trade_id: UUID, trade: Trade) -> OrderResult:
     elif status in _CANCELLED:
         mapped = "PARTIAL" if filled_qty > 0 else "REJECTED"
     elif status in _WORKING:
-        mapped = "PARTIAL" if filled_qty > 0 else "WORKING"
+        mapped = "WORKING"
     else:
         mapped = "ERROR"
 
@@ -200,11 +200,47 @@ def map_order_result(trade_id: UUID, trade: Trade) -> OrderResult:
         status=mapped,  # type: ignore[arg-type]
         filled_quantity=filled_qty,
         avg_fill_price=avg_price,
+        ordered_quantity=Decimal(str(trade.order.totalQuantity)),
         order_ref=trade.order.orderRef or "",
         error_message=error_message,
         commission=fills_commission(getattr(trade, "fills", ())),
         timestamp=datetime.now(dt.UTC),
     )
+
+
+def _reported_commission(fill) -> Decimal | None:
+    value = getattr(getattr(fill, "commissionReport", None), "commission", 0) or 0
+    if 0 < value < _UNSET_FLOOR:
+        return Decimal(str(value))
+    return None
+
+
+def _utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=dt.UTC) if value.tzinfo is None else value.astimezone(dt.UTC)
+
+
+_SIDES = {"BOT": "BUY", "SLD": "SELL"}
+
+
+def map_executions(fills: list) -> list[Execution]:
+    """Map ib_async Fill objects to Execution models, one per fill."""
+    executions = []
+    for fill in fills:
+        execution = fill.execution
+        executed_at = getattr(fill, "time", None) or execution.time
+        executions.append(
+            Execution(
+                exec_id=execution.execId,
+                order_ref=execution.orderRef or "",
+                broker_order_id=str(execution.orderId),
+                side=_SIDES[execution.side],
+                quantity=Decimal(str(execution.shares)),
+                price=Decimal(str(execution.price)),
+                commission=_reported_commission(fill),
+                executed_at=_utc(executed_at),
+            )
+        )
+    return executions
 
 
 def trade_id_from_ref(order_ref: str) -> UUID:
