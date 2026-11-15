@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from app.brokers.base import Execution, OrderResult
 from app.db.repositories.fill_repo import LegTotals
+from app.monitoring.logger import error_logger
 
 
 class FillSyncMixin:
@@ -70,17 +72,50 @@ class FillSyncMixin:
         self, order_ref: str, broker_order_id: str | None = None
     ) -> OrderResult | None:
         """Cancel a live order and poll until it is terminal, gone, or the wait runs out."""
-        current = await self._broker.find_order_by_ref(order_ref)
-        if current is None or current.is_terminal:
-            return current
-        await self._broker.cancel_order(broker_order_id or current.broker_order_id)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._stop_cancel_wait_seconds
-        while True:
-            state = await self._broker.find_order_by_ref(order_ref)
-            if state is None or state.is_terminal:
-                return state
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                return state
-            await asyncio.sleep(min(0.25, remaining))
+        last: OrderResult | None = None
+        step = "lookup"
+        try:
+            current = await asyncio.wait_for(
+                self._broker.find_order_by_ref(order_ref),
+                timeout=max(deadline - loop.time(), 0.01),
+            )
+            if current is None or current.is_terminal:
+                return current
+            last = current
+            step = "cancel"
+            await asyncio.wait_for(
+                self._broker.cancel_order(broker_order_id or current.broker_order_id),
+                timeout=max(deadline - loop.time(), 0.01),
+            )
+            while True:
+                step = "poll"
+                state = await asyncio.wait_for(
+                    self._broker.find_order_by_ref(order_ref),
+                    timeout=max(deadline - loop.time(), 0.01),
+                )
+                if state is None or state.is_terminal:
+                    return state
+                last = state
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return state
+                await asyncio.sleep(min(0.25, remaining))
+        except TimeoutError:
+            error_logger.warning(
+                "broker call timed out during cancel wait",
+                extra={"order_ref": order_ref, "step": step},
+            )
+            if last is not None:
+                return last
+            return OrderResult(
+                trade_id=uuid.UUID(order_ref.split(":")[0]),
+                broker_order_id=broker_order_id or "",
+                status="ERROR",
+                filled_quantity=Decimal("0"),
+                avg_fill_price=Decimal("0"),
+                order_ref=order_ref,
+                error_message="broker call timed out during cancel wait",
+                timestamp=datetime.now(UTC),
+            )
