@@ -8,6 +8,7 @@ from app.db.models.strategy import TradingStrategy
 from app.db.models.strategy_signal import StrategySignal
 from app.db.models.system_log import LogCategory, SystemLog
 from app.db.models.trade import Trade, TradeDirection, TradeStatus
+from app.db.models.trade_fill import TradeFill
 from app.db.models.watched_symbol import WatchedSymbol
 
 __all__ = [
@@ -19,6 +20,7 @@ __all__ = [
     "SystemLog",
     "Trade",
     "TradeDirection",
+    "TradeFill",
     "TradeStatus",
     "WatchedSymbol",
 ]

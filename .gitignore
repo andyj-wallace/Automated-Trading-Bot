@@ -90,5 +90,6 @@ alembic/versions/*.pyc
 .github/hooks/
 .agents/
 .codex/
-.claude/
+.claude/*
+!.claude/CLAUDE.md
 graphify-out/
