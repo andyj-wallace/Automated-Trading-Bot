@@ -343,7 +343,25 @@ class IBKRClient(IBKRMarketDataMixin, IBKRConnectionStatusMixin, BaseBroker):
         """Today's executions (fills) for this session's account, one Execution per fill."""
         self._require_connected()
         fills = await self._ib.reqExecutionsAsync()
-        return mapper.map_executions(list(fills))
+        return mapper.map_executions(self._with_cached_commissions(list(fills)))
+
+    def _with_cached_commissions(self, fills: list) -> list:
+        """Carry commission reports over from the session's fill cache onto refreshed fills.
+
+        A repeated execution request returns fresh Fill objects with an empty commission
+        report, while later commission reports only update the cached Fill for that execId.
+        """
+        cache = getattr(getattr(self._ib, "wrapper", None), "fills", None)
+        if not isinstance(cache, dict):
+            return fills
+        merged = []
+        for fill in fills:
+            cached = cache.get(getattr(getattr(fill, "execution", None), "execId", None))
+            report = getattr(cached, "commissionReport", None)
+            if report is not None and mapper._reported_commission(cached) is not None:
+                fill = fill._replace(commissionReport=report)
+            merged.append(fill)
+        return merged
 
     async def cancel_order(self, broker_order_id: str) -> bool:
         """

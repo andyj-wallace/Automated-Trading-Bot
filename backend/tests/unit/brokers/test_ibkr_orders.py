@@ -279,3 +279,25 @@ async def test_get_execution_summary_aggregates():
     result = await _client(ib).get_execution_summary(ref)
     assert result.filled_quantity == Decimal("10")
     assert result.avg_fill_price == Decimal("57")
+
+
+async def test_get_executions_keeps_commission_reported_on_cached_fill():
+    from ib_async import CommissionReport, Execution, Fill
+
+    def make_fill(commission):
+        execution = Execution(
+            execId="0001.1", orderRef=f"{TID}:entry", orderId=7, side="BOT",
+            shares=10.0, price=10.0, time=datetime(2026, 1, 5, 15, 0, tzinfo=UTC),
+        )
+        report = CommissionReport(execId="0001.1", commission=commission)
+        return Fill(SimpleNamespace(), execution, report, execution.time)
+
+    ib = _FakeIB()
+    ib.fills = [make_fill(0.0)]
+    ib.wrapper = SimpleNamespace(fills={"0001.1": make_fill(1.0)})
+    [execution] = await _client(ib).get_executions()
+    assert execution.commission == Decimal("1.0")
+
+    ib.wrapper = SimpleNamespace(fills={})
+    [execution] = await _client(ib).get_executions()
+    assert execution.commission is None
