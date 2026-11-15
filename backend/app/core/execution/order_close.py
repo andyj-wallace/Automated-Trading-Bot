@@ -242,8 +242,11 @@ class OrderCloseMixin:
         if not self._session_factory:
             raise RuntimeError("finalize_close requires a session_factory")
 
-        from app.db.models.trade import TradeStatus
+        from app.db.models.trade import TradeDirection, TradeStatus
         from app.db.repositories.trade_repo import TradeRepo
+
+        totals = await self._journal_totals(trade_id)
+        exited = totals["STOP"].quantity + totals["EXIT"].quantity
 
         async with self._session_factory() as session:
             repo = TradeRepo(session)
@@ -261,7 +264,26 @@ class OrderCloseMixin:
             elif trade.status != TradeStatus.CLOSING:
                 return False
 
-            exit_price, pnl, exit_commission = self._close_pnl(trade, fill, fallback_price)
+            if exited > 0:
+                # Journal path: average every exit leg; shares with no exit fill are valued at fallback.
+                unaccounted = max(self.entry_quantity(trade) - exited, Decimal("0"))
+                total_qty = exited + unaccounted
+                exit_notional = (
+                    totals["STOP"].notional
+                    + totals["EXIT"].notional
+                    + unaccounted * fallback_price
+                )
+                exit_price = exit_notional / total_qty
+                exit_commission = totals["STOP"].commission + totals["EXIT"].commission
+                entry_px = trade.entry_fill_price or trade.entry_price
+                entry_comm = trade.entry_commission or Decimal("0")
+                entry_cost = entry_px * total_qty
+                if trade.direction == TradeDirection.BUY:
+                    pnl = exit_notional - entry_cost - entry_comm - exit_commission
+                else:
+                    pnl = entry_cost - exit_notional - entry_comm - exit_commission
+            else:
+                exit_price, pnl, exit_commission = self._close_pnl(trade, fill, fallback_price)
 
             closed = await repo.finish_close(
                 trade_id,

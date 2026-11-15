@@ -443,8 +443,14 @@ async def test_finalize_close_subtracts_commissions_from_pnl():
         trade_id=uuid.uuid4(), broker_order_id="9", status="FILLED", filled_quantity=Decimal("2"),
         avg_fill_price=Decimal("26.00"), commission=Decimal("0.36"), timestamp=datetime.now(UTC),
     )
+    from app.db.repositories.fill_repo import LegTotals
+
+    zero = LegTotals(quantity=Decimal("0"), notional=Decimal("0"), commission=Decimal("0"))
+    empty_journal = {leg: zero for leg in ("ENTRY", "STOP", "EXIT")}
     om = OrderManager(MockBroker(), RiskManager(), session_factory=lambda: session)
-    with patch("app.db.repositories.trade_repo.TradeRepo", return_value=repo):
+    with patch.object(
+        OrderManager, "_journal_totals", AsyncMock(return_value=empty_journal)
+    ), patch("app.db.repositories.trade_repo.TradeRepo", return_value=repo):
         assert await om.finalize_close(uuid.uuid4(), ExitReason.TAKE_PROFIT, fill, Decimal("26"))
     args, kwargs = repo.finish_close.call_args
     assert args[2] == Decimal("1.28")  # (26 - 25) * 2 - 0.36 - 0.36
