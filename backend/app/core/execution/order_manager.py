@@ -60,6 +60,7 @@ from app.core.execution.order_close import (
     OrderCloseMixin,
 )
 from app.core.execution.order_entry import OrderEntryMixin
+from app.core.execution.order_fills import FillSyncMixin
 from app.core.execution.order_records import OrderRecordsMixin
 from app.core.execution.order_stops import ProtectiveStopMixin
 from app.core.risk.calculator import RiskCalculator
@@ -78,7 +79,9 @@ from app.monitoring.logger import risk_logger as risk_logger
 _calculator = RiskCalculator()
 
 
-class OrderManager(OrderEntryMixin, OrderCloseMixin, ProtectiveStopMixin, OrderRecordsMixin):
+class OrderManager(
+    OrderEntryMixin, OrderCloseMixin, ProtectiveStopMixin, OrderRecordsMixin, FillSyncMixin
+):
     """
     Orchestrates trade submission and position closing through validation,
     audit, DB lifecycle, and broker layers.
@@ -145,6 +148,7 @@ class OrderManager(OrderEntryMixin, OrderCloseMixin, ProtectiveStopMixin, OrderR
         self._is_market_open = is_market_open
         self._protective_stops = protective_stops
         self._stop_cancel_wait_seconds = stop_cancel_wait_seconds
+        self._trade_locks: dict[uuid.UUID, asyncio.Lock] = {}
         # Serializes "compute aggregate risk → validate → insert PENDING row"
         # across concurrent submit_order() calls in this process — see the
         # portfolio-risk-cap race note in the module docstring.
