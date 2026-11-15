@@ -236,6 +236,7 @@ class OrderEntryMixin:
         broker_request: OrderRequest,
         *,
         context: str,
+        exclude_order_ids: frozenset[str] = frozenset(),
     ) -> tuple[OrderResult | None, BaseException | None]:
         """
         Call broker.place_order() with retry on transient failures.
@@ -245,6 +246,9 @@ class OrderEntryMixin:
         doubling backoff. A clean returned OrderResult (including a broker
         REJECTED status) is not a transient failure and is returned as-is
         on the first attempt.
+
+        A looked-up order whose broker_order_id is in `exclude_order_ids` is
+        not treated as this submission (it is an older order sharing the ref).
 
         Returns (order_result, None) on success, or (None, last_exception)
         if every attempt raised.
@@ -258,6 +262,8 @@ class OrderEntryMixin:
                 last_exc = exc
                 try:
                     existing = await self._find_existing_order(broker_request)
+                    if existing is not None and existing.broker_order_id in exclude_order_ids:
+                        existing = None
                 except Exception as lookup_exc:
                     trading_logger.warning(
                         f"OrderManager: {context} failed and the broker lookup failed too; not resubmitting",

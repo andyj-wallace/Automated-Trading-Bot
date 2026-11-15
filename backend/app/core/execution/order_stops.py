@@ -50,7 +50,11 @@ class ProtectiveStopMixin:
             if quantity <= 0:
                 return False
             existing = await self._broker.find_order_by_ref(stop_ref)
-            if existing is not None and existing.status == "WORKING":
+            if (
+                existing is not None
+                and existing.status == "WORKING"
+                and existing.broker_order_id != replace_stop_id
+            ):
                 await self._record_stop_order(trade_id, existing.broker_order_id, trade.stop_loss_price)
                 return True
             request = OrderRequest(
@@ -63,11 +67,16 @@ class ProtectiveStopMixin:
                 tif="GTC",
                 order_ref=stop_ref,
             )
-            result, error = await self._place_order_with_retry(request, context="protective stop")
+            result, error = await self._place_order_with_retry(
+                request,
+                context="protective stop",
+                exclude_order_ids=frozenset({replace_stop_id}) if replace_stop_id else frozenset(),
+            )
         except Exception as exc:
             result, error = None, exc
 
-        if result is None or result.status in ("REJECTED", "ERROR"):
+        replaced_old_stop = result is not None and result.broker_order_id == replace_stop_id
+        if result is None or result.status in ("REJECTED", "ERROR") or replaced_old_stop:
             await publish_system_alert(
                 self._cache,
                 "PROTECTIVE_STOP_FAILED",
@@ -150,24 +159,6 @@ class ProtectiveStopMixin:
                 new_quantity=str(int(open_qty)),
             )
             return True
-
-    async def _cancel_protective_stop(
-        self, trade_id: uuid.UUID, stop_order_id: str
-    ) -> OrderResult | None:
-        """
-        Cancel the resting stop and wait for it to settle.
-
-        Returns the stop's fill summary if it executed (so the caller must not sell
-        again), None once it is gone. Raises if it is still working after the wait.
-        """
-        stop_ref = f"{trade_id}:stop"
-        stop = await self._cancel_and_wait(stop_ref, stop_order_id)
-        if stop is not None and not stop.is_terminal:
-            raise RuntimeError("protective stop still working after cancel")
-        fill = await self._broker.get_execution_summary(stop_ref)
-        if fill is not None and fill.filled_quantity > 0:
-            return fill
-        return None
 
     async def adopt_entry_fill(self, trade_id: uuid.UUID, fill: OrderResult) -> bool:
         """
