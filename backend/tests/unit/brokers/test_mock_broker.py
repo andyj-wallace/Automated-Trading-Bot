@@ -288,3 +288,71 @@ async def test_connection_info_default_follows_is_connected(broker: MockBroker) 
     assert broker.connection_info().state == "down"
     await broker.connect()
     assert broker.connection_info().state == "connected"
+
+
+# ---------------------------------------------------------------------------
+# Order state contract and executions
+# ---------------------------------------------------------------------------
+
+
+async def test_cancel_working_order_with_fills_gives_partial():
+    b = await _connected()
+    b.next_status = "WORKING"
+    b.next_filled_quantity = Decimal("4")
+    placed = await b.place_order(_make_order(quantity=Decimal("10"), order_ref="c1"))
+    assert placed.status == "WORKING" and placed.ordered_quantity == Decimal("10")
+
+    assert await b.cancel_order(placed.broker_order_id) is True
+    after = await b.find_order_by_ref("c1")
+    assert after.status == "PARTIAL" and after.filled_quantity == Decimal("4")
+    assert after.is_terminal
+
+
+async def test_get_executions_returns_unique_exec_ids():
+    b = await _connected()
+    await b.place_order(_make_order(quantity=Decimal("3"), order_ref="e1"))
+    await b.place_order(_make_order(quantity=Decimal("2"), order_ref="e2"))
+    executions = await b.get_executions()
+    assert len(executions) == 2
+    assert len({e.exec_id for e in executions}) == 2
+    assert [(e.order_ref, e.side, e.quantity) for e in executions] == [
+        ("e1", "BUY", Decimal("3")),
+        ("e2", "BUY", Decimal("2")),
+    ]
+
+
+async def test_clear_executions_empties_list_and_keeps_positions():
+    b = await _connected()
+    await b.place_order(_make_order(quantity=Decimal("10"), order_ref="k1"))
+    b.clear_executions()
+    assert await b.get_executions() == []
+    assert [(p.symbol, p.quantity) for p in b.positions.values()] == [("AAPL", Decimal("10"))]
+
+
+async def test_working_order_with_filled_quantity_records_fill_and_position():
+    b = await _connected()
+    b.next_status = "WORKING"
+    b.next_filled_quantity = Decimal("4")
+    res = await b.place_order(_make_order(quantity=Decimal("10"), order_ref="w1"))
+    assert res.status == "WORKING"
+    assert res.filled_quantity == Decimal("4")
+    assert res.ordered_quantity == Decimal("10")
+    assert b.positions["AAPL"].quantity == Decimal("4")
+    executions = await b.get_executions()
+    assert [(e.quantity, e.order_ref) for e in executions] == [(Decimal("4"), "w1")]
+
+
+async def test_set_execution_commission_updates_commission():
+    b = await _connected()
+    b.next_commission = Decimal("1.00")
+    await b.place_order(_make_order(quantity=Decimal("2"), order_ref="m1"))
+    await b.place_order(_make_order(quantity=Decimal("2"), order_ref="m2"))
+    first, second = await b.get_executions()
+    assert first.commission == Decimal("1.00") and second.commission is None
+
+    b.set_execution_commission(second.exec_id, Decimal("0.35"))
+    updated = await b.get_executions()
+    assert updated[1].commission == Decimal("0.35")
+    assert updated[0].commission == Decimal("1.00")
+    with pytest.raises(KeyError):
+        b.set_execution_commission("no-such-exec", Decimal("0.35"))

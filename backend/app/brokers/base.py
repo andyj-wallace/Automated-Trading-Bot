@@ -203,6 +203,10 @@ class BaseBroker(ABC):
         """
 
     @abstractmethod
+    async def get_executions(self) -> list[Execution]:
+        """Every execution the broker currently reports."""
+
+    @abstractmethod
     async def unsubscribe_price_feed(self, ticker: str) -> None:
         """Remove a single ticker from the active price subscription."""
 
