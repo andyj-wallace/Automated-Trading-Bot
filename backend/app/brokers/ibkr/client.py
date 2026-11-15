@@ -22,6 +22,7 @@ from ib_async import IB, LimitOrder, MarketOrder, Stock, StopOrder
 from app.brokers.base import (
     AccountSummary,
     BaseBroker,
+    Execution,
     OrderRequest,
     OrderResult,
     Position,
@@ -337,6 +338,12 @@ class IBKRClient(IBKRMarketDataMixin, IBKRConnectionStatusMixin, BaseBroker):
         self._require_connected()
         fills = await self._ib.reqExecutionsAsync()
         return mapper.summarize_fills(order_ref, list(fills))
+
+    async def get_executions(self) -> list[Execution]:
+        """Today's executions (fills) for this session's account, one Execution per fill."""
+        self._require_connected()
+        fills = await self._ib.reqExecutionsAsync()
+        return mapper.map_executions(list(fills))
 
     async def cancel_order(self, broker_order_id: str) -> bool:
         """

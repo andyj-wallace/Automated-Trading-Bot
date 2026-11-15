@@ -1,6 +1,7 @@
 """IBKR order mapping, order_ref lookup, execution summaries and cancel-on-timeout (C2, C3)."""
 
 import uuid
+from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -15,9 +16,9 @@ from app.config import Settings
 TID = uuid.uuid4()
 
 
-def _trade(status, filled=0, avg=0.0, ref="", order_id=7):
+def _trade(status, filled=0, avg=0.0, ref="", order_id=7, total=10):
     return SimpleNamespace(
-        order=SimpleNamespace(orderId=order_id, orderRef=ref),
+        order=SimpleNamespace(orderId=order_id, orderRef=ref, totalQuantity=total),
         orderStatus=SimpleNamespace(status=status, filled=filled, avgFillPrice=avg),
         log=[],
         done=status in ("Filled", "Cancelled", "ApiCancelled", "Inactive"),
@@ -39,8 +40,8 @@ def _trade(status, filled=0, avg=0.0, ref="", order_id=7):
         ("Submitted", 0, "WORKING"),
         ("ApiPending", 0, "WORKING"),
         ("PendingCancel", 0, "WORKING"),
-        ("Submitted", 4, "PARTIAL"),
-        ("PendingCancel", 4, "PARTIAL"),
+        ("Submitted", 4, "WORKING"),
+        ("PendingCancel", 4, "WORKING"),
         ("SomethingNew", 0, "ERROR"),
     ],
 )
@@ -120,7 +121,7 @@ class _LiveTrade:
     """Fake ib_async Trade whose state is driven by the test."""
 
     def __init__(self, status="Submitted", ref=""):
-        self.order = SimpleNamespace(orderId=11, orderRef=ref)
+        self.order = SimpleNamespace(orderId=11, orderRef=ref, totalQuantity=10)
         self.orderStatus = SimpleNamespace(status=status, filled=0, avgFillPrice=0.0)
         self.log = []
         self.fills = []
@@ -131,6 +132,60 @@ class _LiveTrade:
 
     def cancel_hook(self):
         self.orderStatus.status = self.cancel_to
+
+
+def test_submitted_with_partial_fill_is_working_not_terminal():
+    result = mapper.map_order_result(TID, _trade("Submitted", 4, 100.5, f"{TID}:entry"))
+    assert result.status == "WORKING"
+    assert result.filled_quantity == Decimal("4")
+    assert result.ordered_quantity == Decimal("10")
+    assert result.is_terminal is False
+
+
+def test_pending_cancel_with_fills_is_working():
+    result = mapper.map_order_result(TID, _trade("PendingCancel", 4, 100.5, f"{TID}:entry"))
+    assert result.status == "WORKING"
+
+
+def test_cancelled_with_fills_is_partial_and_terminal():
+    result = mapper.map_order_result(TID, _trade("Cancelled", 4, 100.5, f"{TID}:entry"))
+    assert result.status == "PARTIAL"
+    assert result.is_terminal is True
+
+
+def test_cancelled_without_fills_is_rejected_and_filled_is_filled():
+    assert mapper.map_order_result(TID, _trade("Cancelled", 0)).status == "REJECTED"
+    assert mapper.map_order_result(TID, _trade("Filled", 10, 100.0)).status == "FILLED"
+
+
+def _execution_fill(side, commission, order_ref=f"{TID}:entry"):
+    return SimpleNamespace(
+        execution=SimpleNamespace(
+            execId="0001.abc",
+            orderRef=order_ref,
+            orderId=5,
+            side=side,
+            shares=4,
+            price=100.25,
+            time=datetime(2026, 11, 13, 14, 30, tzinfo=UTC),
+        ),
+        commissionReport=SimpleNamespace(commission=commission),
+        time=datetime(2026, 11, 13, 14, 30, 1, tzinfo=UTC),
+    )
+
+
+def test_map_executions_maps_side_ids_and_commission():
+    fills = [_execution_fill("BOT", 0.36), _execution_fill("SLD", 1.7976931348623157e308)]
+    executions = mapper.map_executions(fills)
+    assert [e.side for e in executions] == ["BUY", "SELL"]
+    assert executions[0].exec_id == "0001.abc"
+    assert executions[0].order_ref == f"{TID}:entry"
+    assert executions[0].broker_order_id == "5"
+    assert executions[0].quantity == Decimal("4")
+    assert executions[0].price == Decimal("100.25")
+    assert executions[0].commission == Decimal("0.36")
+    assert executions[0].executed_at.tzinfo is not None
+    assert executions[1].commission is None
 
 
 def _client(fake_ib, timeout=0):
