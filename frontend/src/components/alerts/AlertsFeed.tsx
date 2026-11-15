@@ -32,6 +32,10 @@ const KNOWN: Record<string, { title: string; step: string }> = {
   QUANTITY_MISMATCH: { title: "Share count differs from broker", step: "The bot noted it. Compare positions with IB Gateway." },
   POSITION_CLOSED_EXTERNALLY: { title: "A trade was closed outside the bot", step: "No action needed. The bot updated its records." },
   UNMANAGED_POSITION: { title: "Broker holds a trade the bot didn't open", step: "The bot won't manage it. Close it in IB Gateway if unwanted." },
+  ENTRY_REMAINDER_WORKING: { title: "Buy order only partly filled", step: "The bot owns the shares that filled and placed a stop-loss for them. IBKR has not yet confirmed the rest of the order is cancelled. Check the order in IBKR; the bot will add any later fills automatically." },
+  LATE_ENTRY_FILL: { title: "More shares bought after the trade opened", step: "The rest of an earlier buy order filled later. The bot added the shares to the trade and resized its stop-loss. No action needed." },
+  PROTECTIVE_STOP_REPLACED: { title: "Stop-loss order replaced", step: "The stop-loss no longer matched the shares the bot holds, so the bot cancelled it and placed a new one for the correct number of shares. No action needed." },
+  EXIT_FILLS_MISSING: { title: "Some sold shares could not be matched", step: "IBKR shows no shares left, but the bot could not find every sale. It valued the missing shares at the last known price, so the trade's profit or loss may be slightly off. Compare with your IBKR statement." },
 };
 
 function describe(e: DashboardEvent): { severity: Severity; title: string; message: string; step?: string } {
