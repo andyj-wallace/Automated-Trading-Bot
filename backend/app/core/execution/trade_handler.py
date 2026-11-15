@@ -70,10 +70,10 @@ class TradeHandler:
         Raises:
             ValueError: If called with a non-fill status (programming error).
         """
-        if order_result.status not in ("FILLED", "PARTIAL"):
+        if order_result.filled_quantity <= 0:
             raise ValueError(
-                f"on_fill called with non-fill status '{order_result.status}' "
-                f"for trade {request.trade_id}. Only call on_fill for FILLED/PARTIAL orders."
+                f"on_fill called with non-fill status '{order_result.status}' and no filled "
+                f"quantity for trade {request.trade_id}. Only call on_fill when shares filled."
             )
 
         # ------------------------------------------------------------------
