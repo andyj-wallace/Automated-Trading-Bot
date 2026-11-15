@@ -169,7 +169,7 @@ class Reconciler:
                 trade, age, positions, now, report, prev_filled, totals, executions
             )
         elif trade.status == TradeStatus.CLOSING:
-            await self._reconcile_closing(trade, positions, now, report)
+            await self._reconcile_closing(trade, positions, now, report, executions)
 
     async def _reconcile_entry(self, trade: Trade, age: timedelta, report: ReconcileReport) -> None:
         if age < MIN_AGE:
@@ -232,9 +232,9 @@ class Reconciler:
             self._zero_seen.discard(trade.id)
         if held == 0:
             if self._confirmed_flat(trade.id):
-                await self._finalize_from_broker(trade, now, report)
+                await self._finalize_from_broker(trade, now, report, executions)
             return
-        signed = -held if trade.direction == TradeDirection.SELL else held
+        signed =-held if trade.direction == TradeDirection.SELL else held
         open_qty = self._order_manager.open_quantity(trade, totals)
         if signed < 0:
             kind = "DIRECTION"
@@ -263,7 +263,12 @@ class Reconciler:
             report.add("stop_replaced")
 
     async def _reconcile_closing(
-        self, trade: Trade, positions: dict[str, Decimal], now: datetime, report: ReconcileReport
+        self,
+        trade: Trade,
+        positions: dict[str, Decimal],
+        now: datetime,
+        report: ReconcileReport,
+        executions: list[Execution] | None = None,
     ) -> None:
         first_seen = self._closing_first_seen.setdefault(trade.id, now)
         if now - first_seen < CLOSING_TIMEOUT:
@@ -271,7 +276,7 @@ class Reconciler:
         held = positions.get(trade.symbol.upper(), Decimal("0"))
         if held == 0:
             if self._confirmed_flat(trade.id):
-                await self._finalize_from_broker(trade, now, report)
+                await self._finalize_from_broker(trade, now, report, executions)
             return
         self._zero_seen.discard(trade.id)
         reason = trade.exit_reason or ExitReason.MANUAL
@@ -299,37 +304,66 @@ class Reconciler:
         self._zero_seen.add(trade_id)
         return False
 
-    async def _finalize_from_broker(self, trade: Trade, now: datetime, report: ReconcileReport) -> None:
-        """The broker position is gone: book the exit using whatever fills the broker reports."""
-        if trade.stop_order_id:
-            await self._cancel_quietly(trade.stop_order_id)  # never leave a stop that could open a short
-        stop = await self._broker.get_execution_summary(f"{trade.id}:stop")
-        if stop is not None and stop.filled_quantity > 0:
-            await self._order_manager.finalize_close(
-                trade.id, ExitReason.STOP_LOSS, stop, stop.avg_fill_price
-            )
-            report.add("closed_stop_fill")
-            return
-        exit_fill = await self._broker.get_execution_summary(f"{trade.id}:exit")
-        if exit_fill is not None and exit_fill.filled_quantity > 0:
-            await self._order_manager.finalize_close(
-                trade.id, trade.exit_reason or ExitReason.MANUAL, exit_fill, exit_fill.avg_fill_price
-            )
-            report.add("closed_exit_fill")
+    async def _finalize_from_broker(
+        self,
+        trade: Trade,
+        now: datetime,
+        report: ReconcileReport,
+        executions: list[Execution] | None = None,
+    ) -> None:
+        """The broker position is gone: book the exit from the fill journal, never while entry is live."""
+        entry = await self._broker.find_order_by_ref(f"{trade.id}:entry")
+        if entry is not None and not entry.is_terminal:
+            if entry.status == "WORKING":
+                await self._cancel_quietly(entry.broker_order_id)
+            report.add("finalize_waiting_entry")
             return
 
+        if trade.stop_order_id:
+            await self._cancel_quietly(trade.stop_order_id)  # never leave a stop that could open a short
+            totals = await self._order_manager.sync_fills(trade.id)
+        else:
+            totals = await self._order_manager.sync_fills(trade.id, executions)
+
+        stop_qty = totals["STOP"].quantity
+        exit_qty = totals["EXIT"].quantity
         price = await self._last_price(trade.symbol) or trade.entry_fill_price or trade.entry_price
-        await self._order_manager.finalize_close(trade.id, ExitReason.EXTERNAL, None, price)
-        await self._alert_once(
-            "POSITION_CLOSED_EXTERNALLY",
-            str(trade.id),
-            now,
-            f"{trade.symbol}: position was closed outside the bot; booked at {price}",
-            trade_id=str(trade.id),
-            symbol=trade.symbol,
-            exit_price=str(price),
-        )
-        report.add("closed_external")
+        if stop_qty > 0:
+            reason = ExitReason.STOP_LOSS
+        elif exit_qty > 0:
+            reason = trade.exit_reason or ExitReason.MANUAL
+        else:
+            reason = ExitReason.EXTERNAL
+        await self._order_manager.finalize_close(trade.id, reason, None, price)
+
+        if reason == ExitReason.EXTERNAL:
+            await self._alert_once(
+                "POSITION_CLOSED_EXTERNALLY",
+                str(trade.id),
+                now,
+                f"{trade.symbol}: position was closed outside the bot; booked at {price}",
+                trade_id=str(trade.id),
+                symbol=trade.symbol,
+                exit_price=str(price),
+            )
+            report.add("closed_external")
+        else:
+            report.add("closed_stop_fill" if stop_qty > 0 else "closed_exit_fill")
+
+        exited = stop_qty + exit_qty
+        unaccounted = self._order_manager.entry_quantity(trade) - exited
+        if exited > 0 and unaccounted > 0:
+            await self._alert_once(
+                "EXIT_FILLS_MISSING",
+                str(trade.id),
+                now,
+                f"{trade.symbol}: exit fills cover {exited} of {exited + unaccounted} shares; "
+                f"{unaccounted} booked at {price}",
+                trade_id=str(trade.id),
+                symbol=trade.symbol,
+                unaccounted_quantity=str(unaccounted),
+            )
+            report.add("exit_fills_missing")
 
     # ------------------------------------------------------------------
     # Rule 5: positions the bot does not track
