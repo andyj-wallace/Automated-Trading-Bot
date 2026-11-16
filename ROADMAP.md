@@ -4,6 +4,356 @@ Open work only. When something is finished, delete it from this file.
 
 The [architecture review](docs/architecture-review.md) records the November 13, 2026 review of commit `228eadd`. Finding IDs below refer to that evidence; adding a task does not mean its safeguard is implemented. Prioritize execution correctness, shared authorization and trustworthy small-account validation before adding AI or strategy families.
 
+## Beta server: CI/CD to the home box (current focus)
+
+Goal: merging a pull request from `master` into a protected `prod` branch builds, tests, publishes and deploys that code to the always-on home box. The box is an AMD Ryzen (x86_64), the same architecture GitHub's runners build for. Paper trading only. The "Paper soak" below runs on this box.
+
+How it fits together:
+- `master` is where work lands, through pull requests that pass CI (`.github/workflows/ci.yml`, unchanged).
+- `prod` is the release branch. It changes only through a pull request from `master`, and every push to it is a release.
+- New `.github/workflows/deploy.yml` runs only on pushes to `prod`. It has two jobs:
+  - `publish`, on a GitHub-hosted runner, builds the backend and frontend images and smoke-tests the backend on a fresh database. It then pushes both to GitHub Container Registry (GHCR) as `sha-<first 12 characters of the commit>`.
+  - `deploy`, on the box's self-hosted runner, runs `scripts/bot.sh deploy sha-…` in the box's clone. That pulls the images, restarts only `backend` and `frontend`, checks health and leaves automated entries paused.
+- `scripts/bot.sh rollback`, run on the box, returns to the previous version.
+
+Decisions already made (don't revisit):
+- **The box's runner only ever runs `deploy.yml` for pushes to `prod`.** The repo is public. Any workflow can ask for a self-hosted runner by its labels, including one added in an outsider's pull request, and branch rules don't stop that because pull-request workflows run before any merge. A pre-job hook on the box (task 6) refuses every other job. GitHub runs the hook after a job is assigned and before its first step, and a non-zero exit fails the job without running it. Runner groups, which could restrict workflows, exist only for organizations.
+- **Deploys never recreate `ib-gateway`, `db` or `redis`.** Recreating the Gateway forces a new login and possibly an IBKR Mobile approval. Changes to those three services are applied by hand outside market hours (DEPLOYMENT.md section 7).
+- **Deploys leave automated entries paused.** The user resumes after the DEPLOYMENT.md section 5 checks. Until AR-03 lands, startup keeps trading after a failed reconciliation.
+- **The market-hours guard fails the deploy job during market hours.** Merge into `prod` after the close, or use "Re-run failed jobs" after the close. Workflows never pass `--force`.
+- **Undo a release with `scripts/bot.sh rollback` on the box, not by reverting `prod`.** A revert that removes a migration can't start against the already-migrated database. The next normal release brings `prod` back in line.
+
+Guardrails for this section:
+- Don't edit the AGENTS.md do-not-touch files: `.github/workflows/ci.yml`, `.env.example`, `.env.prod.example`, existing migrations.
+- Paper only. Don't change `TRADING_MODE`, `IBKR_TRADING_MODE` or any Gateway port.
+- No new dependencies and no third-party GitHub actions. Use only `actions/checkout@v4` and the docker CLI on the runner.
+- The only GitHub secret is the built-in `GITHUB_TOKEN`, used by `publish` alone. The `deploy` job gets `permissions: {}`. Secrets stay in `.env.prod` on the box.
+- Never read `.env` or `.env.prod`. One backend replica only.
+
+Order: tasks 1, 2 and 6 are done by the user by hand. Tasks 3, 4, 5 and 8 land on `master` through pull requests. Task 7 is the first release. The YAML, shell and hook code below are patterns that haven't been run yet. Check each piece as you build it; task 7 is the end-to-end proof.
+
+### 1. [ ] Set up the box (user, by hand)
+
+1. Install Ubuntu Server 24.04 LTS. In the BIOS, turn on "Restore on AC power loss". Use wired networking with a DHCP reservation in the router.
+2. Install Docker Engine and the compose plugin from Docker's apt repository (not the snap). Run `sudo systemctl enable docker`.
+3. Run `sudo timedatectl set-timezone America/New_York`; the cron lines in DEPLOYMENT.md are in ET. Confirm `timedatectl` shows "NTP service: active".
+4. Turn on `unattended-upgrades` and allow automatic reboots only on weekends.
+5. Allow SSH with keys only, and set `ufw` to block all inbound traffic except SSH. Install Tailscale.
+6. Create the user that owns the clone and runs the runner, then clone:
+   ```sh
+   sudo adduser --disabled-password --gecos "" bot && sudo usermod -aG docker bot
+   sudo git clone https://github.com/andyj-wallace/Automated-Trading-Bot.git /opt/trading-bot
+   sudo chown -R bot: /opt/trading-bot
+   ```
+   As `bot`, in `/opt/trading-bot`, do DEPLOYMENT.md section 1 steps 1-2 (`.env.prod`, `deploy/nginx/.htpasswd`).
+7. Stop the Mac's dev Gateway whenever the box's Gateway is running. Both use the same paper login, and IBKR allows one session per login.
+
+Done when `docker run --rm hello-world` works as `bot` after a reboot, without anyone logging in.
+
+### 2. [ ] GitHub repository settings (user, by hand)
+
+1. Push everything pending on `master` first: once the ruleset is on, direct pushes are rejected. Then create `prod` from it: `git push origin master:prod`.
+2. Settings → Rules → Rulesets → New branch ruleset, named "master and prod":
+   - Enforcement: Active. Target branches: `master` and `prod`. Bypass list: empty.
+   - Rules: Restrict deletions; Block force pushes; Require a pull request before merging, with 0 required approvals (GitHub doesn't let you approve your own pull request).
+   - Require status checks to pass: `Backend (ruff + pytest)`, `Frontend (tsc + eslint)` and `Docker images build`.
+
+   From then on nothing lands on `master` or `prod` without a pull request whose CI is green. That includes the user's own commits and the agent pipeline: work on a branch and open a pull request.
+3. Settings → Actions → General:
+   - Fork pull request workflows from outside collaborators: "Require approval for all external contributors". This is a second layer; the hook in task 6 is the real guard.
+   - Workflow permissions: "Read repository contents and packages permissions". `deploy.yml` requests `packages: write` itself.
+
+Done when `git push origin master` of a local commit is rejected, and a pull request into `master` can't merge until CI is green.
+
+### 3. [ ] Report the running version in `/health`
+
+Files: `backend/app/config.py`, `backend/app/main.py`, `backend/Dockerfile`, `backend/tests/unit/api/test_system_health.py`.
+
+1. `config.py`, in the Application block: `app_version: str = "dev"  # Set by the Docker build (APP_VERSION); not an operator setting.` Don't add it to `.env.example`: that file is do-not-touch, and operators never set this value.
+2. `main.py` `health()`: return `{"status": "ok", "version": settings.app_version}`.
+3. `Dockerfile`: add `ARG APP_VERSION=dev` and `ENV APP_VERSION=$APP_VERSION` after `USER appuser`. Putting them late keeps the `pip install` layer cached.
+4. Test, next to `test_liveness_is_200_with_broker_disconnected`: monkeypatch `app_version` on the same `settings` object `main.py` imports, and assert that `/health` returns it as `version`.
+
+Done when Ruff and the unit tests pass, and `docker build --build-arg APP_VERSION=sha-test -t bt ./backend` produces an image whose `/health` reports `sha-test`.
+
+### 4. [ ] Run published images instead of building on the box
+
+Files: `docker-compose.prod.yml`, `scripts/bot.sh`, `.gitignore`.
+
+1. `docker-compose.prod.yml`: replace `build: ./backend` with `image: ghcr.io/andyj-wallace/trading-bot-backend:${BOT_IMAGE_TAG:-not-deployed}`, and the frontend's `build: ./frontend` with the `-frontend` equivalent. Nothing else in the file changes. `scripts/backup.sh` still runs compose without the variable; the `not-deployed` default keeps that working.
+2. `.gitignore`: add `deploy/version` and `deploy/previous-version` next to `deploy/nginx/.htpasswd`.
+3. `scripts/bot.sh`:
+   - `compose()` passes the deployed tag: `BOT_IMAGE_TAG=$(cat deploy/version 2>/dev/null || echo not-deployed) docker compose -f docker-compose.prod.yml --env-file .env.prod "$@"`.
+   - `up` refuses when `deploy/version` is missing ("Nothing deployed yet: merge into prod, or scripts/bot.sh deploy sha-<commit>") and runs `compose up -d` without `--build`.
+   - New commands: `deploy sha-<12 hex> [--force]`, `rollback`, `pause [reason]`, `resume`. Add them to `usage`.
+   - Move the `case` into `main()` and end the file with `main "$@"; exit $?`. Deploy checks out another commit, which replaces this file mid-run, and reading `main` in full first keeps the run consistent.
+
+   Pattern for the new functions. Check it with `sh -n scripts/bot.sh` and on the box:
+
+```sh
+IMG=ghcr.io/andyj-wallace/trading-bot
+
+running() { [ -n "$(compose ps -q "$1" 2>/dev/null)" ]; }
+
+# Conservative: holidays and early closes count as open (use --force).
+market_hours() {
+  now=$(TZ=America/New_York date +%u%H%M)
+  [ "${now%????}" -le 5 ] && [ "${now#?}" -ge 930 ] && [ "${now#?}" -lt 1600 ]
+}
+
+POST_PY='
+import json, sys, urllib.request
+body = json.dumps({"reason": sys.argv[2]} if len(sys.argv) > 2 else {}).encode()
+req = urllib.request.Request("http://127.0.0.1:8000" + sys.argv[1], data=body, method="POST",
+                             headers={"Content-Type": "application/json"})
+urllib.request.urlopen(req, timeout=10).read()
+'
+post() { compose exec -T backend python -c "$POST_PY" "$@"; }
+
+VERIFY_PY='
+import json, sys, urllib.error, urllib.request
+def get(path):
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8000" + path, timeout=10) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        return json.load(e)
+version = get("/health").get("version")
+data = get("/api/v1/system/health")["data"]
+print("Version: ", version, "(expected", sys.argv[1] + ")")
+for name in ("database", "redis", "engine", "broker"):
+    print(f"{name:9}", data[name]["status"], data[name].get("detail") or "")
+if data["broker"]["status"] != "ok":
+    print("Broker not connected yet: usually the IBKR Mobile approval (DEPLOYMENT.md section 2).")
+sys.exit(version != sys.argv[1] or any(data[n]["status"] != "ok" for n in ("database", "redis", "engine")))
+'
+
+wait_healthy() {
+  i=0
+  while [ "$i" -lt 30 ]; do
+    [ "$(docker inspect -f '{{.State.Health.Status}}' "$(compose ps -q backend)" 2>/dev/null)" = healthy ] && return 0
+    i=$((i + 1)); sleep 10
+  done
+  return 1
+}
+
+verify() {
+  i=0
+  while [ "$i" -lt 12 ]; do
+    compose exec -T backend python -c "$VERIFY_PY" "$1" && return 0
+    i=$((i + 1)); sleep 10
+  done
+  return 1
+}
+
+deploy() {
+  version=$1 force=${2:-}
+  case "$version" in
+    sha-*) ref=${version#sha-} ;;
+    *) echo "Version must be sha-<12 hex characters>." >&2; exit 1 ;;
+  esac
+  if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    echo "Tracked files are modified. The box runs committed code only." >&2; exit 1
+  fi
+  if market_hours && [ "$force" != "--force" ]; then
+    echo "Market hours (Mon-Fri 9:30-16:00 ET). Deploy after the close." >&2; exit 1
+  fi
+  docker pull -q "$IMG-backend:$version"
+  docker pull -q "$IMG-frontend:$version"
+  if running backend; then
+    post /api/v1/trading/pause "deploy $version" || [ "$force" = "--force" ] || {
+      echo "Could not pause automated entries. Fix the backend or pass --force." >&2; exit 1; }
+    scripts/backup.sh
+  fi
+  git fetch -q origin
+  git checkout -q --detach "$ref"
+  expected="sha-$(git rev-parse HEAD | cut -c1-12)"
+  current=$(cat deploy/version 2>/dev/null || true)
+  if [ -n "$current" ] && [ "$current" != "$version" ]; then echo "$current" > deploy/previous-version; fi
+  echo "$version" > deploy/version
+  compose up -d --no-recreate db redis ib-gateway
+  compose up -d --no-deps backend frontend
+  if ! wait_healthy || ! verify "$expected"; then
+    echo "Deploy of $version failed its checks. Roll back on the box: scripts/bot.sh rollback" >&2; exit 1
+  fi
+  post /api/v1/trading/pause "deployed $version"
+  echo "Deployed $version. Automated entries are PAUSED."
+  echo "Do the checks in DEPLOYMENT.md section 5, then: scripts/bot.sh resume"
+}
+
+rollback() {
+  prev=$(cat deploy/previous-version 2>/dev/null) || { echo "No previous version recorded." >&2; exit 1; }
+  docker pull -q "$IMG-backend:$prev"
+  # The old code can't start on a database migrated past it, so downgrade with the current image first.
+  old_head=$(docker run --rm -e SECRET_KEY=unused -e DATABASE_URL=postgresql+asyncpg://unused@localhost/unused \
+    "$IMG-backend:$prev" alembic heads | awk 'NR == 1 { print $1 }')
+  [ -n "$old_head" ] || { echo "Could not read the database revision of $prev." >&2; exit 1; }
+  scripts/backup.sh
+  if running backend; then post /api/v1/trading/pause "rollback to $prev" || true; fi
+  compose stop backend
+  compose run --rm --no-deps backend alembic downgrade "$old_head"
+  deploy "$prev" --force
+}
+```
+
+   In `main`, `pause` runs `post /api/v1/trading/pause "${2:-manual}"` and `resume` runs `post /api/v1/trading/resume`. Each prints one line on success.
+
+Done when `sh -n scripts/bot.sh` passes, and `docker compose -f docker-compose.prod.yml config` (no env file; warnings are fine) shows both images with the `not-deployed` tag.
+
+### 5. [ ] Deploy workflow
+
+Create `.github/workflows/deploy.yml`:
+
+```yaml
+name: Deploy
+
+on:
+  push:
+    branches: [prod]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build, smoke-test and push images
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.names.outputs.tag }}
+    services:
+      postgres:
+        image: timescale/timescaledb:2.26.1-pg15
+        env:
+          POSTGRES_USER: trading
+          POSTGRES_PASSWORD: trading
+          POSTGRES_DB: trading_bot
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Names
+        id: names
+        run: |
+          TAG="sha-$(git rev-parse HEAD | cut -c1-12)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "IMG=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/trading-bot" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          SRC="org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}"
+          docker build --build-arg APP_VERSION="$TAG" --label "$SRC" -t "$IMG-backend:$TAG" ./backend
+          docker build --label "$SRC" -t "$IMG-frontend:$TAG" ./frontend
+
+      - name: Smoke-test the backend (migrations on a fresh database, then /health)
+        run: |
+          docker run -d --name smoke --network host \
+            -e ENVIRONMENT=development -e SECRET_KEY=smoke-test-not-secret \
+            -e DATABASE_URL=postgresql+asyncpg://trading:trading@localhost:5432/trading_bot \
+            -e REDIS_URL=redis://localhost:6379/0 -e BROKER=mock -e IBKR_TRADING_MODE=paper \
+            "$IMG-backend:$TAG"
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/health | grep -q "\"$TAG\""; then exit 0; fi
+            sleep 2
+          done
+          docker logs smoke
+          exit 1
+
+      - name: Push
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMG-backend:$TAG"
+          docker push "$IMG-frontend:$TAG"
+
+  deploy:
+    name: Deploy on the box
+    needs: publish
+    runs-on: [self-hosted, trading-box]
+    permissions: {}
+    steps:
+      - name: scripts/bot.sh deploy
+        run: cd /opt/trading-bot && scripts/bot.sh deploy "${{ needs.publish.outputs.tag }}"
+```
+
+If the backend needs another variable to start in the smoke test, add it with a dummy value, never a real secret.
+
+Done when the file passes review in its pull request into `master`. The first real run is task 7.
+
+### 6. [ ] Self-hosted runner on the box, locked to `prod` deploys (user, by hand)
+
+1. Settings → Actions → Runners → New self-hosted runner → Linux, x64. Run the commands it shows as `bot` in `/home/bot/actions-runner`. At the labels prompt, add `trading-box`. Install it as a service from that folder: `sudo ./svc.sh install bot && sudo ./svc.sh start`.
+2. Install the guard hook. It's owned by root, so the runner's user can't change it:
+   ```sh
+   sudo mkdir -p /opt/runner-hooks
+   sudo tee /opt/runner-hooks/only-prod-deploy.sh > /dev/null <<'EOF'
+   #!/bin/sh
+   # Refuse every job except deploy.yml running for a push to prod.
+   if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF" = "refs/heads/prod" ] &&
+      [ "$GITHUB_WORKFLOW_REF" = "andyj-wallace/Automated-Trading-Bot/.github/workflows/deploy.yml@refs/heads/prod" ]; then
+     exit 0
+   fi
+   echo "Refused: this runner only runs deploy.yml for pushes to prod." >&2
+   exit 1
+   EOF
+   sudo chmod 755 /opt/runner-hooks/only-prod-deploy.sh
+   echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/runner-hooks/only-prod-deploy.sh" | sudo -u bot tee -a /home/bot/actions-runner/.env
+   cd /home/bot/actions-runner && sudo ./svc.sh stop && sudo ./svc.sh start
+   ```
+3. Drill: push a throwaway branch (rulesets cover only `master` and `prod`) with a workflow whose job has `runs-on: [self-hosted, trading-box]` and runs `touch /tmp/runner-guard-breached`. Expected: the job fails during setup with the "Refused" message, and `/tmp/runner-guard-breached` doesn't exist on the box. Delete the branch afterwards.
+
+Done when the drill passes and the runner shows "Idle" under Settings → Actions → Runners. The hook only fails closed: if a variable it checks were missing, every job would be refused, and task 7 would show it.
+
+### 7. [ ] First release and drills (user and implementer)
+
+1. Outside market hours, open a pull request from `master` into `prod` and merge it. Deploy runs `publish`, then `deploy`.
+   - If `deploy` can't pull the images, that's because new GHCR packages may start private. Go to GitHub → profile → Packages → `trading-bot-backend` and `trading-bot-frontend` → Package settings → Change visibility → Public, then use "Re-run failed jobs". The images contain only the public source: CI builds them from a clean checkout, and `.dockerignore` excludes `.env` files.
+   - Approve the Gateway login in IBKR Mobile. The job log shows the version line, `database`, `redis` and `engine` ok, and "PAUSED".
+2. On the box, run `scripts/backup.sh` and confirm it writes a dump and an audit-log copy. If the copy fails because `audit.log` doesn't exist yet, make that step skip a missing file with a message.
+3. During market hours, merge a small change into `prod`. The `deploy` job fails with the market-hours message. After the close, "Re-run failed jobs" deploys it.
+4. On the box as `bot`, run `scripts/bot.sh rollback`. `/health` shows the previous version and the checks pass. Re-run the latest Deploy job to return to the current version.
+5. Reboot the box. All five containers and the runner come back by themselves, and `scripts/bot.sh status` shows the broker connected (approve in IBKR Mobile if asked).
+6. Add the backup cron line from DEPLOYMENT.md section 6 to `bot`'s crontab, with the path `/opt/trading-bot` (the box runs on ET).
+7. Run `scripts/bot.sh resume` once satisfied.
+
+Done when all seven pass. GitHub emails the user about failed workflow runs, so a failed deploy is noticed without extra alerting.
+
+### 8. [ ] Docs
+
+- `DEPLOYMENT.md`:
+  - Opening: the backend and frontend images come from GHCR, built by `deploy.yml`, and merging into `prod` deploys. Add `deploy`, `rollback`, `pause` and `resume` to the `scripts/bot.sh` command list.
+  - Section 1: box setup (task 1), the runner (task 6), and the first release through `prod`.
+  - Section 3: retitle it "The host". The Linux box comes first. Keep the Mac bullets as a fallback, and delete the "Moving to an always-on Linux server later" bullet.
+  - Section 7: release flow. A pull request into `master` passes CI. After the close, a pull request from `master` into `prod` deploys. Read the Deploy job log, do the section 5 checks, then run `scripts/bot.sh resume`. Changes to `ib-gateway`, `db` or `redis` need `docker compose -f docker-compose.prod.yml --env-file .env.prod up -d <service>` by hand, outside market hours.
+  - Section 8: `scripts/bot.sh rollback`, what it does, and why reverting `prod` isn't the way back. Keep the manual restore steps for when it fails. Database changes must keep working with the previous release's code (add columns; don't rename or drop them in the same release).
+- `README.md`: one line on the release flow, wherever CI is described.
+- `AGENTS.md`: in Architecture notes, one sentence on `deploy.yml` and the `prod` branch. Also state that `master` and `prod` accept changes only through pull requests with green CI.
+
+### 9. Optional hardening (any order)
+
+- [ ] **Heartbeat** (alerts you when the whole box goes silent). Create a free healthchecks.io check, then add a cron line for `bot` every 5 minutes: `docker inspect -f '{{.State.Health.Status}}' trading-bot-backend-1 | grep -q healthy && curl -fsS -m 10 --retry 3 https://hc-ping.com/<uuid> > /dev/null`.
+- [ ] **Off-host backup copy.** A nightly `rsync -a backups/ <destination>/`. Never use `--delete`: a wiped source would wipe the copy too.
+- [ ] **Pin CI's TimescaleDB** to `2.26.1-pg15`. `ci.yml` is do-not-touch, so this needs the user's OK. The deploy smoke test already uses the pinned version.
+- [ ] **Make the repo private.** This is the strongest protection for the runner. If you do it, keep the packages private and run `docker login ghcr.io` as `bot` with a classic token that has only `read:packages`.
+
+Not bugs:
+- Images are tagged by commit (`sha-…`). `prod`'s history is the release history; there are no version tags.
+- A `deploy` job that fails during market hours is the guard working.
+- The runner refusing jobs from any other workflow, event or branch is the hook working.
+- `rollback` goes back one version only. It leaves `prod` at the bad commit until the next release.
+- Commits from before tasks 3-5 have no images.
+
 ## Before live money (in order)
 
 Everything here runs on the paper account. Settings are in `.env.example`; terms are explained in the README's Growth mode section.
