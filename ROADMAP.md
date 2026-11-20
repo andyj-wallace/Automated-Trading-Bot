@@ -17,6 +17,7 @@ How it fits together:
 - `scripts/bot.sh rollback`, run on the box, returns to the previous version.
 
 Decisions already made (don't revisit):
+- **`rollback` is the one deliberate use of `--force`.** It always skips the market-hours guard, because it is run by hand on the box to undo a bad release, possibly during the day. Entries stay paused (the pause lives in Redis), so skipping the guard doesn't start trading. Workflows never pass `--force`.
 - **The box's runner only ever runs `deploy.yml` for pushes to `prod`.** The repo is public. Any workflow can ask for a self-hosted runner by its labels, including one added in an outsider's pull request, and branch rules don't stop that because pull-request workflows run before any merge. A pre-job hook on the box (task 6) refuses every other job. GitHub runs the hook after a job is assigned and before its first step, and a non-zero exit fails the job without running it. Runner groups, which could restrict workflows, exist only for organizations.
 - **Deploys never recreate `ib-gateway`, `db` or `redis`.** Recreating the Gateway forces a new login and possibly an IBKR Mobile approval. Changes to those three services are applied by hand outside market hours (DEPLOYMENT.md section 7).
 - **Deploys leave automated entries paused.** The user resumes after the DEPLOYMENT.md section 5 checks. Until AR-03 lands, startup keeps trading after a failed reconciliation.
@@ -57,6 +58,8 @@ Done when `docker run --rm hello-world` works as `bot` after a reboot, without a
    - Enforcement: Active. Target branches: `master` and `prod`. Bypass list: empty.
    - Rules: Restrict deletions; Block force pushes; Require a pull request before merging, with 0 required approvals (GitHub doesn't let you approve your own pull request).
    - Require status checks to pass: `Backend (ruff + pytest)`, `Frontend (tsc + eslint)` and `Docker images build`.
+
+   `ci.yml` runs its `pull_request` trigger only for `main` and `master`. A pull request into `prod` gets its three required checks from the `push` run on the same commit, which `master` already had. If `ci.yml` ever loses its `push: ["**"]` trigger, `prod` pull requests can't merge.
 
    From then on nothing lands on `master` or `prod` without a pull request whose CI is green. That includes the user's own commits and the agent pipeline: work on a branch and open a pull request.
 3. Settings → Actions → General:
@@ -287,6 +290,8 @@ jobs:
         run: cd /opt/trading-bot && scripts/bot.sh deploy "${{ needs.publish.outputs.tag }}"
 ```
 
+The smoke test uses `BROKER=mock` and `ENVIRONMENT=development`, so it proves migrations and startup, not that the production configuration boots (the production-only startup checks in `main.py` aren't exercised).
+
 If the backend needs another variable to start in the smoke test, add it with a dummy value, never a real secret.
 
 Done when the file passes review in its pull request into `master`. The first real run is task 7.
@@ -309,11 +314,19 @@ Done when the file passes review in its pull request into `master`. The first re
    EOF
    sudo chmod 755 /opt/runner-hooks/only-prod-deploy.sh
    echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/runner-hooks/only-prod-deploy.sh" | sudo -u bot tee -a /home/bot/actions-runner/.env
+   sudo chown root: /home/bot/actions-runner/.env && sudo chmod 644 /home/bot/actions-runner/.env
    cd /home/bot/actions-runner && sudo ./svc.sh stop && sudo ./svc.sh start
    ```
-3. Drill: push a throwaway branch (rulesets cover only `master` and `prod`) with a workflow whose job has `runs-on: [self-hosted, trading-box]` and runs `touch /tmp/runner-guard-breached`. Expected: the job fails during setup with the "Refused" message, and `/tmp/runner-guard-breached` doesn't exist on the box. Delete the branch afterwards.
+3. Check the hook accepts the real case. Run it by hand with the variables a `prod` deploy would have; it must exit 0:
+   ```sh
+   GITHUB_EVENT_NAME=push GITHUB_REF=refs/heads/prod \
+     GITHUB_WORKFLOW_REF=andyj-wallace/Automated-Trading-Bot/.github/workflows/deploy.yml@refs/heads/prod \
+     /opt/runner-hooks/only-prod-deploy.sh; echo $?
+   ```
+   Then run it with `GITHUB_EVENT_NAME=pull_request`; it must exit 1. This doesn't prove GitHub passes those variables to the hook; task 7 does.
+4. Drill: push a throwaway branch (rulesets cover only `master` and `prod`) with a workflow whose job has `runs-on: [self-hosted, trading-box]` and runs `touch /tmp/runner-guard-breached`. Expected: the job fails during setup with the "Refused" message, and `/tmp/runner-guard-breached` doesn't exist on the box. Delete the branch afterwards.
 
-Done when the drill passes and the runner shows "Idle" under Settings → Actions → Runners. The hook only fails closed: if a variable it checks were missing, every job would be refused, and task 7 would show it.
+Done when the manual hook check and the drill pass and the runner shows "Idle" under Settings → Actions → Runners. The hook only fails closed: if a variable it checks were missing, every job would be refused, and task 7 would show it.
 
 ### 7. [ ] First release and drills (user and implementer)
 
@@ -367,13 +380,13 @@ The November 13 review passed 823 backend unit tests, backend lint, frontend lin
 - [ ] **P1 / AR-05 — Centralize required data and account checks.** Move mandatory spread/liquidity/freshness checks into shared entry authorization. Preserve source/receipt timestamps and data mode; reject missing required quotes and account facts rather than assuming safe values. Verify settled funds and the broker/account's applicable restrictions. Done when manual and automated entries receive the same deterministic decisions for missing, stale, delayed or invalid required inputs.
 - [ ] **P1 / AR-06 — Persist authorization and dispatch durably.** Replace logging-only audit success with checked durable proposal, authorization and order-intent records plus a transactional outbox. Record fills and reconciliation outcomes incrementally, with versioned input references. Preserve existing immutable audit columns and append subsequent facts. Done when failed mandatory persistence prevents dispatch and restart/retry recovers intent without duplicate execution; exercise actual handler I/O failure, not only a mocked logger method.
 - [ ] **P1 / AR-07 — Budget all-in loss and actual exposure.** Include estimated entry/exit friction and execution headroom when sizing within the existing fixed 1% ceiling. Maintain current exposure separately from immutable approved risk, including adverse fills and late executions. Done when the $1,000/$10 planned-risk/$1.34 friction case is resized or rejected to meet the all-in modeled budget; report gap risk separately. Entry restrictions must never block an exit because of fees, settlement or day-trade rules.
-- [ ] **P2 / AR-10 — Report broker outcomes accurately.** `scheduler_submit.py` records SUBMITTED whenever submission returns without raising, including REJECTED/ERROR results; the manual route can return HTTP 201 for the cancelled trade. Inspect the broker outcome and expose accepted, working, partial, rejected, unknown and filled states to the signal log and API/UI. Done when clean broker rejection and uncertain submission produce truthful outcomes without weakening successful-order behavior.
+- [ ] **P2 / AR-10 (broker outcomes) — Report broker outcomes accurately.** `scheduler_submit.py` records SUBMITTED whenever submission returns without raising, including REJECTED/ERROR results; the manual route can return HTTP 201 for the cancelled trade. Inspect the broker outcome and expose accepted, working, partial, rejected, unknown and filled states to the signal log and API/UI. Done when clean broker rejection and uncertain submission produce truthful outcomes without weakening successful-order behavior.
 
 ### 1. Make historical and paper validation representative
 
 - [ ] **P1 / AR-08 — Share simulation and execution policy.** In `backtesting/engine.py`, `portfolio_engine.py` and `backtesting_helpers.py`, apply aggregate capital/cash reservations, growth-universe and position constraints, settlement and relevant exit rules, including signal exits. Advance portfolio slots on a shared calendar. Done when two simultaneous 40-share/$25 positions cannot consume about $2,001 on $1,000, and matching simulated/execution proposals produce explainable equivalent authorization decisions.
 - [ ] **P1 / AR-09 — Add an isolated virtual paper ledger.** Keep `TRADING_CAPITAL_LIMIT`'s existing sizing-cap meaning; add explicit experimental cash/equity accounting for small-account certification. Include realized/unrealized P&L, fees, reservations and settlement. Done when a $100 experiment losing $10 has $90 of experimental equity even if broker paper equity remains near $1 million, and subsequent sizing/cash checks use that ledger.
-- [ ] **P2 / AR-10 — Correct metrics and chronological validation.** Build marked-to-market equity returns for drawdown and Sharpe in `backtesting/metrics.py`. Extend `walk_forward.py` with rolling evaluations, prior-history warm-up, extra-symbol history and consistent cost settings. Separate training/tuning from untouched evaluation data; use purging/embargo where overlapping labels require it. Done when sparse samples are inconclusive, regime-filter inputs are present, and statistics use their documented sampling period.
+- [ ] **P2 / AR-10 (metrics) — Correct metrics and chronological validation.** Build marked-to-market equity returns for drawdown and Sharpe in `backtesting/metrics.py`. Extend `walk_forward.py` with rolling evaluations, prior-history warm-up, extra-symbol history and consistent cost settings. Separate training/tuning from untouched evaluation data; use purging/embargo where overlapping labels require it. Done when sparse samples are inconclusive, regime-filter inputs are present, and statistics use their documented sampling period.
 
 ### 2. Validate growth mode on paper
 
