@@ -106,7 +106,7 @@ class AlphaVantageClient:
         self._clock = clock
 
     async def fetch(self, symbol: str, may_request: MayRequest) -> FetchResult:
-        """Fetch dividends for `symbol`, retrying transport errors up to twice within budget."""
+        """Fetch dividends for `symbol`, retrying a transport error once within budget."""
         try:
             return await self._fetch(symbol, may_request)
         except Exception as exc:

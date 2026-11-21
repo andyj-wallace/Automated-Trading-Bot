@@ -133,6 +133,19 @@ def test_special_then_normal_payment_is_none():
     assert detect_cut(events, date(2026, 11, 20)) == CutStatus.NONE
 
 
+def test_lasting_raise_across_monthly_to_quarterly_is_none():
+    dates = [date(2026, 1, 1), date(2026, 1, 31), date(2026, 3, 2), date(2026, 4, 1),
+             date(2026, 6, 30), date(2026, 9, 28)]
+    events = series(["1.00", "1.00", "1.00", "1.00", "3.00", "3.00"], dates)
+    assert detect_cut(events, date(2026, 10, 1)) == CutStatus.NONE
+
+
+def test_latest_high_amount_is_kept_and_not_a_cut():
+    events = series(["1.00"] * 4, Q) + [Ev(N1, D("3.00"))]
+    # If the 3.00 were dropped as special, the 2026-08-14 payment would be overdue (OMISSION).
+    assert detect_cut(events, date(2027, 1, 15)) == CutStatus.NONE
+
+
 def test_omission_after_grace():
     assert detect_cut(series(["1.00"] * 4, Q), date(2027, 1, 15)) == CutStatus.OMISSION
 

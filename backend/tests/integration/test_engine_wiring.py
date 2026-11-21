@@ -58,6 +58,7 @@ async def trading_engine():
 
     settings = Settings()
     settings.scheduler_interval_seconds = 3600
+    settings.alpha_vantage_api_key = ""  # a key in .env must not make real Alpha Vantage calls
     eng = TradingEngine(
         settings,
         clock=lambda: FIXED_NOW,

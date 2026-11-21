@@ -60,6 +60,7 @@ def _build_engine(**kw):
 
     settings = Settings()
     settings.scheduler_interval_seconds = 3600
+    settings.alpha_vantage_api_key = ""  # a key in .env must not make real Alpha Vantage calls
     eng = TradingEngine(
         settings,
         is_market_open=lambda: True,

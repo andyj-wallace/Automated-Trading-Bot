@@ -178,6 +178,33 @@ async def test_failed_fetch_stores_nothing_but_counts_against_budget():
     assert cache.data[_key(date(2026, 11, 2))] == "1"
 
 
+def _timeout(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadTimeout("t", request=request)
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        lambda r: httpx.Response(200, json={"Information": "rate limit"}),
+        lambda r: httpx.Response(200, text="<html>"),
+        lambda r: httpx.Response(503),
+        _timeout,
+    ],
+    ids=["no_data_list", "non_json", "http_error", "timeout"],
+)
+async def test_failed_reply_writes_nothing_and_keeps_last_fetched(handler):
+    clock = Clock(_at(2026, 11, 20, 10, 0))
+    cache, store = FakeCache(), Store()
+    earlier = _at(2026, 11, 1, 10, 0)
+    store.last["AAA"] = earlier
+    job = _job(_real_client(handler), clock, cache, store, symbols=["AAA"])
+
+    await job.run(date(2026, 11, 20))
+
+    assert store.rows == {}
+    assert store.last == {"AAA": earlier}
+
+
 async def test_no_client_makes_no_requests_and_does_not_raise(logs):
     clock = Clock(_at(2026, 11, 2, 10, 0))
     cache, store = FakeCache(), Store()
