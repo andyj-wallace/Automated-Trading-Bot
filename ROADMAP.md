@@ -437,6 +437,116 @@ Proposed work toward the supplied hybrid architecture. The [review](docs/archite
 
 Fill accounting and reconciliation are done; the order-state and fill-journal contract lives in `brokers/base.py` and `trade_fills`. For Claude's handoff, another developer can own readiness and authorization; agree on that contract before editing shared execution modules. These are proposed assignments, not evidence of a delivered handoff.
 
+## Strategy families (after the validation gates)
+
+Implements the strategy ideas in the Backlog below. Start only after "Before live money" sections 0 and 1 are done: a new strategy is worthless if backtests can't be trusted. Everything ships **disabled** (seeding already creates a disabled row per registered type) and is enabled on paper only after its backtest passes.
+
+Order is by what each family needs. Phases 1 and 2 fit the engine as it is. Phases 3 and 4 need things that are forbidden today, so each starts with a decision from the user and stops there until it is made.
+
+Rules for all phases:
+- A strategy is one file in `backend/app/core/strategy_engine/` that subclasses `BaseStrategy`, calls `registry.register("<name>", Cls)` at the bottom, and is imported in `builtin.py`. Copy the shape of `trend_pullback.py`: config from `config.get(...)`, `ValueError` for bad config in `__init__`, `get_config_schema()` with a default for every key, `min_history_bars()`, `required_extra_symbols()`, `_hold()`, and a docstring listing the rules.
+- Decide from completed daily bars (`bars[-1]` is the last completed session) and enter the next day, like Trend Pullback, so live and backtest match.
+- Long only. `submit_stop_to_broker=True`. `take_profit_price` is only a strategy suggestion (the monitor handles it; never sent to the broker). Exits that are not stops use `action="SELL"` while `open_position` is true; the scheduler turns that into a `SIGNAL_EXIT`.
+- Reuse `indicators.py` (`sma`, `atr`, `avg_dollar_volume`) and `filters.py` (`regime_ok`, `volatility_ok`). New shared helpers go there, not in the strategy file.
+- Prices are `Decimal` built from `str`. Quantity stays `int` and comes from `RiskCalculator`.
+- Tests in `backend/tests/unit/strategy/test_<name>.py`, using the helpers in that folder's `conftest.py`. Cover: each entry rule failing on its own gives HOLD; the all-pass case gives BUY with the documented stop and target; insufficient history gives HOLD; bad config raises `ValueError`; no look-ahead (appending a future bar doesn't change the signal for earlier bars).
+- Add the strategy to `test_min_history_bars.py`, and update README's strategy list in the same change.
+- Run `graphify update .` after code changes.
+
+### Known limit to fix first
+
+`scheduler_data.py` loads only `_HISTORY_LOOKBACK_DAYS = 365` calendar days of daily bars, about 250 sessions. That covers a 200-day average and a 52-week high, but not an **all-time high**. Phase 1 handles this by approximating "all-time high" with a longer window, set per strategy. Task 1.1 makes the lookback a strategy property.
+
+### Phase 1. Rocket breakout and long momentum (no new infrastructure)
+
+#### 1.1 [ ] Let a strategy ask for more history
+
+Files: `strategy_engine/base.py`, `scheduler_data.py`, `core/jobs/` (bar refresh), tests under `tests/unit/strategy_engine/`.
+
+1. `BaseStrategy.history_days(self) -> int` defaults to `0` (meaning "use the scheduler default of 365").
+2. The scheduler takes the largest `history_days()` among enabled strategies for a symbol and passes it as the lookback in `_fetch_db_bars`. The bar cache key includes the lookback.
+3. Check whether the bar refresh job stores that much history for each symbol. If not, extend its backfill by the same amount, only for symbols an enabled strategy needs it for.
+4. Tests: default unchanged at 365; a strategy asking for 1500 gets 1500; a symbol with less history than asked still returns what exists.
+
+Done when existing strategies see the same bars as before and a test shows a longer window arriving.
+
+#### 1.2 [ ] `rocket_breakout`
+
+Source: the Backlog "Rocket stocks" section. Config (all with defaults, all `Decimal` from `str`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `high_lookback` | 252 | Sessions for the "52-week high" |
+| `ath_lookback` | 1250 | Sessions for the "all-time high" approximation (about 5 years); `0` turns this rule off |
+| `fast_period` / `slow_period` | 50 / 200 | Moving averages |
+| `volume_period` | 50 | Prior average volume window |
+| `volume_surge` | 1.5 | Breakout bar volume must be at least this multiple |
+| `max_gap_pct` | 0.05 | HOLD if the open gapped above the prior close by more than this |
+| `max_extension_pct` | 0.03 | HOLD if current price is above the breakout level by more than this |
+| `atr_period` / `stop_atr_mult` / `max_stop_atr` | 14 / 2.0 / 3.5 | Stop = entry - mult * ATR; HOLD if wider than max |
+| `trail_atr_mult` | 3.0 | Exit when close falls below highest close since entry minus this * ATR |
+| `failed_breakout_days` / `failed_breakout_buffer_pct` | 5 / 0.0 | Exit if within N sessions of entry the close is back below the breakout level |
+| `max_holding_days` | 60 | Time exit |
+| `regime_symbol` | SPY | Same regime filter as Trend Pullback; `""` turns it off |
+
+Entry (all must hold, else HOLD):
+1. Breakout: `close[-1]` is above the highest high of the `high_lookback` sessions **before** `bars[-1]` (exclude the bar itself, so no look-ahead), and above the same for `ath_lookback`.
+2. Trend: `close[-1] > SMA(fast) > SMA(slow)`.
+3. Volume: `volume[-1] >= volume_surge * mean(volume of the volume_period sessions before bars[-1])`.
+4. No gap or chase: both limits above.
+5. Regime and `avg_dollar_volume` checks as in Trend Pullback and the scheduler's existing liquidity gate.
+
+Stop and sizing as in the table. No take profit: winners are cut by the trailing exit. Exits (SELL while `open_position`): trailing exit, failed breakout, `max_holding_days`. The trailing and failed-breakout exits need the entry date and breakout level, which a stateless strategy doesn't have. Recompute them from bars: the breakout level is the highest high of the `high_lookback` sessions before the first session in the last `failed_breakout_days` where the entry rules held. If that is not reproducible from bars alone, drop the failed-breakout exit and say so in the docstring; don't add strategy state.
+
+Tests: add the standard set plus: a gap above `max_gap_pct` gives HOLD; volume at 1.49x gives HOLD and 1.5x gives BUY; a high set inside the lookback but on `bars[-1]` itself doesn't count as "prior"; `ath_lookback=0` skips that rule; stock splits not adjusted in the bars produce a HOLD or are documented as out of scope (check what `historical.py` stores first).
+
+Done when the tests pass and `backtest_run` on the Growth universe ETFs and five large caps runs without error. Report trade count; a handful of trades is "inconclusive", not a pass.
+
+#### 1.3 [ ] `momentum_long`
+
+Before writing it, read `stock_trend.py` and `trend_pullback.py` and write down in the docstring what this does that they don't. If the only difference is the ranking, build the ranking and not another entry rule. Proposed difference: **relative strength**.
+
+- Score = total return over `lookback_days` (default 126) skipping the most recent `skip_days` (default 5), compared with the same score on `regime_symbol`'s bars (`extra_bars`). Enter only when the symbol's score beats the benchmark's by `min_rs_margin` (default 0.05) and the score is positive.
+- Plus: close above `SMA(slow)`, `avg_dollar_volume` above the existing floor, volatility in range (`volatility_ok`).
+- Stop: `stop_atr_mult` (2.5) x ATR below entry. Trailing exit and `max_holding_days` (90) as in rocket. Failed-trend exit: close below `SMA(slow)`.
+- Cross-sectional ranking ("top 10% of the universe") is out of scope: it needs all symbols at once, which is the roadmap's "Deterministic ranking and allocation" item. Say so in the docstring.
+
+Tests: the standard set plus relative strength below the margin gives HOLD, and the skip window excludes recent bars.
+
+Done when tests pass and the docstring states the difference from `trend_pullback` in two lines.
+
+#### 1.4 [ ] Compare on paper-grade evidence
+
+No new code if the backtest engine already reports it. Run `rocket_breakout`, `momentum_long`, `trend_pullback` and buy-and-hold on the same symbols and dates, fees on, 3 starting balances ($100, $300, $1,000), with the walk-forward split from section 1 of "Before live money". Record the numbers in the pull request, not in a doc. Done when each strategy has an out-of-sample result at the capital it would run at, or a recorded reason it can't (too few trades).
+
+### Phase 2. Dividend investing (needs data, and one rule bent)
+
+This family holds for months and buys in pieces, which breaks two engine rules: one active trade per symbol, and a stop on every trade. **Decision for the user before any code:** keep dividend holdings outside the trade/stop machinery as a separate "holdings" ledger (recommended: simplest, can't weaken the risk rules, but needs its own tables and reconciliation), or extend trades to allow several lots per symbol. Don't start until this is answered.
+
+Tasks, in order. Each is a separate pull request.
+
+1. [ ] **Tax research.** Done as the Backlog describes: a short written answer with official sources and the date, pasted into the pull request. No code.
+2. [ ] **Dividend data.** Pick the source first (ask the user; an IBKR dividend feed, or a free API, which is a new dependency or key). Store declared amount, ex-date, record date, pay date and frequency in a new table (migration `0013`, hand-written, working `downgrade()`). A repository in `db/repositories/`, a daily refresh in `core/jobs/`, and helpers `trailing_yield`, `forward_yield` (excludes special dividends) in a new `core/dividends.py`. Tests use fake rows; no network in tests.
+3. [ ] **Detect cuts.** A pure function over the dividend history: confirmed cut = the regular amount per period falls after adjusting for frequency changes and excluding special dividends and splits; omission = a missed expected payment past a grace period. Tests for each false positive named in the Backlog (frequency change, special, split, ETF variability).
+4. [ ] **Recurring buys.** A monthly job that buys whole shares with available cash only: `NOBL` one share, or one-twelfth of a stock allocation per month. Unused cash carries forward. Ladder mode has explicit price levels and a total cap; a falling price never buys past the cap. All orders go through the existing entry authorization and the 10% portfolio cap.
+5. [ ] **Exit rules.** Exit an individual company the next session after a confirmed cut or omission; never exit on price or technicals. ETFs are never exited by the cut rule. Exits use the existing close path, so they are never blocked by growth mode or fees.
+6. [ ] **Validation.** Backtests need historical Dividend Aristocrats membership and dividend events; if that data isn't available, say so and stop at paper. Report income, yield on cost, total return and drawdown separately.
+
+### Phase 3. Short momentum (blocked on the user)
+
+`.claude/CLAUDE.md` says "Never implement short selling". Lifting it is the user's call and changes risk sizing, P&L, reconciliation, the circuit breaker and the exit rules. Ask. If the answer is yes, write a separate plan first covering `TradeDirection`, `RiskCalculator` for shorts (stop above entry), borrow availability and fees, buy-to-cover exits that are never blocked, gap-through-stop handling and squeeze limits. Only then build `momentum_short` from the Backlog rules. Until then, this phase is "do nothing".
+
+### Phase 4. Options: iron condor, covered calls, cash-secured and covered puts (blocked on the user)
+
+None of this exists: no options data feed, contracts, multi-leg orders or margin model, and `BaseBroker` has no options methods. Covered puts also need Phase 3. **Decisions for the user:** whether to do options at all on a small account (contract multiples and fees make most of these ineligible below a few thousand dollars; check with the cost model first), and where options data comes from (IBKR's feed, which may need a market-data subscription, or other).
+
+If yes, write a separate plan. Suggested order: (1) data feed and contract model, no trading; (2) cash-secured puts, the simplest because the collateral is just reserved cash; (3) covered calls, adding share-coverage reservation and assignment handling; (4) iron condor, adding multi-leg orders and defined-risk sizing; (5) covered puts last. Each stays paper-only until reconciled against broker assignments and expirations.
+
+### Not bugs
+- Strategies that return HOLD for weeks on a small account are the filters working.
+- `rocket_breakout` skipping a gap-up is intended, not a missed trade.
+- "All-time high" is approximated by `ath_lookback` until the history store goes deeper.
+
 ## Optional
 
 Schedule hosting expansion and additional strategy families after the deterministic baseline and validation gates. Reuse infrastructure and set operating-cost limits appropriate to experimental capital.
@@ -447,6 +557,8 @@ Schedule hosting expansion and additional strategy families after the determinis
 - [ ] **Repository tidy-up.** Move `test_ibkr_connection.py` to `backend/scripts/check_gateway.py`. Split `requirements-dev.txt` (pytest, pytest-asyncio, pytest-cov) from the runtime requirements; the Dockerfile installs runtime only, CI installs both.
 
 ## Backlog
+
+The strategy families below (dividend, momentum, rocket, covered calls, puts, iron condor) are planned in "Strategy families" above; this list holds the research rules that plan refers to.
 
 - **Options (iron condor):** options data feed, multi-leg orders and database models, spread-based risk calculation.
 - **Mobile PWA:** manifest and service worker, responsive layout, web push (needs HTTPS).

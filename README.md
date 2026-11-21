@@ -10,7 +10,7 @@ It runs on an IBKR **paper account** (simulated money). The current MVP uses rul
 
 *Screenshots use sample data.*
 
-**Docs:** this README (what it does, how to run it locally) · [DEPLOYMENT.md](DEPLOYMENT.md) (running and operating the full stack) · [ROADMAP.md](ROADMAP.md) (open work) · [Architecture review](docs/architecture-review.md) (leadership alignment, evidence, and priorities).
+**Docs:** this README (what it does, how to run it locally) · [DEPLOYMENT.md](DEPLOYMENT.md) (running and operating the full stack) · [PRODUCT.md](PRODUCT.md) (audience and design principles) · [ROADMAP.md](ROADMAP.md) (open work) · [Architecture review](docs/architecture-review.md) (leadership alignment, evidence, and priorities).
 
 ## Stack
 
@@ -54,7 +54,7 @@ To start trading on paper: add symbols on the Watchlist page, then enable a stra
 
 IBKR has no API keys. The bot talks to IB Gateway, IBKR's desktop app, over a local socket, and the Gateway holds the logged-in session.
 
-The Gateway runs in Docker and logs in by itself with the paper username and password from `.env`, restarting daily. You only approve a login in IBKR Mobile about once a week. Quit the native Gateway app first: same login, same port.
+The Gateway runs in Docker and logs in by itself with the paper username and password from `.env`, restarting daily at `IB_AUTO_RESTART_TIME`. IBC inside the image enters the credentials. You only approve a login in IBKR Mobile about once a week; see the [approval and recovery procedure](DEPLOYMENT.md#2-the-weekly-ibkr-mobile-approval). Quit the native Gateway app first: IBKR allows one session per login, and both apps use the same port.
 
 ```bash
 docker compose --profile ibkr up -d ib-gateway   # development: API on 127.0.0.1:4002
@@ -66,7 +66,7 @@ scripts/bot.sh up                                # full stack, see DEPLOYMENT.md
 | On the host (`uvicorn`) | `127.0.0.1` | `4002` |
 | In `docker-compose.yml` | `ib-gateway` | `4004` |
 
-Live ports (4001 native, 4003 Docker) are never used, and the bot refuses to trade if the Gateway is logged into a non-paper account. When the Gateway needs you, the dashboard banner and `scripts/dev.sh status` say what to do. Each connection needs its own `IBKR_CLIENT_ID`: the app uses `1`, so give test scripts another number.
+Never set `IBKR_TRADING_MODE=live`. Live ports (4001 native, 4003 Docker) are never used, and the bot refuses to trade if the Gateway is logged into a non-paper account. When the Gateway needs you, the dashboard banner and `scripts/dev.sh status` say what to do. Each connection needs its own `IBKR_CLIENT_ID`: the app uses `1`, so give test scripts another number.
 
 ## How a trade happens
 
@@ -80,16 +80,26 @@ Reconciler compares the bot's trades with IBKR's positions every 2 minutes
 1. On NYSE trading days, 09:45-15:45 ET, the scheduler runs each enabled strategy every 60 seconds on its assigned symbols. Creating or changing a strategy while the bot runs downloads 2 years of daily price history for its symbols and any extra symbols it needs (for example SPY, which tracks the whole US market, for the market filter), and the scheduler uses the new bars the same day. The same applies to a history download started from the Watchlist page.
 2. Each strategy, symbol, day and action can act only once.
 3. The risk checks below decide whether to trade and how many shares to buy. Quantities are always whole shares: IBKR's API rejects fractional stock orders.
-4. After the fill, the bot attempts to place a stop order at IBKR in case it goes offline (`BROKER_PROTECTIVE_STOPS`). Confirm that the broker accepted it; placement failure currently alerts without blocking further entries. The profit target stays inside the bot.
+4. After the fill, the bot attempts to place a stop order at IBKR in case it goes offline (`BROKER_PROTECTIVE_STOPS`). Confirm that the broker accepted it; placement failure currently alerts without blocking further entries. The profit target stays inside the bot. When the Gateway is logged out, the bot cannot trade and its internal stop monitor receives no prices. With `BROKER_PROTECTIVE_STOPS=true` (the default), only an accepted, working stop provides broker-side protection during an outage; verify its quantity and state directly at IBKR rather than relying on a setting or saved order ID.
 5. The trade closes on its stop, trailing stop, target, time limit (`STALE_TRADE_MAX_DAYS`), day-trade deadline, or your manual close or flatten. These act only while the market is open, so an overnight gap fills at the next open. A strategy can also close its own trade with a sell signal, called a signal exit (`SIGNAL_EXIT`): when the strategy that opened the trade produces a SELL, for example `moving_average`'s "death cross" when the 50-day average falls below the 200-day. Signal exits do not run while trading is paused. A SELL never opens a short position (a bet that the price will fall), and it is ignored when there is no open trade, or when the trade was opened by another strategy or manually. If a signal exit fails, or the market turns out to be closed, the strategy tries again on its next run the same day while the trade is still open, and the first failed attempt that day sends a `CLOSE_FAILED` alert.
 
 **Trailing stop:** a stop that moves up as the price rises, locking in more of the gain. The raised stop is saved with the trade whenever it rises by at least 0.1R, so it survives a backend restart. If saving fails, for example because the database is down, the bot waits 5 seconds before trying again; the stop itself keeps working the whole time. R is the per-share risk: entry price minus the original stop. The stop order already resting at IBKR is not moved.
 
-**Flatten** (the "Sell everything" button) is best effort, not a guarantee. It pauses trading, waits up to 30 seconds for strategy buy orders that are being sent, and cancels buy orders still working at IBKR. A buy that filled only partly has its unfilled rest cancelled. Flatten then waits until IBKR reports that cancel as finished, counts the shares that really bought, and sells them. Finally it closes all open trades, including any whose buy remainder was still working. One limit remains: an entry still being sent to IBKR after the 30-second wait can still open.
+## Trading controls
+
+All endpoints below are under `/api/v1`. `GET /trading/status` reports pause state, engine state and broker connection with a "what to do" hint.
+
+- **Pause/resume:** `POST /trading/pause` and `POST /trading/resume`. Pause state survives restarts. Pause stops automated entries and strategy signal exits; manual buys remain possible, while stops, targets and manual closes keep working during market hours. An account-wide entry halt remains planned work.
+- **Close one trade:** `POST /trades/{id}/close` or the UI Close button. Responses: 200 closed, 202 exit pending, 409 not open or market closed, 502 broker failure.
+- **Circuit breaker:** `GET /risk/circuit-breaker`; reset only after understanding why it tripped.
+
+**Flatten** (the "Sell everything" button) uses `POST /trading/flatten` with `{"confirm": "FLATTEN"}`; the UI sends that body silently. Flatten is best effort, not a guarantee. It pauses trading, waits up to 30 seconds for strategy buy orders that are being sent, and cancels buy orders still working at IBKR. A buy that filled only partly has its unfilled rest cancelled. Flatten then waits until IBKR reports that cancel as finished, counts the shares that really bought, and sells them. Finally it closes all open trades, including any whose buy remainder was still working. One limit remains: an entry still being sent to IBKR after the 30-second wait can still open. Inspect every returned outcome and verify broker holdings and terminal order states; HTTP success does not prove the account is flat. Resume manually only after account consistency is established.
+
+### Fills and recovery
 
 **Fills:** a **fill** is shares that IBKR has bought or sold for one of the bot's orders. A **partial fill** means only some of the ordered shares have traded so far. Every fill and every commission (the fee IBKR charges per order) is saved to the fill journal, the `trade_fills` table with one row per IBKR execution, tagged `ENTRY` (the buy), `STOP` (the protective stop) or `EXIT` (the sell).
 
-**Trade status:** `PENDING → SUBMITTED → OPEN → CLOSING → CLOSED`, or `CANCELLED` if it never opened. A trade becomes CLOSED only after all its shares have exited, and never while its buy order is still live at IBKR. Its P&L (profit and loss after fees) includes every fill and every fee; an entry commission that IBKR reports late is picked up. If a buy fills partly, the bot cancels the rest, waits up to 5 seconds for the cancel to finish, opens the trade with the shares that filled, and places a stop for exactly those shares. If IBKR has not confirmed the cancel, the `ENTRY_REMAINDER_WORKING` alert is sent. A protective stop that sells only some shares leaves the rest still managed, and the bot sells them later. Entry submission attempts to write before/after records to `logs/audit.log`. The file is opened in append mode and never rotated; durable audit-write enforcement remains open work. The review's other [confirmed execution and recovery gaps](docs/architecture-review.md#findings) are still open too, so check them before relying on trade status or reconciliation as proof that all shares are accounted for.
+**Trade status:** `PENDING → SUBMITTED → OPEN → CLOSING → CLOSED`, or `CANCELLED` if it never opened. A trade becomes CLOSED only after all its shares have exited, and never while its buy order is still live at IBKR. Its P&L (profit and loss after fees) includes every fill and every fee; an entry commission that IBKR reports late is picked up. If a buy fills partly, the bot cancels the rest, waits up to 5 seconds for the cancel to finish, opens the trade with the shares that filled, and places a stop for exactly those shares. If IBKR has not confirmed the cancel, the `ENTRY_REMAINDER_WORKING` alert is sent. A protective stop that sells only some shares leaves the rest still managed, and the bot sells them later. Entry submission attempts to write before/after records to `logs/audit.log`. The file uses ordinary logging handlers, is opened in append mode and never rotated; never edit it. A failed write can return without failing submission, so durable audit-write enforcement remains open work. The review's other [confirmed execution and recovery gaps](docs/architecture-review.md#findings) are still open too, so check them before relying on trade status or reconciliation as proof that all shares are accounted for.
 
 **Reconciler:** a background check that compares the bot's records with IBKR's positions, orders and executions. It runs every 2 minutes, at startup and after each reconnect. Each run reads IBKR's executions once and journals them. It adopts shares from a partly filled entry and from later fills: `LATE_ENTRY_FILL` is alerted when the entry fills more after the trade opened, and the stop is resized (`PROTECTIVE_STOP_REPLACED`). It compares IBKR's share count with the bot's and sends a `QUANTITY_MISMATCH` alert with kind `DIRECTION` (IBKR holds shares the wrong way, a short position the bot never opens), `MISSING` (fewer shares than the bot expects) or `EXCESS` (more). Each trade and kind alerts at most once per day. The reconciler never places an order to correct a mismatch. It replaces a protective stop that no longer covers the open shares only when IBKR holds at least that many shares in the trade's direction. If IBKR shows no shares but some sales are missing from the journal, it closes the trade, values the missing shares at the last known price and sends `EXIT_FILLS_MISSING`. If the buy order is still live, it cancels the buy and waits for a later run instead of closing. Before closing, it also cancels any stop or sell order still live at IBKR and waits for IBKR to confirm; if one stays live, it sends `CLOSE_FAILED` and keeps the trade open, because that order could otherwise sell shares the account no longer holds. The bot finds its stop and sell orders at IBKR by their order reference, not only by the order ID it saved, so a failed database write cannot leave an order it no longer knows about. Commission reports that arrive after a trade has closed update its journal row, but the trade's P&L is not recalculated.
 
@@ -105,13 +115,13 @@ These apply to entries only. Nothing here can block or delay an exit.
 - **One active trade per symbol.**
 - **Circuit breaker:** a 3% daily realized loss (`DAILY_LOSS_LIMIT_PCT`) halts new entries for the day, and 5 losses in a row (`MAX_CONSECUTIVE_LOSSES`) stop that strategy until you re-enable it. Unrealized-loss and high-water-mark drawdown controls remain open work.
 
-Entry enforcement is currently split between the scheduler, `RiskManager` and `OrderManager`. Missing bid/ask data can pass the scheduler's spread check, and manual entries do not use its spread/liquidity checks. Failed risk-state recovery or reconciliation does not yet establish an entry halt. The shared fail-safe gateway in the architecture review is proposed behavior.
+Entry enforcement is currently split between the scheduler, `RiskManager` and `OrderManager`. Missing bid/ask data can pass the scheduler's spread check, and manual entries do not use its spread/liquidity checks. Failed circuit-breaker recovery, failed or skipped reconciliation, and failed protective-stop placement do not yet establish a shared entry halt. Startup continues into trading loops after a recovery or reconciliation failure. If risk-state recovery, reconciliation or protective-stop placement fails, pause automated entries, avoid manual buys, inspect broker orders and holdings, and investigate before resuming. Treat quantity mismatches as unresolved until checked against broker executions, positions and working orders; OPEN/CLOSED status and reconciliation summaries alone are insufficient. Health and connection status do not establish trading readiness. The shared fail-safe gateway in the architecture review is proposed behavior; its repair target blocks additional exposure while preserving risk-reducing actions.
 
 ## Growth mode (small accounts)
 
-At very small balances, fees can cost more than a trade could reasonably earn. Growth mode adds restrictions while equity is under $2,000 (`GROWTH_MODE_EXIT_EQUITY`); it never loosens the rules above. IBKR Lite has no API access, so the bot pays IBKR Pro fees: **Fixed** $0.005/share, $1 minimum, or **Tiered** $0.0035/share, $0.35 minimum plus exchange fees, both capped at 1% of trade value (rates as of October 2026). Set yours in `COMMISSION_PLAN`.
+The product includes paper experiments with less than $100; this is an operating scenario, not a minimum balance or the growth-mode threshold. At very small balances, fees can cost more than a trade could reasonably earn. Growth mode adds restrictions while equity is under $2,000 (`GROWTH_MODE_EXIT_EQUITY`); it never loosens the rules above. IBKR Lite has no API access, so the bot pays IBKR Pro fees: **Fixed** $0.005/share, $1 minimum, or **Tiered** $0.0035/share, $0.35 minimum plus exchange fees, both capped at 1% of trade value (rates as of October 2026). Set yours in `COMMISSION_PLAN`.
 
-Automated entry checks, in order. Outcomes appear in `GET /api/v1/signals`; broker rejection can currently be mislabeled `SUBMITTED` (see the roadmap).
+Automated entry checks, in order. Outcomes appear in `GET /api/v1/signals`; broker rejection can currently be mislabeled `SUBMITTED`, and manual creation can return HTTP 201 for a cancelled trade (see the roadmap).
 
 | Check | Setting | Rejection |
 |-------|---------|-----------|
@@ -139,7 +149,7 @@ The margin check represents the current implementation. Confirm the broker/accou
 
 These examples are estimates from the configured cost model, using 5 bps slippage per leg. They do not establish a minimum starting balance or a profitable strategy. Actual eligibility depends on price, stop distance, available cash and fees. At $1,000 in the Tiered example, $10 of price-to-stop risk plus $1.34 of modeled friction gives an estimated $11.34 loss at the stop, before gaps.
 
-`trades.pnl` is recorded profit after commissions, built from every fill in the `trade_fills` journal. A commission that IBKR reports after a trade has closed updates the journal but not `pnl`. The daily summary compares estimated and actual fees. `TRADING_CAPITAL_LIMIT` caps sizing equity; it does not create a separate small-account cash/equity ledger. A large paper account capped at $100 can still report $100 of sizing equity after a $10 loss. The My Trades page shows the real broker balance. `GET /api/v1/trading/status` reports growth mode as `growth_mode`.
+`trades.pnl` is recorded profit after commissions, built from every fill in the `trade_fills` journal. A commission that IBKR reports after a trade has closed updates the journal but not `pnl`. The daily summary compares estimated and actual fees. `TRADING_CAPITAL_LIMIT` caps sizing equity; it does not create a separate small-account cash/equity ledger. A large paper account capped at $100 can still report $100 of sizing equity after a $10 loss. Record broker and experimental equity separately; small-account certification requires the virtual cash/equity ledger planned in the roadmap. The My Trades page shows the real broker balance. `GET /api/v1/trading/status` reports growth mode as `growth_mode`.
 
 The break-even threshold is a cost filter; it does not predict the strategy's win rate. Include data, hosting and AI expenses in validation: a hypothetical $10/month costs $120/year, or 12% of $1,000 of capital before trading costs.
 
@@ -177,6 +187,8 @@ Backtests do not yet share all execution constraints: growth-universe and positi
 
 ## Pages
 
+The dashboard uses a dark theme; retain it when changing the UI. Watchlist, backtesting, system health and strategy parameters are optional tools, kept out of the main flow.
+
 | Page | Shows |
 |------|-------|
 | Home | Plain-English status, pause and resume, alerts, open trades; risk, watchlist and system panels under "Risk & system details" |
@@ -194,7 +206,7 @@ One backend process and one uvicorn worker run everything. `TradingEngine` (`bac
 
 | Path | Holds |
 |------|-------|
-| `backend/app/api/` | Thin routes under `/api/v1`, WebSocket at `/ws/dashboard` |
+| `backend/app/api/` | Thin routes under `/api/v1`, one dashboard WebSocket at `/ws/dashboard` |
 | `backend/app/core/` | Strategies, risk, execution, backtesting, jobs |
 | `backend/app/brokers/` | `BaseBroker` interface, `IBKRClient`, `MockBroker` |
 | `backend/app/data/` | Market data feed and Redis cache |
@@ -214,7 +226,7 @@ One backend process and one uvicorn worker run everything. `TradingEngine` (`bac
 | `risk_updates` | `risk_alert` |
 | `system_alerts` | `system_alert` |
 
-These Redis Pub/Sub events are transient; they do not provide durable decision replay. Leadership's proposed pipeline adds versioned inputs, proposals, deterministic authorizations, an execution journal and recoverable dispatch. ML/LLM workers would propose signals and research without broker mutation access.
+These Redis Pub/Sub events are transient; they do not provide durable decision replay. Input bars can change on refresh. Backups preserve available records, but do not establish complete decision lineage or deterministic replay. Leadership's proposed pipeline adds versioned inputs, proposals, deterministic authorizations, an execution journal and recoverable dispatch. ML/LLM workers would propose signals and research without broker mutation access.
 
 **Background tasks:**
 

@@ -10,18 +10,16 @@ web
 A single owner who is new to trading, checking in briefly a few times a day while the bot trades on its own. They do not know trading jargon and should never need it to understand what is happening.
 
 ## Product Purpose
-A personal automated trading bot for stocks (options later). The bot finds trades, sizes them, manages exits and enforces loss limits by itself. The UI exists to answer two questions at a glance: is it running (and if not, why), and am I making or losing money. Success is that the owner rarely needs to touch anything.
+The UI exists to answer two questions at a glance: is it running (and if not, why), and am I making or losing money. Success is that the owner rarely needs to touch anything.
 
 ## Operating Context
-- Paper trading through an IB Gateway broker connection; small account (under $100) in "growth mode".
-- Live data arrives over one WebSocket; the dashboard is a React/Tailwind dark-theme app.
-- Advanced tools (watchlist, backtesting, system health, strategy parameters) exist but are optional.
+See [README.md](README.md) for current capabilities, account and growth-mode rules, stack, data delivery and pages. See [DEPLOYMENT.md](DEPLOYMENT.md) for setup and operations.
 
 ## Capabilities and Constraints
-- UI-only changes: no backend or API changes in this effort. The flatten endpoint still requires `{"confirm": "FLATTEN"}`; the UI sends it silently.
-- Dark theme stays.
+- UI-only changes: no backend or API changes in this effort.
 - Plain-language copy; no unexplained trading terms.
-- Undecided: first-run setup defaults (default strategies and symbols).
+- Options trading is a future product direction.
+- Current first-run behavior is documented in [Quick Start](README.md#quick-start); use it when designing onboarding.
 
 ## Evidence on Hand
 No testimonials, customers or benchmarks exist; none should be invented.
