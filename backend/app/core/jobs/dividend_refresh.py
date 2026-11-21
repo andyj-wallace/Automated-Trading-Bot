@@ -118,10 +118,5 @@ class DividendRefreshJob:
         return self._clock().astimezone(market_calendar.ET).date()
 
     async def _may_request(self) -> bool:
-        day = self._budget_day()
-        used = await self._used(day)
-        if used >= self._daily_budget:
-            return False
-        key = BUDGET_KEY.format(day=day.isoformat())
-        await self._cache.set(key, str(used + 1), ttl=BUDGET_TTL_SECONDS)
-        return True
+        key = BUDGET_KEY.format(day=self._budget_day().isoformat())
+        return await self._cache.incr_if_below(key, self._daily_budget, BUDGET_TTL_SECONDS)

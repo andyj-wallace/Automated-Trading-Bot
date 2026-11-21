@@ -31,6 +31,10 @@ _COMPARE_AND_DELETE = (
     "if redis.call('get', KEYS[1]) == ARGV[1] "
     "then return redis.call('del', KEYS[1]) else return 0 end"
 )
+_INCR_IF_BELOW = (
+    "if tonumber(redis.call('get', KEYS[1]) or '0') >= tonumber(ARGV[1]) then return 0 end "
+    "redis.call('incr', KEYS[1]) redis.call('expire', KEYS[1], ARGV[2]) return 1"
+)
 
 
 class RedisCache:
@@ -79,6 +83,10 @@ class RedisCache:
     async def compare_and_delete(self, key: str, value: str) -> bool:
         """Delete key only if it still holds value; True if it did."""
         return bool(await self._client.eval(_COMPARE_AND_DELETE, 1, key, value))
+
+    async def incr_if_below(self, key: str, limit: int, ttl: int) -> bool:
+        """Atomically add 1 to the counter at key if it is below limit; True if it did."""
+        return bool(await self._client.eval(_INCR_IF_BELOW, 1, key, limit, ttl))
 
     # ------------------------------------------------------------------
     # Pub/sub operations

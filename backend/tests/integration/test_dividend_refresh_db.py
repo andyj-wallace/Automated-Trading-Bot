@@ -39,6 +39,13 @@ class FakeCache:
     async def set(self, key, value, ttl=None):
         self.data[key] = value
 
+    async def incr_if_below(self, key, limit, ttl):
+        used = int(self.data.get(key, 0))
+        if used >= limit:
+            return False
+        self.data[key] = str(used + 1)
+        return True
+
 
 class FakeClient:
     def __init__(self) -> None:
