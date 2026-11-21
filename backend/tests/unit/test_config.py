@@ -116,3 +116,26 @@ def test_dividend_budget_bounds(monkeypatch, value, ok):
 def test_dividend_symbols_normalized(monkeypatch):
     monkeypatch.setenv("DIVIDEND_SYMBOLS", '[" ko ","pep",""]')
     assert _settings().dividend_symbols == ["KO", "PEP"]
+
+
+# Same length as a real Alpha Vantage key; pydantic shortens long input reprs, which would hide a longer one.
+_SENTINEL = "SENTINELKEY12345"
+
+
+def _leaks(text: str) -> bool:
+    return any(_SENTINEL[i : i + 8] in text for i in range(len(_SENTINEL) - 7))
+
+
+def test_missing_setting_error_hides_secret_values(monkeypatch):
+    monkeypatch.delenv("SECRET_KEY")
+    monkeypatch.delenv("DATABASE_URL")
+    monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", _SENTINEL)
+    with pytest.raises(ValidationError) as exc:
+        _settings()
+    assert not _leaks(str(exc.value))
+
+
+def test_misspelled_setting_error_hides_its_value():
+    with pytest.raises(ValidationError) as exc:
+        Settings(_env_file=None, alphavantage_api_key=_SENTINEL)
+    assert not _leaks(str(exc.value))
