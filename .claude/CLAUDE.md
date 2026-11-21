@@ -55,5 +55,5 @@ When behavior or a setting changes, update these docs in the same change. Don't 
 - New constructor parameters default to "off" (`None`, `0`, `False`), so existing callers and tests keep today's behavior.
 - A new setting goes in `app/config.py` and `.env.example` with a comment. Secrets and required values have no default in code.
 - Tests: `pytest.ini` sets `asyncio_mode = auto`. Reuse existing fakes such as `FakeCache`, `FakeSymbolRepo`, `FakeTradeRepo` and the fixtures in `tests/integration/test_layer17_e2e.py`.
-- Migrations are hand-written: `backend/alembic/versions/000N_<name>.py` with `revision = "000N"`, `down_revision` = previous, and a working `downgrade()`. Next free number: **0013**.
+- Migrations are hand-written: `backend/alembic/versions/000N_<name>.py` with `revision = "000N"`, `down_revision` = previous, and a working `downgrade()`. Next free number: **0014**.
 - No comments that restate the code. One short docstring line per public function or class is enough.
