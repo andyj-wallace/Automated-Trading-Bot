@@ -101,6 +101,9 @@ class Settings(BaseSettings):
     ]
     max_spread_bps: Decimal = Decimal("20")
     min_avg_dollar_volume: Decimal = Decimal("20000000")
+    alpha_vantage_api_key: str = ""          # env ALPHA_VANTAGE_API_KEY; empty = dividend refresh off
+    dividend_refresh_daily_budget: int = 20  # Alpha Vantage free tier allows 25 requests/day
+    dividend_symbols: list[str] = []         # env JSON list, e.g. '["KO","PEP"]'
 
     @field_validator("max_breakeven_win_rate")
     @classmethod
@@ -115,6 +118,18 @@ class Settings(BaseSettings):
         if value < 1:
             raise ValueError("growth_max_open_positions must be >= 1")
         return value
+
+    @field_validator("dividend_refresh_daily_budget")
+    @classmethod
+    def _check_dividend_budget(cls, value: int) -> int:
+        if not 1 <= value <= 25:
+            raise ValueError("dividend_refresh_daily_budget must be between 1 and 25")
+        return value
+
+    @field_validator("dividend_symbols")
+    @classmethod
+    def _normalize_dividend_symbols(cls, value: list[str]) -> list[str]:
+        return [s.strip().upper() for s in value if s.strip()]
 
     @field_validator("growth_universe")
     @classmethod
