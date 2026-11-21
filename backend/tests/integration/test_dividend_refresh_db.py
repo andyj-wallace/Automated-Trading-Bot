@@ -39,6 +39,13 @@ class FakeCache:
     async def set(self, key, value, ttl=None):
         self.data[key] = value
 
+    async def incr_if_below(self, key, limit, ttl):
+        used = int(self.data.get(key, 0))
+        if used >= limit:
+            return False
+        self.data[key] = str(used + 1)
+        return True
+
 
 class FakeClient:
     def __init__(self) -> None:
@@ -112,3 +119,38 @@ async def test_last_fetched_persists_after_success_and_untouched_after_failure(f
             (date(2026, 9, 15), Decimal("0.52")),
         ]
         assert (await repo.last_fetched(["KO"]))["KO"] == day10_utc
+
+
+class PerSymbolClient:
+    def __init__(self, results: dict[str, FetchResult]) -> None:
+        self.results = results
+
+    async def fetch(self, symbol, may_request):
+        await may_request()
+        return self.results[symbol]
+
+
+async def test_rows_postgres_rejects_skip_that_symbol_only(factory):
+    # These rows bypass parse_dividends, which drops them; this proves the job's fallback.
+    now = datetime(2026, 11, 2, 10, 0, tzinfo=ET)
+    client = PerSymbolClient(
+        {
+            "BIG": FetchResult(ok=True, rows=[_row(date(2026, 9, 15), "1000000000000")]),
+            "DUP": FetchResult(
+                ok=True, rows=[_row(date(2026, 9, 15), "0.51"), _row(date(2026, 9, 15), "0.52")]
+            ),
+            "KO": FetchResult(ok=True, rows=[_row(date(2026, 9, 15), "0.51")]),
+        }
+    )
+    job = DividendRefreshJob(
+        client, factory, FakeCache(), symbols=["BIG", "DUP", "KO"], clock=lambda: now
+    )
+
+    await job.run(date(2026, 11, 2))
+
+    async with factory() as s:
+        repo = DividendRepo(s)
+        assert await repo.list_events("BIG") == []
+        assert await repo.list_events("DUP") == []
+        assert len(await repo.list_events("KO")) == 1
+        assert set(await repo.last_fetched(["BIG", "DUP", "KO"])) == {"KO"}
