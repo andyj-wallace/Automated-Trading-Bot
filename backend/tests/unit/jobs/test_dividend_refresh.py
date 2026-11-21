@@ -7,6 +7,7 @@ from decimal import Decimal
 
 import httpx
 import pytest
+from sqlalchemy.exc import DBAPIError
 
 from app.core.jobs.dividend_refresh import BUDGET_KEY, DividendRefreshJob
 from app.core.market_calendar import ET
@@ -45,8 +46,14 @@ class FakeCache:
 
 
 class FakeSession:
+    def __init__(self) -> None:
+        self.rollbacks = 0
+
     async def commit(self) -> None:
         pass
+
+    async def rollback(self) -> None:
+        self.rollbacks += 1
 
 
 @asynccontextmanager
@@ -290,3 +297,68 @@ async def test_fresh_symbol_is_skipped_until_its_ex_date_has_passed():
     clock.now = _at(2026, 11, 5, 10, 0)
     await job.run(date(2026, 11, 5))
     assert client.calls == ["S00", "S00"]
+
+
+class PgError(Exception):
+    """Stands in for asyncpg's adapted error, which carries the Postgres SQLSTATE."""
+
+    def __init__(self, sqlstate: str) -> None:
+        super().__init__(sqlstate)
+        self.sqlstate = sqlstate
+
+
+def _db_error(sqlstate: str) -> DBAPIError:
+    return DBAPIError("INSERT", {}, PgError(sqlstate))
+
+
+def _failing_job(client, clock, cache, store, exc, sessions) -> DividendRefreshJob:
+    class FailingRepo(FakeRepo):
+        def __init__(self, session, store) -> None:
+            super().__init__(session, store)
+            sessions.append(session)
+
+        async def upsert_events(self, symbol, rows, fetched_at) -> int:
+            if symbol == "S00":
+                raise exc
+            return await super().upsert_events(symbol, rows, fetched_at)
+
+    return DividendRefreshJob(
+        client,
+        _session_factory,
+        cache,
+        symbols=["S00", "S01"],
+        daily_budget=20,
+        clock=clock,
+        repo_factory=lambda s: FailingRepo(s, store),
+    )
+
+
+@pytest.mark.parametrize("sqlstate", ["22003", "21000", "23505"])
+async def test_bad_data_for_one_symbol_does_not_stop_the_run(logs, sqlstate):
+    clock = Clock(_at(2026, 11, 2, 10, 0))
+    cache, store, sessions = FakeCache(), Store(), []
+    client = FakeClient(clock)
+    job = _failing_job(client, clock, cache, store, _db_error(sqlstate), sessions)
+
+    await job.run(date(2026, 11, 2))
+
+    assert client.calls == ["S00", "S01"]
+    assert "S00" not in store.last
+    assert "S01" in store.last
+    assert sessions[0].rollbacks == 1
+    failed = [r for r in logs.records if r.getMessage() == "Dividend store failed"]
+    assert {(r.symbol, r.sqlstate) for r in failed} == {("S00", sqlstate)}
+
+
+@pytest.mark.parametrize("sqlstate", ["08006", "57P01", ""])
+async def test_other_database_errors_still_stop_the_run(sqlstate):
+    clock = Clock(_at(2026, 11, 2, 10, 0))
+    cache, store, sessions = FakeCache(), Store(), []
+    client = FakeClient(clock)
+    job = _failing_job(client, clock, cache, store, _db_error(sqlstate), sessions)
+
+    with pytest.raises(DBAPIError):
+        await job.run(date(2026, 11, 2))
+
+    assert client.calls == ["S00"]
+    assert store.last == {}
