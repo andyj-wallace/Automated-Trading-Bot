@@ -165,6 +165,22 @@ The break-even threshold is a cost filter; it does not predict the strategy's wi
 - **Regime filter:** buy only while the market (SPY) is above its 200-day average.
 - **Gap:** the market opens beyond a price level, so the order fills at the open.
 
+## Dividend data
+
+A dividend is cash a company pays its shareholders. The **ex-dividend date** is the cutoff: you must own the stock before this date to get the payment. A **dividend cut** is when a company lowers or stops its payment.
+
+Once a day the backend fetches dividend history (paid and declared future payments) for each symbol in `DIVIDEND_SYMBOLS` from Alpha Vantage's free `DIVIDENDS` API and stores it in the `dividend_events` table (migration `0013`). It places no orders and changes no trading behavior. `app/core/dividends.py` computes trailing and forward yield (special one-off dividends excluded) and payment frequency (from the 3 latest gaps between ex-dates). `app/core/dividend_cuts.py` detects cuts (the latest payment, annualized, below the previous one) and missed payments, for later dividend features. A drop to exactly 1/2, 1/3 ... 1/10 is treated as a stock split, so a real cut to exactly that size is missed.
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `ALPHA_VANTAGE_API_KEY` | empty | Free key from alphavantage.co. While empty, the job does nothing and logs that once a day. |
+| `DIVIDEND_REFRESH_DAILY_BUDGET` | `20` | Most Alpha Vantage requests the job may make per day, 1 to 25. The free tier allows 25, so 5 stay free for manual use. |
+| `DIVIDEND_SYMBOLS` | `[]` | JSON list of symbols to track, e.g. `["KO","PEP"]`. |
+
+The budget is counted in Redis per US Eastern date. Every HTTP attempt counts, including retries and failures. Symbols are refreshed oldest-first; any left over when the budget runs out are logged and go first the next day. A symbol fetched in the last 7 days is skipped unless one of its stored ex-dividend dates has passed since. A failed or rate-limited reply never overwrites stored data.
+
+These settings are not in `.env.example` yet. When you add them to `.env`, add them to `.env.example` too, with a comment.
+
 ## Strategies
 
 | Type | Buys when |
