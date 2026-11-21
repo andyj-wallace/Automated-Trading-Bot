@@ -17,6 +17,7 @@ How it fits together:
 - `scripts/bot.sh rollback`, run on the box, returns to the previous version.
 
 Decisions already made (don't revisit):
+- **`rollback` is the one deliberate use of `--force`.** It always skips the market-hours guard, because it is run by hand on the box to undo a bad release, possibly during the day. Entries stay paused (the pause lives in Redis), so skipping the guard doesn't start trading. Workflows never pass `--force`.
 - **The box's runner only ever runs `deploy.yml` for pushes to `prod`.** The repo is public. Any workflow can ask for a self-hosted runner by its labels, including one added in an outsider's pull request, and branch rules don't stop that because pull-request workflows run before any merge. A pre-job hook on the box (task 6) refuses every other job. GitHub runs the hook after a job is assigned and before its first step, and a non-zero exit fails the job without running it. Runner groups, which could restrict workflows, exist only for organizations.
 - **Deploys never recreate `ib-gateway`, `db` or `redis`.** Recreating the Gateway forces a new login and possibly an IBKR Mobile approval. Changes to those three services are applied by hand outside market hours (DEPLOYMENT.md section 7).
 - **Deploys leave automated entries paused.** The user resumes after the DEPLOYMENT.md section 5 checks. Until AR-03 lands, startup keeps trading after a failed reconciliation.
@@ -57,6 +58,8 @@ Done when `docker run --rm hello-world` works as `bot` after a reboot, without a
    - Enforcement: Active. Target branches: `master` and `prod`. Bypass list: empty.
    - Rules: Restrict deletions; Block force pushes; Require a pull request before merging, with 0 required approvals (GitHub doesn't let you approve your own pull request).
    - Require status checks to pass: `Backend (ruff + pytest)`, `Frontend (tsc + eslint)` and `Docker images build`.
+
+   `ci.yml` runs its `pull_request` trigger only for `main` and `master`. A pull request into `prod` gets its three required checks from the `push` run on the same commit, which `master` already had. If `ci.yml` ever loses its `push: ["**"]` trigger, `prod` pull requests can't merge.
 
    From then on nothing lands on `master` or `prod` without a pull request whose CI is green. That includes the user's own commits and the agent pipeline: work on a branch and open a pull request.
 3. Settings → Actions → General:
@@ -287,6 +290,8 @@ jobs:
         run: cd /opt/trading-bot && scripts/bot.sh deploy "${{ needs.publish.outputs.tag }}"
 ```
 
+The smoke test uses `BROKER=mock` and `ENVIRONMENT=development`, so it proves migrations and startup, not that the production configuration boots (the production-only startup checks in `main.py` aren't exercised).
+
 If the backend needs another variable to start in the smoke test, add it with a dummy value, never a real secret.
 
 Done when the file passes review in its pull request into `master`. The first real run is task 7.
@@ -309,11 +314,19 @@ Done when the file passes review in its pull request into `master`. The first re
    EOF
    sudo chmod 755 /opt/runner-hooks/only-prod-deploy.sh
    echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/runner-hooks/only-prod-deploy.sh" | sudo -u bot tee -a /home/bot/actions-runner/.env
+   sudo chown root: /home/bot/actions-runner/.env && sudo chmod 644 /home/bot/actions-runner/.env
    cd /home/bot/actions-runner && sudo ./svc.sh stop && sudo ./svc.sh start
    ```
-3. Drill: push a throwaway branch (rulesets cover only `master` and `prod`) with a workflow whose job has `runs-on: [self-hosted, trading-box]` and runs `touch /tmp/runner-guard-breached`. Expected: the job fails during setup with the "Refused" message, and `/tmp/runner-guard-breached` doesn't exist on the box. Delete the branch afterwards.
+3. Check the hook accepts the real case. Run it by hand with the variables a `prod` deploy would have; it must exit 0:
+   ```sh
+   GITHUB_EVENT_NAME=push GITHUB_REF=refs/heads/prod \
+     GITHUB_WORKFLOW_REF=andyj-wallace/Automated-Trading-Bot/.github/workflows/deploy.yml@refs/heads/prod \
+     /opt/runner-hooks/only-prod-deploy.sh; echo $?
+   ```
+   Then run it with `GITHUB_EVENT_NAME=pull_request`; it must exit 1. This doesn't prove GitHub passes those variables to the hook; task 7 does.
+4. Drill: push a throwaway branch (rulesets cover only `master` and `prod`) with a workflow whose job has `runs-on: [self-hosted, trading-box]` and runs `touch /tmp/runner-guard-breached`. Expected: the job fails during setup with the "Refused" message, and `/tmp/runner-guard-breached` doesn't exist on the box. Delete the branch afterwards.
 
-Done when the drill passes and the runner shows "Idle" under Settings → Actions → Runners. The hook only fails closed: if a variable it checks were missing, every job would be refused, and task 7 would show it.
+Done when the manual hook check and the drill pass and the runner shows "Idle" under Settings → Actions → Runners. The hook only fails closed: if a variable it checks were missing, every job would be refused, and task 7 would show it.
 
 ### 7. [ ] First release and drills (user and implementer)
 
@@ -367,13 +380,13 @@ The November 13 review passed 823 backend unit tests, backend lint, frontend lin
 - [ ] **P1 / AR-05 — Centralize required data and account checks.** Move mandatory spread/liquidity/freshness checks into shared entry authorization. Preserve source/receipt timestamps and data mode; reject missing required quotes and account facts rather than assuming safe values. Verify settled funds and the broker/account's applicable restrictions. Done when manual and automated entries receive the same deterministic decisions for missing, stale, delayed or invalid required inputs.
 - [ ] **P1 / AR-06 — Persist authorization and dispatch durably.** Replace logging-only audit success with checked durable proposal, authorization and order-intent records plus a transactional outbox. Record fills and reconciliation outcomes incrementally, with versioned input references. Preserve existing immutable audit columns and append subsequent facts. Done when failed mandatory persistence prevents dispatch and restart/retry recovers intent without duplicate execution; exercise actual handler I/O failure, not only a mocked logger method.
 - [ ] **P1 / AR-07 — Budget all-in loss and actual exposure.** Include estimated entry/exit friction and execution headroom when sizing within the existing fixed 1% ceiling. Maintain current exposure separately from immutable approved risk, including adverse fills and late executions. Done when the $1,000/$10 planned-risk/$1.34 friction case is resized or rejected to meet the all-in modeled budget; report gap risk separately. Entry restrictions must never block an exit because of fees, settlement or day-trade rules.
-- [ ] **P2 / AR-10 — Report broker outcomes accurately.** `scheduler_submit.py` records SUBMITTED whenever submission returns without raising, including REJECTED/ERROR results; the manual route can return HTTP 201 for the cancelled trade. Inspect the broker outcome and expose accepted, working, partial, rejected, unknown and filled states to the signal log and API/UI. Done when clean broker rejection and uncertain submission produce truthful outcomes without weakening successful-order behavior.
+- [ ] **P2 / AR-10 (broker outcomes) — Report broker outcomes accurately.** `scheduler_submit.py` records SUBMITTED whenever submission returns without raising, including REJECTED/ERROR results; the manual route can return HTTP 201 for the cancelled trade. Inspect the broker outcome and expose accepted, working, partial, rejected, unknown and filled states to the signal log and API/UI. Done when clean broker rejection and uncertain submission produce truthful outcomes without weakening successful-order behavior.
 
 ### 1. Make historical and paper validation representative
 
 - [ ] **P1 / AR-08 — Share simulation and execution policy.** In `backtesting/engine.py`, `portfolio_engine.py` and `backtesting_helpers.py`, apply aggregate capital/cash reservations, growth-universe and position constraints, settlement and relevant exit rules, including signal exits. Advance portfolio slots on a shared calendar. Done when two simultaneous 40-share/$25 positions cannot consume about $2,001 on $1,000, and matching simulated/execution proposals produce explainable equivalent authorization decisions.
 - [ ] **P1 / AR-09 — Add an isolated virtual paper ledger.** Keep `TRADING_CAPITAL_LIMIT`'s existing sizing-cap meaning; add explicit experimental cash/equity accounting for small-account certification. Include realized/unrealized P&L, fees, reservations and settlement. Done when a $100 experiment losing $10 has $90 of experimental equity even if broker paper equity remains near $1 million, and subsequent sizing/cash checks use that ledger.
-- [ ] **P2 / AR-10 — Correct metrics and chronological validation.** Build marked-to-market equity returns for drawdown and Sharpe in `backtesting/metrics.py`. Extend `walk_forward.py` with rolling evaluations, prior-history warm-up, extra-symbol history and consistent cost settings. Separate training/tuning from untouched evaluation data; use purging/embargo where overlapping labels require it. Done when sparse samples are inconclusive, regime-filter inputs are present, and statistics use their documented sampling period.
+- [ ] **P2 / AR-10 (metrics) — Correct metrics and chronological validation.** Build marked-to-market equity returns for drawdown and Sharpe in `backtesting/metrics.py`. Extend `walk_forward.py` with rolling evaluations, prior-history warm-up, extra-symbol history and consistent cost settings. Separate training/tuning from untouched evaluation data; use purging/embargo where overlapping labels require it. Done when sparse samples are inconclusive, regime-filter inputs are present, and statistics use their documented sampling period.
 
 ### 2. Validate growth mode on paper
 
@@ -424,6 +437,155 @@ Proposed work toward the supplied hybrid architecture. The [review](docs/archite
 
 Fill accounting and reconciliation are done; the order-state and fill-journal contract lives in `brokers/base.py` and `trade_fills`. For Claude's handoff, another developer can own readiness and authorization; agree on that contract before editing shared execution modules. These are proposed assignments, not evidence of a delivered handoff.
 
+## Strategy families (after the validation gates)
+
+Implements the strategy ideas in the Backlog below. Start only after "Before live money" sections 0 and 1 are done: a new strategy is worthless if backtests can't be trusted. Everything ships **disabled** (seeding already creates a disabled row per registered type) and is enabled on paper only after its backtest passes.
+
+Order is by what each family needs. Phases 1 and 2 fit the engine as it is. Phases 3 and 4 need things that were forbidden until now (shorting, options), so they are built only behind off-by-default switches; see "Gating rules for phases 3 and 4".
+
+Rules for all phases:
+- A strategy is one file in `backend/app/core/strategy_engine/` that subclasses `BaseStrategy`, calls `registry.register("<name>", Cls)` at the bottom, and is imported in `builtin.py`. Copy the shape of `trend_pullback.py`: config from `config.get(...)`, `ValueError` for bad config in `__init__`, `get_config_schema()` with a default for every key, `min_history_bars()`, `required_extra_symbols()`, `_hold()`, and a docstring listing the rules.
+- Decide from completed daily bars (`bars[-1]` is the last completed session) and enter the next day, like Trend Pullback, so live and backtest match.
+- Long only. `submit_stop_to_broker=True`. `take_profit_price` is only a strategy suggestion (the monitor handles it; never sent to the broker). Exits that are not stops use `action="SELL"` while `open_position` is true; the scheduler turns that into a `SIGNAL_EXIT`.
+- Reuse `indicators.py` (`sma`, `atr`, `avg_dollar_volume`) and `filters.py` (`regime_ok`, `volatility_ok`). New shared helpers go there, not in the strategy file.
+- Prices are `Decimal` built from `str`. Quantity stays `int` and comes from `RiskCalculator`.
+- Tests in `backend/tests/unit/strategy/test_<name>.py`, using the helpers in that folder's `conftest.py`. Cover: each entry rule failing on its own gives HOLD; the all-pass case gives BUY with the documented stop and target; insufficient history gives HOLD; bad config raises `ValueError`; no look-ahead (appending a future bar doesn't change the signal for earlier bars).
+- Add the strategy to `test_min_history_bars.py`, and update README's strategy list in the same change.
+- Run `graphify update .` after code changes.
+
+### Known limit to fix first
+
+`scheduler_data.py` loads only `_HISTORY_LOOKBACK_DAYS = 365` calendar days of daily bars, about 250 sessions. That covers a 200-day average and a 52-week high, but not an **all-time high**. Phase 1 handles this by approximating "all-time high" with a longer window, set per strategy. Task 1.1 makes the lookback a strategy property.
+
+### Phase 1. Rocket breakout and long momentum (no new infrastructure)
+
+#### 1.1 [ ] Let a strategy ask for more history
+
+Files: `strategy_engine/base.py`, `scheduler_data.py`, `core/jobs/` (bar refresh), tests under `tests/unit/strategy_engine/`.
+
+1. `BaseStrategy.history_days(self) -> int` defaults to `0` (meaning "use the scheduler default of 365").
+2. The scheduler takes the largest `history_days()` among enabled strategies for a symbol and passes it as the lookback in `_fetch_db_bars`. The bar cache key includes the lookback.
+3. Check whether the bar refresh job stores that much history for each symbol. If not, extend its backfill by the same amount, only for symbols an enabled strategy needs it for.
+4. Tests: default unchanged at 365; a strategy asking for 1500 gets 1500; a symbol with less history than asked still returns what exists.
+
+Done when existing strategies see the same bars as before and a test shows a longer window arriving.
+
+#### 1.2 [ ] `rocket_breakout`
+
+Source: the Backlog "Rocket stocks" section. Config (all with defaults, all `Decimal` from `str`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `high_lookback` | 252 | Sessions for the "52-week high" |
+| `ath_lookback` | 1250 | Sessions for the "all-time high" approximation (about 5 years); `0` turns this rule off |
+| `fast_period` / `slow_period` | 50 / 200 | Moving averages |
+| `volume_period` | 50 | Prior average volume window |
+| `volume_surge` | 1.5 | Breakout bar volume must be at least this multiple |
+| `max_gap_pct` | 0.05 | HOLD if the open gapped above the prior close by more than this |
+| `max_extension_pct` | 0.03 | HOLD if current price is above the breakout level by more than this |
+| `atr_period` / `stop_atr_mult` / `max_stop_atr` | 14 / 2.0 / 3.5 | Stop = entry - mult * ATR; HOLD if wider than max |
+| `trail_atr_mult` | 3.0 | Exit when close falls below highest close since entry minus this * ATR |
+| `failed_breakout_days` / `failed_breakout_buffer_pct` | 5 / 0.0 | Exit if within N sessions of entry the close is back below the breakout level |
+| `max_holding_days` | 60 | Time exit |
+| `regime_symbol` | SPY | Same regime filter as Trend Pullback; `""` turns it off |
+
+Entry (all must hold, else HOLD):
+1. Breakout: `close[-1]` is above the highest high of the `high_lookback` sessions **before** `bars[-1]` (exclude the bar itself, so no look-ahead), and above the same for `ath_lookback`.
+2. Trend: `close[-1] > SMA(fast) > SMA(slow)`.
+3. Volume: `volume[-1] >= volume_surge * mean(volume of the volume_period sessions before bars[-1])`.
+4. No gap or chase: both limits above.
+5. Regime and `avg_dollar_volume` checks as in Trend Pullback and the scheduler's existing liquidity gate.
+
+Stop and sizing as in the table. No take profit: winners are cut by the trailing exit. Exits (SELL while `open_position`): trailing exit, failed breakout, `max_holding_days`. The trailing and failed-breakout exits need the entry date and breakout level, which a stateless strategy doesn't have. Recompute them from bars: the breakout level is the highest high of the `high_lookback` sessions before the first session in the last `failed_breakout_days` where the entry rules held. If that is not reproducible from bars alone, drop the failed-breakout exit and say so in the docstring; don't add strategy state.
+
+Tests: add the standard set plus: a gap above `max_gap_pct` gives HOLD; volume at 1.49x gives HOLD and 1.5x gives BUY; a high set inside the lookback but on `bars[-1]` itself doesn't count as "prior"; `ath_lookback=0` skips that rule; stock splits not adjusted in the bars produce a HOLD or are documented as out of scope (check what `historical.py` stores first).
+
+Done when the tests pass and `backtest_run` on the Growth universe ETFs and five large caps runs without error. Report trade count; a handful of trades is "inconclusive", not a pass.
+
+#### 1.3 [ ] `momentum_long`
+
+Before writing it, read `stock_trend.py` and `trend_pullback.py` and write down in the docstring what this does that they don't. If the only difference is the ranking, build the ranking and not another entry rule. Proposed difference: **relative strength**.
+
+- Score = total return over `lookback_days` (default 126) skipping the most recent `skip_days` (default 5), compared with the same score on `regime_symbol`'s bars (`extra_bars`). Enter only when the symbol's score beats the benchmark's by `min_rs_margin` (default 0.05) and the score is positive.
+- Plus: close above `SMA(slow)`, `avg_dollar_volume` above the existing floor, volatility in range (`volatility_ok`).
+- Stop: `stop_atr_mult` (2.5) x ATR below entry. Trailing exit and `max_holding_days` (90) as in rocket. Failed-trend exit: close below `SMA(slow)`.
+- Cross-sectional ranking ("top 10% of the universe") is out of scope: it needs all symbols at once, which is the roadmap's "Deterministic ranking and allocation" item. Say so in the docstring.
+
+Tests: the standard set plus relative strength below the margin gives HOLD, and the skip window excludes recent bars.
+
+Done when tests pass and the docstring states the difference from `trend_pullback` in two lines.
+
+#### 1.4 [ ] Compare on paper-grade evidence
+
+No new code if the backtest engine already reports it. Run `rocket_breakout`, `momentum_long`, `trend_pullback` and buy-and-hold on the same symbols and dates, fees on, 3 starting balances ($100, $300, $1,000), with the walk-forward split from section 1 of "Before live money". Record the numbers in the pull request, not in a doc. Done when each strategy has an out-of-sample result at the capital it would run at, or a recorded reason it can't (too few trades).
+
+### Phase 2. Dividend investing (needs data, and one rule bent)
+
+This family holds for months and buys in pieces, which doesn't fit the engine's one active trade per symbol and a stop on every trade. **Decided: dividend holdings live in a separate holdings ledger** (own tables, lots and cost basis, dividend cash flows, reconciliation against broker positions), outside the trade/stop machinery, so the risk rules for trades stay untouched. Rules for the ledger:
+- Buys still go through the shared entry authorization (cash, 10% portfolio cap, whole shares, paper-only until the validation gates pass). Exits (confirmed dividend cut for a company, manual sale) are never blocked.
+- A symbol held in the ledger can't also be opened as a trade by another strategy, and the reverse; the check lives in one place used by both.
+- The reconciler must understand ledger positions, so the broker's shares of a ledger symbol are not flagged as excess holdings.
+- A new setting `DIVIDEND_ENABLED` (default `False`, paper only) switches it on, with the same gating rules as the switches below.
+
+Tasks, in order. Each is a separate pull request.
+
+1. [ ] **Tax research.** Done as the Backlog describes: a short written answer with official sources and the date, pasted into the pull request. No code.
+2. [ ] **ETF distribution variability.** ETF payouts vary from period to period, so a lower ETF distribution is not a cut. Extend `detect_cut()` in `app/core/dividend_cuts.py` (or the exit rule) so ETFs are not flagged by ordinary variability, with tests for it. Individual-company cuts, omissions, specials, splits and frequency changes are done.
+3. [ ] **Recurring buys.** A monthly job that buys whole shares with available cash only: `NOBL` one share, or one-twelfth of a stock allocation per month. Unused cash carries forward. Ladder mode has explicit price levels and a total cap; a falling price never buys past the cap. All orders go through the existing entry authorization and the 10% portfolio cap.
+4. [ ] **Exit rules.** Exit an individual company the next session after a confirmed cut or omission; never exit on price or technicals. ETFs are never exited by the cut rule. Exits use the existing close path, so they are never blocked by growth mode or fees.
+5. [ ] **Validation.** Backtests need historical Dividend Aristocrats membership and dividend events; if that data isn't available, say so and stop at paper. Report income, yield on cost, total return and drawdown separately.
+
+### Gating rules for phases 3 and 4
+
+The user has approved building shorting and options **only behind switches that default to off**. Everything in these phases follows these rules.
+
+1. **Master switches in `app/config.py`**, no secrets, default `False`: `SHORTING_ENABLED`, `OPTIONS_ENABLED`. Each has a comment, and goes in `.env.example` and the README settings list. `.env.example` is on the AGENTS.md do-not-touch list while `.claude/CLAUDE.md` requires new settings there: **ask the user to approve that one edit** before starting task 3.1.
+2. **Paper only.** A validator in `config.py` refuses to start (raises) if either switch is true while `IBKR_TRADING_MODE` is not `paper`. This is on top of the existing live-mode guardrail, which still needs the user's go-ahead.
+3. **One choke point.** The switches are enforced in the shared entry authorization (`OrderManager`'s submission path, the same place the portfolio cap lives), not only in the strategies. A short entry with `SHORTING_ENABLED=false`, or any options order with `OPTIONS_ENABLED=false`, is rejected with a new reason code (`SHORTING_DISABLED`, `OPTIONS_DISABLED`) that shows in the signal log.
+4. **Three layers must all be on to trade:** the master switch, the strategy row's `enabled` flag (seeded disabled), and, for options, a per-strategy `max_contracts` greater than 0. Turning a master switch off blocks new entries only.
+5. **Exits are never gated.** Buy-to-cover, buy-to-close, closing a spread, flatten and the reconciler keep working with the switches off, so turning one off with a position open can't strand it. Never block or resize an exit for any reason in this list.
+6. **Off means unchanged.** With both switches off, the registry still lists the new strategies but they can't produce an order, existing tests pass unmodified, and no new table is read at startup. Add a test that runs the existing end-to-end fixtures with the defaults and asserts no behavior change.
+7. **Tighter limits than long stocks.** Each family gets its own exposure cap, below the 10% portfolio cap (setting names `SHORT_MAX_PORTFOLIO_PCT` and `OPTIONS_MAX_RISK_PCT`, defaults small, validated so they can't exceed 10%). The 1% rule applies to maximum possible loss, never to premium collected.
+8. **Surface the state.** `/trading/status` returns both switches, and the Home and Strategies pages show a visible badge when either is on. An enabled strategy whose switch is off shows "blocked: switch off" rather than silently doing nothing.
+9. **Alert on first use.** The first order of each family after startup publishes a system alert, so a switch left on is noticed.
+10. **Order of work inside each phase:** switch, gate and tests first (tasks 3.1 and 4.1), then infrastructure, then strategies. No strategy ships before its gate tests pass.
+
+### Phase 3. Short selling and short momentum (gated by `SHORTING_ENABLED`)
+
+The `.claude/CLAUDE.md` guardrails "Never implement short selling" and "Never send fractional quantities to IBKR" are being narrowed: shorting is allowed only behind `SHORTING_ENABLED`, paper only. Change that line in the same pull request as task 3.1 to say so, and leave the other guardrails alone (exits never blocked, 1% rule, whole shares, no take-profit orders to the broker, `Decimal` money, audit-immutable columns).
+
+Tasks, in order, each its own pull request:
+
+1. [ ] **Switch and gate** (rules above). `SHORTING_ENABLED`, `SHORT_MAX_PORTFOLIO_PCT`, the paper-only validator, the `SHORTING_DISABLED` rejection, status fields, UI badge and the "off means unchanged" test. Done when a SELL-to-open signal is rejected with the switch off and nothing else changes.
+2. [ ] **Data model.** Read `app/db/models/trade.py` first: `TradeDirection` and the immutable columns. A short trade reuses the existing columns (`entry_price` is the sale price, `stop_loss_price` is above it). New per-trade facts (borrow fee accrued, hard-to-borrow flag) go in new nullable columns in migration `0014` (or the next free number; `0013` is taken by dividend data), with a working `downgrade()`.
+3. [ ] **Risk and sizing.** `RiskCalculator` for shorts: risk per share = stop - entry, so the stop must be above entry or the request is rejected. `max_quantity()` stays `int`. Include borrow fee and the cost model in the all-in loss. Tests for each rejection, including a stop at or below entry.
+4. [ ] **Broker.** Add sell-to-open and buy-to-cover to `BaseBroker`, the IBKR and mock implementations, and the broker's order-state mapping. The protective stop is a BUY stop above entry, submitted to the broker. Tests against the mock for fill, partial fill, rejection (no shares to borrow) and a gap through the stop.
+5. [ ] **Position monitor, reconciler and circuit breaker.** P&L sign, stop and trailing logic mirrored for shorts, reconciler recognizing negative broker quantities, circuit breaker counting short losses. Buy-to-cover exits are never blocked. Integration tests (use a `*_test` database).
+6. [ ] **Simulation.** Backtest engine and portfolio engine support shorts: borrow cost, gap-through-stop fills at the open, no profit from a stock that is hard to borrow in the data (if the data doesn't say, borrow is assumed unavailable and the short is skipped). Done when a short backtest's equity matches a hand-computed example.
+7. [ ] **`momentum_short`.** Backlog rules: sustained downward momentum, or confirmed breakdown after a run-up. Never short just because a stock rose or is expensive. Config includes `max_holding_days`, `max_gap_pct`, and a squeeze guard (HOLD when the last N sessions' close-to-high range is wide or price is above a short-term average). Seeded disabled. Standard strategy tests plus: HOLD when `SHORTING_ENABLED` is false is not required (the gate does that), but a SELL-to-open signal must carry a stop above entry.
+8. [ ] **Validation.** Backtest long and short separately across regimes with costs, then paper only after the validation gates in "Before live money" pass. Don't enable on paper before then.
+
+### Phase 4. Options (gated by `OPTIONS_ENABLED`)
+
+Before task 4.2, check fit with the user's account size: use the cost model to see whether one contract (100 shares) and its fees fit the 1% rule at the intended capital. If almost nothing does, say so in the pull request and stop after 4.3; the infrastructure is still useful, the strategies may never be eligible, and that is a valid outcome. Don't assume a market-data subscription: confirm with the user what IBKR options data the account has before building the feed.
+
+Tasks, in order:
+
+1. [ ] **Switch and gate** (rules above). `OPTIONS_ENABLED`, `OPTIONS_MAX_RISK_PCT`, `OPTIONS_DISABLED` rejection, status fields, badge, tests.
+2. [ ] **Contracts and data, no trading.** Contract model (underlying, expiry from the real contract calendar, strike, right, multiplier from the contract, not a hard-coded 100), a read-only options chain and quote feed behind `BaseBroker`, and caching with a freshness limit. Reject missing or stale quotes. Migration for contract/leg tables. Done when the chain for one symbol can be fetched on paper and stale data is refused.
+3. [ ] **Multi-leg orders and risk.** Combo orders as one broker order with legs, spread-based max-loss sizing (width minus credit, times multiplier, times quantity, plus fees), and collateral reservations feeding the same account reservation the entry authorization uses. Integer contracts only. Tests: partial leg fills never leave an unintended naked position; cancel races; rejection.
+4. [ ] **Expiration, assignment and reconciliation.** Handle assignment and expiration events, early assignment, ex-dividend risk and after-hours exercise, with the reconciler recognizing the resulting stock and option positions. Closing or rolling a position is never gated.
+5. [ ] **Cash-secured puts.** First strategy, simplest collateral: reserve strike x multiplier in cash, only on symbols in a configured "willing to own" list. Strike and expiry by delta/DTE config, minimum premium after costs, liquidity limits. Assignment hands the shares to the normal stock lifecycle with an explicit owner and a stop.
+6. [ ] **Covered calls.** Reserve owned shares for each sold call (shares × contract multiplier), refuse a stock exit order that would leave a call uncovered unless it closes the call in the same action, and record which strategy owns the shares. Sideways-market filter and exclusions as the Backlog describes.
+7. [ ] **Iron condor.** Defined-risk four-leg entry with wing width, DTE, credit and a max-loss exit rule. Sizing from max loss, never from the credit.
+8. [ ] **Covered puts last.** Needs Phase 3 complete, since it includes a short stock leg. Backlog rules; blocked on both switches being on.
+9. [ ] **Validation.** Each strategy separately: backtest only if historical options data exists (if not, say so and use paper only), model spreads, fees, early assignment and collateral. Compare with stock ownership. Paper only, and only after the validation gates pass.
+
+### Not bugs
+- Strategies that return HOLD for weeks on a small account are the filters working.
+- `rocket_breakout` skipping a gap-up is intended, not a missed trade.
+- "All-time high" is approximated by `ath_lookback` until the history store goes deeper.
+
 ## Optional
 
 Schedule hosting expansion and additional strategy families after the deterministic baseline and validation gates. Reuse infrastructure and set operating-cost limits appropriate to experimental capital.
@@ -434,6 +596,8 @@ Schedule hosting expansion and additional strategy families after the determinis
 - [ ] **Repository tidy-up.** Move `test_ibkr_connection.py` to `backend/scripts/check_gateway.py`. Split `requirements-dev.txt` (pytest, pytest-asyncio, pytest-cov) from the runtime requirements; the Dockerfile installs runtime only, CI installs both.
 
 ## Backlog
+
+The strategy families below (dividend, momentum, rocket, covered calls, puts, iron condor) are planned in "Strategy families" above; this list holds the research rules that plan refers to.
 
 - **Options (iron condor):** options data feed, multi-leg orders and database models, spread-based risk calculation.
 - **Mobile PWA:** manifest and service worker, responsive layout, web push (needs HTTPS).

@@ -16,10 +16,12 @@ from app.core.engine_lock import EngineLock
 from app.core.events import RISK_UPDATES, SYSTEM_ALERTS, TRADE_EVENTS, publish_system_alert
 from app.core.jobs.bar_refresh import BarRefreshJob
 from app.core.jobs.daily_summary import DailySummaryJob
+from app.core.jobs.dividend_refresh import DividendRefreshJob
 from app.core.risk.costs import CostModel
 from app.core.risk.growth import GrowthPolicy, effective_equity
 from app.core.tasks import PeriodicTask, spawn, supervised_subscribe
 from app.core.trading_state import TradingState
+from app.data.alpha_vantage import AlphaVantageClient
 from app.monitoring.logger import error_logger, system_logger
 
 
@@ -158,6 +160,19 @@ class TradingEngine:
             capital_limit=settings.trading_capital_limit,
         )
         self._daily_summary_task = PeriodicTask("daily_summary", 60, self.daily_summary.tick)
+        self.dividend_refresh = DividendRefreshJob(
+            AlphaVantageClient(settings.alpha_vantage_api_key, clock=clock)
+            if settings.alpha_vantage_api_key
+            else None,
+            AsyncSessionFactory,
+            self.cache,
+            symbols=settings.dividend_symbols,
+            daily_budget=settings.dividend_refresh_daily_budget,
+            clock=clock,
+        )
+        self._dividend_refresh_task = PeriodicTask(
+            "dividend_refresh", 600, self.dividend_refresh.tick
+        )
         self._session_factory = AsyncSessionFactory
         self._risk_task: asyncio.Task | None = None
         self._notifier_task: asyncio.Task | None = None
@@ -289,6 +304,7 @@ class TradingEngine:
         self._bar_refresh_task.start()
         self._reconciler_task.start()
         self._daily_summary_task.start()
+        self._dividend_refresh_task.start()
         await self.scheduler.start()
         system_logger.info("Trading loops started (engine lock held)")
 
@@ -298,6 +314,7 @@ class TradingEngine:
         await self.position_monitor.stop()
         await self._bar_refresh_task.stop()
         await self._daily_summary_task.stop()
+        await self._dividend_refresh_task.stop()
 
     async def _lock_loop(self) -> None:
         """Renew the lease while leader; otherwise keep trying to acquire it."""

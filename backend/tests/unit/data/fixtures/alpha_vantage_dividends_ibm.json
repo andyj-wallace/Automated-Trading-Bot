@@ -1,0 +1,4 @@
+{"symbol": "IBM", "data": [
+ {"ex_dividend_date": "2026-11-10", "declaration_date": "2026-10-21", "record_date": "2026-11-10", "payment_date": "2026-12-10", "amount": "1.69"},
+ {"ex_dividend_date": "2026-08-08", "declaration_date": "None", "record_date": "2026-08-08", "payment_date": "2026-09-10", "amount": "1.68"},
+ {"ex_dividend_date": "2026-05-09", "declaration_date": "2026-04-29", "record_date": "2026-05-09", "payment_date": "2026-06-10", "amount": "1.68"}]}
