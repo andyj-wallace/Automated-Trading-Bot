@@ -6,6 +6,8 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
+from sqlalchemy.exc import DBAPIError
+
 from app.core import market_calendar
 from app.data.alpha_vantage import DividendSource
 from app.db.repositories.dividend_repo import DividendRepo
@@ -15,6 +17,13 @@ BUDGET_KEY = "dividends:alpha_vantage:requests:{day}"
 BUDGET_TTL_SECONDS = 48 * 3600
 FRESH_DAYS = 7
 _EPOCH = datetime.min.replace(tzinfo=UTC)
+# Postgres SQLSTATE classes caused by the rows themselves: cardinality, data exception, constraint.
+# asyncpg reports these as plain DBAPIError, not DataError/IntegrityError.
+_DATA_SQLSTATE_CLASSES = ("21", "22", "23")
+
+
+def _sqlstate(exc: DBAPIError) -> str:
+    return str(getattr(exc.orig, "sqlstate", "") or "")
 
 
 class DividendRefreshJob:
@@ -81,9 +90,19 @@ class DividendRefreshJob:
                         "Dividend fetch failed", extra={"symbol": symbol, "error": result.error}
                     )
                 else:
-                    await repo.upsert_events(symbol, result.rows, now_utc)
-                    await repo.mark_fetched(symbol, now_utc)
-                    await session.commit()
+                    try:
+                        await repo.upsert_events(symbol, result.rows, now_utc)
+                        await repo.mark_fetched(symbol, now_utc)
+                        await session.commit()
+                    except DBAPIError as exc:
+                        # Bad data for one symbol must not stop the others; other DB errors still abort.
+                        if _sqlstate(exc)[:2] not in _DATA_SQLSTATE_CLASSES:
+                            raise
+                        await session.rollback()
+                        system_logger.warning(
+                            "Dividend store failed",
+                            extra={"symbol": symbol, "sqlstate": _sqlstate(exc)},
+                        )
         if skipped:
             system_logger.warning(
                 "Dividend refresh budget spent",

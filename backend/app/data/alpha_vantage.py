@@ -20,6 +20,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 MayRequest = Callable[[], Awaitable[bool]]
 URL = "https://www.alphavantage.co/query"
 MAX_ATTEMPTS = 2
+MAX_AMOUNT = Decimal("1e10")  # dividend_events.amount is Numeric(18, 8): at most 10 whole digits
 
 
 @dataclass(frozen=True)
@@ -60,14 +61,15 @@ def _amount(value: object) -> Decimal | None:
         amount = Decimal(value)
     except InvalidOperation:
         return None
-    return amount if amount.is_finite() and amount > 0 else None
+    return amount if amount.is_finite() and 0 < amount < MAX_AMOUNT else None
 
 
 def parse_dividends(payload: object, today: date) -> FetchResult:
-    """Turn an Alpha Vantage DIVIDENDS payload into rows, dropping malformed ones."""
+    """Turn an Alpha Vantage DIVIDENDS payload into rows, dropping malformed and repeated ones."""
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         return FetchResult(ok=False, error="no_data_list")
     rows: list[DividendRow] = []
+    seen: set[date] = set()
     dropped = 0
     for raw in payload["data"]:
         if not isinstance(raw, dict):
@@ -75,9 +77,11 @@ def parse_dividends(payload: object, today: date) -> FetchResult:
             continue
         ex = _date(raw.get("ex_dividend_date"))
         amount = _amount(raw.get("amount"))
-        if ex is None or amount is None:
+        # One row per ex-date (the first, i.e. newest, wins): a repeat would fail the upsert.
+        if ex is None or amount is None or ex in seen:
             dropped += 1
             continue
+        seen.add(ex)
         rows.append(
             DividendRow(
                 ex_dividend_date=ex,

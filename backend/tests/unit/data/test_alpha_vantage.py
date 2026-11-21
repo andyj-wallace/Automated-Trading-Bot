@@ -66,6 +66,39 @@ def test_parse_drops_malformed_rows():
     assert result.dropped == 5
 
 
+def test_parse_keeps_first_row_per_ex_date():
+    payload = {
+        "data": [
+            {"ex_dividend_date": "2026-05-09", "amount": "0.52"},
+            {"ex_dividend_date": "2026-05-09", "amount": "0.50"},
+            {"ex_dividend_date": "2026-02-09", "amount": "0.50"},
+        ]
+    }
+
+    result = parse_dividends(payload, TODAY)
+
+    assert [(r.ex_dividend_date, r.amount) for r in result.rows] == [
+        (date(2026, 5, 9), Decimal("0.52")),
+        (date(2026, 2, 9), Decimal("0.50")),
+    ]
+    assert result.dropped == 1
+
+
+def test_parse_drops_amounts_too_large_to_store():
+    payload = {
+        "data": [
+            {"ex_dividend_date": "2026-05-09", "amount": "1e10"},
+            {"ex_dividend_date": "2026-04-09", "amount": "99999999999"},
+            {"ex_dividend_date": "2026-03-09", "amount": "9999999999.99"},
+        ]
+    }
+
+    result = parse_dividends(payload, TODAY)
+
+    assert [r.ex_dividend_date for r in result.rows] == [date(2026, 3, 9)]
+    assert result.dropped == 2
+
+
 def test_parse_rejects_missing_data_list():
     assert parse_dividends({"Information": "rate limit"}, TODAY).error == "no_data_list"
     assert parse_dividends("<html>", TODAY).error == "no_data_list"
